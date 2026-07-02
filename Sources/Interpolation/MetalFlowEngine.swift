@@ -508,7 +508,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float2 uv2 = (float2(gid) + 0.5 + f) / size;
         float2 b = flowB.sample(s, uv2).rg;
         float cyc = length(f + b);
-        float conf = 1.0 - smoothstep(1.0, 4.0, cyc);  // 픽셀 단위 오차 1~4 사이 감쇠
+        // 실영상 압축 노이즈에서 순환 오차 ~2px는 정상 — 과민하면 화면 대부분이
+        // 원본 폴백(60fps 스텝)으로 빠져 '프레임레이트 낮아 보임' (실측 보고)
+        float conf = 1.0 - smoothstep(2.5, 8.0, cyc);
 
         float la = lumA.read(gid).r;
         float lb = lumB.read(gid).r;

@@ -145,9 +145,10 @@ public final class OverlayManager {
     }
 
     /// 외부 CB에 렌더 인코딩. drawable 반환.
+    /// 주의: 창 추적 폴링은 updateTracking(30Hz 타이머)에서만 — CGWindowList가 0.5-2ms라
+    /// present 경로에 두면 vsync 틱을 놓친다 (틱 유실 ~5%/s 실측).
     public func encodeRenderFrame(texture: any MTLTexture, into commandBuffer: any MTLCommandBuffer) -> (any CAMetalDrawable)? {
-        pollAndUpdateFrame()
-        return overlayWindow?.encodeRender(texture: texture, into: commandBuffer)
+        overlayWindow?.encodeRender(texture: texture, into: commandBuffer)
     }
 
     /// 렌더 없이 위치 추적만 갱신 (프레임 스킵 시 호출)

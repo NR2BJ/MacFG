@@ -223,4 +223,5 @@ public enum CaptureError: Error, Sendable {
     case screenCaptureKitError(String)
     case noPermission
     case windowNotFound
+    case notCapturing
 }

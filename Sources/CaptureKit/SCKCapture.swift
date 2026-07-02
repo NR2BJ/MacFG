@@ -35,19 +35,11 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
 
         let filter = SCContentFilter(desktopIndependentWindow: window)
 
-        let config = SCStreamConfiguration()
         // 대상 창이 있는 화면의 배율을 찾아서 적용 (외부 1x ↔ MacBook 2x)
         let scaleFactor = Self.findScaleFactor(for: window.frame)
-        config.width = window.frame.width > 0 ? Int(window.frame.width * scaleFactor) : 1920
-        config.height = window.frame.height > 0 ? Int(window.frame.height * scaleFactor) : 1080
-        config.captureResolution = .best
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        // 1/60 게이트는 콘텐츠 60fps와 위상이 어긋나면 맥놀이로 프레임을 걸러냄 (실측 57-58fps 구멍).
-        // 1/120으로 열고 중복 제거는 소비자(status+fingerprint)가 담당.
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
-        config.queueDepth = 8
-        config.showsCursor = false
-        config.capturesAudio = false
+        let w = window.frame.width > 0 ? Int(window.frame.width * scaleFactor) : 1920
+        let h = window.frame.height > 0 ? Int(window.frame.height * scaleFactor) : 1080
+        let config = Self.makeConfig(width: w, height: h)
 
         let handler = StreamOutputHandler(device: device) { [weak self] slot in
             guard let self else { return }
@@ -70,6 +62,30 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         self.capturing = true
 
         logger.info("SCK capture started for window \(windowID)")
+    }
+
+    /// 공용 스트림 설정 — startCapture와 updateConfiguration이 공유
+    private static func makeConfig(width: Int, height: Int) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.width = max(width, 2)
+        config.height = max(height, 2)
+        config.captureResolution = .best
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        // 1/60 게이트는 콘텐츠 60fps와 위상이 어긋나면 맥놀이로 프레임을 걸러냄 (실측 57-58fps 구멍).
+        // 1/120으로 열고 중복 제거는 소비자(status+fingerprint)가 담당.
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
+        config.queueDepth = 8
+        config.showsCursor = false
+        config.capturesAudio = false
+        return config
+    }
+
+    /// 스트림을 끊지 않고 출력 크기만 변경 — 창 리사이즈/전체화면 전환 시 프레임 끊김 없이.
+    /// 전체 stop→start 재시작이 유발하는 수 초 붕괴(프레임 갭 + 재워밍업)를 없앤다.
+    public func updateConfiguration(width: Int, height: Int) async throws {
+        guard let stream else { throw CaptureError.notCapturing }
+        try await stream.updateConfiguration(Self.makeConfig(width: width, height: height))
+        logger.info("SCK config updated → \(width)x\(height)")
     }
 
     public func stopCapture() async {

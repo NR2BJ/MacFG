@@ -49,6 +49,12 @@ public final class CaptureManager: Sendable {
         activeSource = nil
     }
 
+    /// 스트림 무중단 리사이즈 (SCK 전용). IOSurface 폴백 시엔 미지원 → throw (호출자가 전체 재시작).
+    public func updateConfiguration(width: Int, height: Int) async throws {
+        guard _activeMethod == .screenCaptureKit else { throw CaptureError.notCapturing }
+        try await sckCapture.updateConfiguration(width: width, height: height)
+    }
+
     /// 최신 프레임 가져오기
     public func latestFrame() -> FrameSlot? {
         activeSource?.latestFrame()

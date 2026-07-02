@@ -364,7 +364,27 @@ public final class AppState {
         DiagnosticLog.shared.log("Capture stopped")
     }
 
-    /// 캡처 스트림만 재시작 (오버레이/DisplayLink/엔진 유지) — 창 리사이즈 대응
+    /// 무중단 리사이즈 — 스트림을 끊지 않고 출력 크기만 갱신 (SCStream.updateConfiguration).
+    /// 전체 stop→start 재시작이 유발하던 수 초 붕괴(프레임 갭 + 케이던스 재락)를 없앤다.
+    /// 전체화면/최대화 전환 시 present이 안 무너지는 것이 핵심 (실측: 전환 시 11~87fps 붕괴 → 제거).
+    private func resizeCaptureStream(width: Int, height: Int) async {
+        guard isCapturing, !isRestartingCapture else { return }
+        isRestartingCapture = true
+        defer { isRestartingCapture = false }
+        do {
+            try await captureManager.updateConfiguration(width: width, height: height)
+            softResetForResize()
+            pairEngine?.reset()
+            DiagnosticLog.shared.log("[CAPTURE] seamless resize → \(width)x\(height)")
+        } catch {
+            // updateConfiguration 미지원(IOSurface 폴백)/실패 → 기존 전체 재시작으로 폴백
+            DiagnosticLog.shared.log("[CAPTURE] seamless resize failed (\(error)) → full restart")
+            isRestartingCapture = false   // restartCaptureStream이 자체 플래그 관리
+            await restartCaptureStream(reason: "resize → \(width)x\(height)")
+        }
+    }
+
+    /// 캡처 스트림만 재시작 (오버레이/DisplayLink/엔진 유지) — 무중단 리사이즈 실패 시 폴백
     private func restartCaptureStream(reason: String) async {
         guard let windowID = selectedWindowID, isCapturing, !isRestartingCapture else { return }
         isRestartingCapture = true
@@ -398,6 +418,23 @@ public final class AppState {
         hasReceivedFirstFrame = false
         presentedTimes = []
         _ = mailbox.drain()
+    }
+
+    /// 리사이즈 전용 경량 리셋 — 크기 의존 상태(타임라인/풀/이전 프레임)만 비우고
+    /// 케이던스(스냅 링/EMA/타임스탬프)는 유지한다. 전체 리셋의 ~16프레임 재락을 회피.
+    private func softResetForResize() {
+        timeline = []
+        inFlightTextures = []
+        stablePool = []
+        stablePoolWidth = 0
+        stablePoolHeight = 0
+        prevStable = nil                 // 크기 바뀐 이전 프레임과 새 프레임은 페어 불가 → 1프레임 워밍업
+        lastPresentedTexture = nil
+        lastAcceptedFingerprint = 0
+        resizeMismatchCount = 0
+        _ = mailbox.drain()
+        // 유지: snapTsRing / sourceIntervalEMA / snappedLastTimestamp / lastPresentedTimestamp /
+        //       lastAcceptedTimestamp / hasReceivedFirstFrame → 콘텐츠 타이밍 연속성 보존
     }
 
     // MARK: - Scheduler State
@@ -539,7 +576,7 @@ public final class AppState {
                 resizeMismatchCount += 1
                 if resizeMismatchCount >= 2 {
                     resizeMismatchCount = 0
-                    Task { await restartCaptureStream(reason: "resize → \(src.width)x\(src.height)") }
+                    Task { await resizeCaptureStream(width: src.width, height: src.height) }
                 }
             } else {
                 resizeMismatchCount = 0

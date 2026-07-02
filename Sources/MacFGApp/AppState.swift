@@ -432,6 +432,8 @@ public final class AppState {
     private var diagSkipDiscontinuity = 0
     private var diagSkipEngineFail = 0
     private var diagSkipOther = 0
+    private var diagStaleDropCount = 0
+    private var diagSkipBackpressure = 0
 
     // MARK: - Render Loop
 
@@ -512,16 +514,13 @@ public final class AppState {
         // stale 한계: 평시 2.5 간격(늦은 묶음도 순서대로 표시 — 구멍보다 +1vsync 지연이 낫다),
         // 큐가 깊어지면(≥5) 1.2로 조여 백로그를 서서히 배출 — 생성≈소비 균형에서 큐가
         // 고여 e2e가 +40ms 눌러앉는 것 방지 (실측 75-84ms → 목표 ~55ms)
-        let staleCutoff = target - interval * (timeline.count >= 5 ? 1.2 : 2.5)
+        let staleCutoff = target - interval * (timeline.count >= 6 ? 1.2 : 2.5)
         let candidates = timeline.filter { $0.timestamp > lastPresentedTimestamp && $0.timestamp <= target + 0.002 }
         var pick = candidates.first
-        for next in candidates.dropFirst() {
-            // 이미 고른 항목이 심하게 과거(백로그)면 다음 항목으로 건너뛰어 따라잡는다
-            if let current = pick, current.timestamp < staleCutoff {
-                pick = next
-            } else {
-                break
-            }
+        // 따라잡기는 틱당 최대 1장만 건너뜀 — 여러 장을 한 번에 버리면 눈에 보이는 점프
+        if let current = pick, current.timestamp < staleCutoff, candidates.count > 1 {
+            pick = candidates[1]
+            diagStaleDropCount += 1
         }
         if let pick {
             presentEntry(pick, at: targetTimestamp)
@@ -631,6 +630,19 @@ public final class AppState {
                 if tValues.isEmpty && gap > displayInterval * 1.5 { tValues = [0.5] }
                 if tValues.isEmpty {
                     diagSkipContentFast += 1
+                }
+                // 배압: 워크 스파이크로 큐가 깊어졌으면 생성 단계에서 줄인다 —
+                // 이미 예약된 프레임을 드레인으로 버리는 것(눈에 보이는 딸꾹질)보다
+                // 새 보간을 덜 만드는 쪽이 시각적으로 무해 (MetalFlow만 간헐 드랍 보고의 원인).
+                // 임계값은 콘텐츠 fps에 비례 — 24fps는 쌍당 4-5장이라 tl=11이 '건강한' 깊이.
+                let expectedDepth = Int((gap / displayInterval).rounded(.up)) * 2 + 3
+                if timeline.count >= expectedDepth && tValues.count > 1 {
+                    // 절반 솎아내기 (홀수 인덱스 유지)
+                    tValues = tValues.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
+                }
+                if timeline.count >= expectedDepth + 4 {
+                    tValues = []
+                    diagSkipBackpressure += 1
                 }
                 interpResult = tValues.isEmpty ? nil : pairEngine?.encodePair(
                     stableA: prev.texture, stableB: stable,
@@ -833,6 +845,8 @@ public final class AppState {
         if diagSkipDiscontinuity > 0 { skipParts.append("discont:\(diagSkipDiscontinuity)") }
         if diagSkipEngineFail > 0 { skipParts.append("engFail:\(diagSkipEngineFail)") }
         if diagSkipOther > 0 { skipParts.append("other:\(diagSkipOther)") }
+        if diagStaleDropCount > 0 { skipParts.append("staleDrop:\(diagStaleDropCount)") }
+        if diagSkipBackpressure > 0 { skipParts.append("backpres:\(diagSkipBackpressure)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
         let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
@@ -841,6 +855,7 @@ public final class AppState {
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
+        diagStaleDropCount = 0; diagSkipBackpressure = 0
 
         diagSourceCount = 0
         diagDupSkipCount = 0

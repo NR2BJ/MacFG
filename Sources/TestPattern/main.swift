@@ -214,7 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let complexFlag = args.contains("--complex")
         window = NSWindow(
             contentRect: NSRect(x: px, y: py, width: w, height: h),
-            styleMask: [.titled, .closable, .miniaturizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false
         )
         window.title = "MacFG Test Pattern"
@@ -226,6 +226,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         view.startRendering()
+
+        // 자체 검증용: N초 후 전체화면/최대화 전환 (보간 유지 테스트)
+        if let i = args.firstIndex(of: "--fullscreen-after"), i + 1 < args.count, let sec = Double(args[i + 1]) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + sec) { [weak window] in
+                window?.toggleFullScreen(nil)
+            }
+        }
+        if let i = args.firstIndex(of: "--zoom-after"), i + 1 < args.count, let sec = Double(args[i + 1]) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + sec) { [weak window] in
+                window?.zoom(nil)
+            }
+        }
     }
 }
 

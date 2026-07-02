@@ -32,7 +32,25 @@ private final class ShaderCache: @unchecked Sendable {
         struct BlitParams {
             float2 size;      // drawable 픽셀 크기
             float radiusPx;   // 모서리 반경 (px, 0=마스킹 없음)
+            float sharpness;  // CAS 강도 0~1 (0=끔, 패스스루 바이트 보존)
         };
+
+        // AMD FidelityFX CAS(Contrast Adaptive Sharpening) 단순화 — LS의 "1:1인데도
+        // 선명해지는" 체감의 정체. 로컬 대비가 낮은 곳(브라우저가 늘려놓은 720p의
+        // 뭉개진 디테일)을 강하게, 이미 최대 대비인 하드엣지는 약하게 → 헤일로 없음.
+        float3 casSharpen(texture2d<float> tex, sampler samp, float2 uv, float2 texel, float sharpness) {
+            float3 a = tex.sample(samp, uv + float2( 0, -1) * texel).rgb;
+            float3 b = tex.sample(samp, uv + float2(-1,  0) * texel).rgb;
+            float3 c = tex.sample(samp, uv).rgb;
+            float3 d = tex.sample(samp, uv + float2( 1,  0) * texel).rgb;
+            float3 e = tex.sample(samp, uv + float2( 0,  1) * texel).rgb;
+            float3 mn = min(min(min(a, b), min(d, e)), c);
+            float3 mx = max(max(max(a, b), max(d, e)), c);
+            float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
+            float peak = -1.0 / mix(8.0, 5.0, saturate(sharpness));
+            float3 w = amp * peak;
+            return saturate((c + (a + b + d + e) * w) / (1.0 + 4.0 * w));
+        }
 
         vertex VertexOut blitVertex(uint vid [[vertex_id]]) {
             float2 positions[] = {
@@ -57,6 +75,9 @@ private final class ShaderCache: @unchecked Sendable {
                                       sampler samp [[sampler(0)]],
                                       constant BlitParams& p [[buffer(0)]]) {
             float4 color = tex.sample(samp, in.texCoord);
+            if (p.sharpness > 0.01) {
+                color.rgb = casSharpen(tex, samp, in.texCoord, 1.0 / p.size, p.sharpness);
+            }
             color.a = 1.0;
             if (p.radiusPx > 0.5) {
                 float2 pos = in.texCoord * p.size;
@@ -122,7 +143,9 @@ public final class OverlayWindow: NSObject {
     private var upscaler: MetalFXUpscaler?
     /// 출력 목표가 소스보다 클 때 MetalFX Spatial 업스케일 사용 (뷰어/큰 창). off면 이중선형.
     public var upscaleEnabled = false
-    /// 업스케일 실동작 상태 (UI 표시용) — nil = 토글 off 또는 overlay 스타일
+    /// CAS 샤프닝 강도 0~1 (0=끔 — 패스스루 바이트 보존 경로 유지). Cover 1:1에서도 유효.
+    public var sharpness: Float = 0
+    /// 업스케일/샤픈 실동작 상태 (UI 표시용) — nil = 토글 off
     public private(set) var scaleStatus: String?
 
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
@@ -252,17 +275,25 @@ public final class OverlayWindow: NSObject {
         // 업스케일: 뷰어에서 표시 목표(레터박스 영역 × 배율)가 소스보다 크면 MetalFX Spatial로
         // 선명하게 올린다 (off이거나 실패하면 이중선형 스케일로 폴백 = 아래 그대로).
         var source = texture
-        if upscaleEnabled, style == .viewer {
-            let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
-            let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
-            if targetW > texture.width, targetH > texture.height,
-               let up = upscaler?.upscale(texture, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
-                source = up
-                scaleStatus = "MetalFX \(texture.width)×\(texture.height) → \(targetW)×\(targetH)"
+        if upscaleEnabled {
+            var parts: [String] = []
+            if style == .viewer {
+                let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
+                let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
+                if targetW > texture.width, targetH > texture.height,
+                   let up = upscaler?.upscale(texture, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
+                    source = up
+                    parts.append("MetalFX \(texture.width)×\(texture.height) → \(targetW)×\(targetH)")
+                } else {
+                    parts.append("1:1")
+                }
             } else {
-                // 출력이 소스 이하 크기 = 업스케일할 게 없음 (4K 소스를 작은 뷰어로 볼 때)
-                scaleStatus = "1:1 (output ≤ source, nothing to upscale)"
+                parts.append("1:1 cover")
             }
+            // CAS는 스케일과 무관하게 최종 블릿에서 적용 — 브라우저가 이미 늘려놓은
+            // 저해상도(720p→4K) 영상의 뭉개짐을 되살리는 것이 Cover에서의 실효
+            parts.append(sharpness > 0.01 ? String(format: "sharpen %.1f", sharpness) : "sharpen off")
+            scaleStatus = parts.joined(separator: " · ")
         } else {
             scaleStatus = nil
         }
@@ -288,7 +319,8 @@ public final class OverlayWindow: NSObject {
         // 모서리 마스킹: overlay 스타일만 (viewer는 레터박스 배경이 검정이라 불필요)
         var params = BlitParams(
             size: SIMD2<Float>(Float(texW), Float(texH)),
-            radiusPx: style == .overlay ? Float(OverlayStyleConstants.cornerRadius * metalLayer.contentsScale) : 0
+            radiusPx: style == .overlay ? Float(OverlayStyleConstants.cornerRadius * metalLayer.contentsScale) : 0,
+            sharpness: upscaleEnabled ? sharpness : 0
         )
         encoder.setFragmentBytes(&params, length: MemoryLayout<BlitParams>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -300,6 +332,7 @@ public final class OverlayWindow: NSObject {
     private struct BlitParams {
         var size: SIMD2<Float>
         var radiusPx: Float
+        var sharpness: Float
     }
 
     /// 뷰어: contentView 안에서 텍스처 종횡비 유지 레터박스 배치

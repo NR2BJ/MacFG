@@ -135,13 +135,28 @@ struct WindowPickerView: View {
                     appState.updateOverlayPlacement()
                 }
 
-                Toggle("Upscale (MetalFX)", isOn: $appState.isUpscaleEnabled)
+                Toggle("Enhance (Sharpen + MetalFX)", isOn: $appState.isUpscaleEnabled)
                     .toggleStyle(.switch)
                     .onChange(of: appState.isUpscaleEnabled) {
                         appState.updateUpscale()
                     }
-                if appState.isUpscaleEnabled && appState.selectedOverlayPlacement == .coverSource {
-                    Text("Upscaling takes effect when the output is larger than the source — use Separate Window and enlarge it.")
+                if appState.isUpscaleEnabled {
+                    HStack(spacing: 8) {
+                        Text("Sharpness")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Slider(value: $appState.sharpness, in: 0...1)
+                            .onChange(of: appState.sharpness) {
+                                appState.updateUpscale()
+                            }
+                        Text(String(format: "%.1f", appState.sharpness))
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    // CAS 샤프닝은 1:1(Cover)에서도 적용 — 브라우저가 늘려놓은 저해상도
+                    // 영상의 뭉개짐 복원. MetalFX 업스케일은 출력>소스일 때 추가로.
+                    Text("Sharpening works everywhere (restores soft low-res video). MetalFX upscaling additionally kicks in when the output is larger than the source.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)

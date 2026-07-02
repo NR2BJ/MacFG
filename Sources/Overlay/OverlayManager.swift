@@ -30,6 +30,7 @@ public final class OverlayManager {
     private var lastAppliedFrame: CGRect = .zero
     private var placement: OverlayPlacement = .coverSource
     private var upscaleEnabled = false
+    private var sharpness: Float = 0
     private var trackedWindowID: CGWindowID?
     private var captureColorSpace: CGColorSpace?
     /// 소스 창의 NS 좌표 프레임 (windowTracker.pollGeometry 결과)
@@ -89,6 +90,12 @@ public final class OverlayManager {
         overlayWindow?.upscaleEnabled = enabled
     }
 
+    /// CAS 샤프닝 강도 (0=끔) — Enhance 토글과 함께 사용, 창 재생성에도 유지
+    public func setSharpness(_ value: Float) {
+        sharpness = value
+        overlayWindow?.sharpness = value
+    }
+
     /// 업스케일 실동작 상태 (UI 표시용)
     public var scaleStatus: String? { overlayWindow?.scaleStatus }
 
@@ -114,6 +121,7 @@ public final class OverlayManager {
             self?.onViewerClosed?()
         }
         overlay.upscaleEnabled = upscaleEnabled
+        overlay.sharpness = sharpness
         self.overlayWindow = overlay
 
         applyOcclusionPolicy()

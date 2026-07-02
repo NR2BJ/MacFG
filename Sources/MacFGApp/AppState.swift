@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import Carbon.HIToolbox
 @preconcurrency import Metal
 import QuartzCore
 import CaptureKit
@@ -137,6 +139,15 @@ public final class AppState {
     private var statsTimer: Timer?
     private var trackingTimer: Timer?
 
+    // MARK: - Overlay Auto-Hide (단일 모니터: 소스 벗어나면 오버레이 양보)
+    /// 캡처 대상 창을 소유한 앱의 PID (0 = 미확인 → 자동 숨김 비활성, 항상 표시)
+    private var sourceOwnerPID: pid_t = 0
+    /// 사용자가 단축키로 강제 숨김 (자동 숨김과 OR)
+    private var overlayUserHidden = false
+    /// 현재 오버레이가 숨김으로 적용된 상태인지 (전이 감지 + 렌더 정지 게이트)
+    private var overlayHiddenState = false
+    private var workspaceObserver: NSObjectProtocol?
+
     public init() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             fatalError("Metal is not supported on this device")
@@ -167,6 +178,17 @@ public final class AppState {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.handleScreenParametersChange()
+            }
+        }
+
+        // 소스 앱이 최전면을 벗어나면 오버레이를 양보(자동 숨김) — 단일 모니터에서
+        // 오버레이가 다른 앱/설정 창을 계속 덮어 "갇히는" 문제 해소.
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshOverlayVisibility()
             }
         }
     }
@@ -297,7 +319,16 @@ public final class AppState {
                 }
             }
 
+            // 자동 숨김 기준용 소스 PID + 초기 표시 상태
+            sourceOwnerPID = ownerPID(of: windowID)
+            overlayUserHidden = false
+            overlayHiddenState = false
             isCapturing = true
+            // coverSource: 소스 앱을 최전면으로 → 오버레이 즉시 표시.
+            // (Capture 클릭 시점엔 MacFG가 최전면이므로 활성화해줘야 자동숨김 기준이 성립)
+            if selectedOverlayPlacement == .coverSource, sourceOwnerPID != 0 {
+                NSRunningApplication(processIdentifier: sourceOwnerPID)?.activate()
+            }
             logger.info("Capture started: \(self.captureMethod) + \(self.trackingMethod)")
             DiagnosticLog.shared.log("Capture started: \(captureMethod) + \(trackingMethod) mode=\(selectedRenderMode.rawValue)")
         } catch {
@@ -325,6 +356,9 @@ public final class AppState {
         isCapturing = false
         captureMethod = "None"
         trackingMethod = "None"
+        sourceOwnerPID = 0
+        overlayUserHidden = false
+        overlayHiddenState = false
         resetScheduler()
         logger.info("Capture stopped")
         DiagnosticLog.shared.log("Capture stopped")
@@ -440,6 +474,18 @@ public final class AppState {
     private func onDisplayLinkTick(timestamp: CFTimeInterval, targetTimestamp: CFTimeInterval) {
         diagTick += 1
         lastVsyncTarget = targetTimestamp
+
+        // 오버레이 숨김(자동/수동) 중 — GPU 양보: 캡처/메일박스 파이프만 비우고
+        // 보간·present는 생략한다 (사용자가 다른 앱으로 전환한 목적이 GPU 확보이므로).
+        if overlayHiddenState {
+            let (_, released, _) = mailbox.drain()
+            for id in released { inFlightTextures.remove(id) }
+            _ = captureManager.drainFrames()   // 파이프 적체 방지 (텍스처는 풀로 회수)
+            if isCapturing, hasReceivedFirstFrame, (overlayManager?.trackingFailureCount ?? 0) > 240 {
+                Task { await stopCapture() }
+            }
+            return
+        }
 
         // 1) 완료된 GPU 작업 수거 → 타임라인 등재
         let (newEntries, released, presented) = mailbox.drain()
@@ -909,6 +955,65 @@ public final class AppState {
 
     func updateOverlayPlacement() {
         overlayManager?.setPlacement(selectedOverlayPlacement)
+        // 배치 전환 시 숨김 상태 초기화 (뷰어는 자동 숨김 대상 아님)
+        overlayUserHidden = false
+        overlayHiddenState = false
+        refreshOverlayVisibility()
+    }
+
+    // MARK: - Overlay Visibility / Hotkeys
+
+    private func ownerPID(of windowID: CGWindowID) -> pid_t {
+        guard let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]],
+              let pid = info.first?[kCGWindowOwnerPID as String] as? pid_t else { return 0 }
+        return pid
+    }
+
+    /// 소스 최전면 여부 + 수동 숨김을 종합해 오버레이 표시/숨김을 적용.
+    /// 숨김→표시 전이 시 스케줄러/엔진을 리셋해 끊긴 A→B 연속성을 정리한다.
+    func refreshOverlayVisibility() {
+        guard isCapturing else { return }
+        // 뷰어 배치는 자동 숨김 대상 아님 (사용자가 직접 제어하는 일반 창)
+        guard selectedOverlayPlacement == .coverSource else {
+            overlayHiddenState = false
+            return
+        }
+        let sourceFront = sourceOwnerPID == 0
+            || NSWorkspace.shared.frontmostApplication?.processIdentifier == sourceOwnerPID
+        let shouldHide = overlayUserHidden || !sourceFront
+        guard shouldHide != overlayHiddenState else { return }
+        overlayHiddenState = shouldHide
+        overlayManager?.setOverlayHidden(shouldHide)
+        if shouldHide {
+            DiagnosticLog.shared.log("[OVERLAY] hidden (front≠source or manual)")
+        } else {
+            // 숨김 동안 프레임을 버려 연속성이 끊겼으므로 리셋 후 재개
+            resetScheduler()
+            pairEngine?.reset()
+            DiagnosticLog.shared.log("[OVERLAY] shown → scheduler reset")
+        }
+    }
+
+    /// 단축키: 오버레이 수동 토글 (raw 소스와 A/B 비교 / 즉시 치우기)
+    func toggleOverlayManual() {
+        guard isCapturing, selectedOverlayPlacement == .coverSource else { return }
+        overlayUserHidden.toggle()
+        refreshOverlayVisibility()
+    }
+
+    /// 전역 단축키 등록 (앱 시작 시 1회).
+    /// ⌃⌥⌘I = 오버레이 수동 토글, ⌃⌥⌘. = 캡처 정지 (전체화면에서 창으로 못 돌아가도 제어).
+    func registerHotKeys() {
+        HotKeyCenter.shared.register([
+            .init(id: 1, keyCode: UInt32(kVK_ANSI_I),
+                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                self?.toggleOverlayManual()
+            },
+            .init(id: 2, keyCode: UInt32(kVK_ANSI_Period),
+                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                Task { @MainActor in await self?.stopCapture() }
+            },
+        ])
     }
 
     private func configurePairEngine() async {

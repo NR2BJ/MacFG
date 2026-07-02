@@ -21,6 +21,7 @@ struct MacFGApp: App {
                 .onAppear {
                     setupMenuBar()
                     checkPermissions()
+                    appState.registerHotKeys()
                     Task { await appState.processAutoStartArguments() }
                 }
                 .onChange(of: appState.isCapturing) {

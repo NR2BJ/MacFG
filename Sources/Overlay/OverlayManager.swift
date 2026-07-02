@@ -156,6 +156,21 @@ public final class OverlayManager {
         pollAndUpdateFrame()
     }
 
+    /// Cover 오버레이 숨김/표시 (창은 유지 — 자동 숨김/수동 토글용).
+    /// 표시 복귀 시 occlusion 우회·색 정책·위치를 다시 적용한다.
+    /// 뷰어 배치는 사용자가 직접 제어하므로 무시.
+    public func setOverlayHidden(_ hidden: Bool) {
+        guard let overlayWindow, placement == .coverSource else { return }
+        if hidden {
+            overlayWindow.setVisible(false)
+        } else {
+            applyOcclusionPolicy()
+            pollAndUpdateFrame()
+            applyColorPolicy()
+            overlayWindow.setVisible(true)
+        }
+    }
+
     /// CGWindowList에서 최신 위치를 읽고, cover 배치면 오버레이 위치 갱신
     private func pollAndUpdateFrame() {
         guard let geom = windowTracker.pollGeometry() else {

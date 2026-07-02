@@ -858,7 +858,15 @@ public final class AppState {
 
     private func updateStats() {
         inputFPS = performanceMonitor.inputFPS
-        outputFPS = performanceMonitor.outputFPS
+        // 출력 FPS는 실제 glass 시각(presented handler의 presentedTime)으로 계산 —
+        // PerformanceMonitor의 renderTimestamps는 mailbox 드레인 시각이라 틱에 뭉쳐
+        // 표시값이 80-120으로 맥놀이 (실프레임은 꾸준한데 지표만 출렁, 실측)
+        if presentedTimes.count >= 2,
+           let first = presentedTimes.first, let last = presentedTimes.last, last > first {
+            outputFPS = Double(presentedTimes.count - 1) / (last - first)
+        } else {
+            outputFPS = 0
+        }
         latencyMs = latencySamplesMs.isEmpty ? 0 : latencySamplesMs.reduce(0, +) / Double(latencySamplesMs.count)
     }
 

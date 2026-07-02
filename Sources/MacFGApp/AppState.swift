@@ -150,6 +150,12 @@ public final class AppState {
                 await self.stopCapture()
             }
         }
+        // 출력 창이 다른 화면으로 이동 → 그 화면의 vsync로 페이싱 재바인딩
+        self.overlayManager?.onOutputScreenChanged = { [weak self] screen in
+            guard let self, self.isCapturing, self.displaySync != nil else { return }
+            DiagnosticLog.shared.log("[DISPLAY] output moved to \(screen?.localizedName ?? "?") → DisplayLink 재바인딩")
+            self.restartDisplayLink()
+        }
         // 디스플레이 구성 변경(주사율 전환/모니터 연결 해제) 시 DisplayLink 재시작 —
         // 기존 링크는 이전 모드에 묶여 페이싱이 깨진다 (사용자가 120↔144Hz를 오가는 환경)
         NotificationCenter.default.addObserver(
@@ -172,7 +178,7 @@ public final class AppState {
         displaySync?.stop()
         let sync = DisplayLinkSync(device: device)
         displaySync = sync
-        sync.start { [weak self] timestamp, targetTimestamp in
+        sync.start(screen: overlayManager?.outputScreen) { [weak self] timestamp, targetTimestamp in
             MainActor.assumeIsolated {
                 self?.onDisplayLinkTick(timestamp: timestamp, targetTimestamp: targetTimestamp)
             }
@@ -232,6 +238,11 @@ public final class AppState {
             MetalFlowEngine.flowBaseLongSide = base
             DiagnosticLog.shared.log("[AUTO] flowBaseLongSide=\(Int(base))")
         }
+        if let cIdx = args.firstIndex(of: "--corner-radius"), cIdx + 1 < args.count,
+           let r = Double(args[cIdx + 1]), r >= 0, r <= 64 {
+            OverlayStyleConstants.cornerRadius = r
+            DiagnosticLog.shared.log("[AUTO] cornerRadius=\(r)")
+        }
 
         // 창 목록에 대상이 뜰 때까지 재시도 (최대 15초)
         for _ in 0..<30 {
@@ -265,16 +276,9 @@ public final class AppState {
             try overlayManager?.start(windowID: windowID)
             trackingMethod = overlayManager?.trackingMethod ?? "Unknown"
 
-            // 엔진 준비를 먼저 끝낸 뒤 렌더 루프 시작
+            // 엔진 준비를 먼저 끝낸 뒤 렌더 루프 시작 (출력 화면의 vsync에 바인딩)
             await configurePairEngine()
-
-            let sync = DisplayLinkSync(device: device)
-            self.displaySync = sync
-            sync.start { [weak self] timestamp, targetTimestamp in
-                MainActor.assumeIsolated {
-                    self?.onDisplayLinkTick(timestamp: timestamp, targetTimestamp: targetTimestamp)
-                }
-            }
+            restartDisplayLink()
 
             statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 Task { @MainActor in
@@ -342,6 +346,7 @@ public final class AppState {
         lastAcceptedTimestamp = 0
         lastAcceptedFingerprint = 0
         snappedLastTimestamp = 0
+        lastVsyncTarget = 0
         sourceIntervalEMA = 0
         hasReceivedFirstFrame = false
         presentedTimes = []
@@ -373,6 +378,8 @@ public final class AppState {
     private var isRestartingCapture = false
     private var presentedTimes: [CFTimeInterval] = []
     private var latencySamplesMs: [Double] = []
+    /// 최근 vsync 목표 시각 — 보간 위상을 디스플레이 그리드에 정렬하기 위한 기준
+    private var lastVsyncTarget: CFTimeInterval = 0
 
     /// 출력 지연: 콘텐츠 시각을 이만큼 과거로 조준한다.
     /// 보간 프레임 I(A,B)가 B 도착 + GPU/ANE 완료 후 표시 슬롯에 준비되어 있으려면
@@ -411,6 +418,7 @@ public final class AppState {
 
     private func onDisplayLinkTick(timestamp: CFTimeInterval, targetTimestamp: CFTimeInterval) {
         diagTick += 1
+        lastVsyncTarget = targetTimestamp
         overlayManager?.updateTracking()
 
         // 1) 완료된 GPU 작업 수거 → 타임라인 등재
@@ -571,14 +579,30 @@ public final class AppState {
         let wantInterpolation = isInterpolationEnabled && pairEngine != nil
         if wantInterpolation, let prev = prevStable {
             let gap = snappedTs - prev.timestamp
-            let contentAlreadyFast = sourceIntervalEMA > 0 && sourceIntervalEMA < 1.3 / refreshRate
+            let displayInterval = 1.0 / max(refreshRate, 30)
+            // 콘텐츠가 주사율에 근접하면 보간 무의미 (갭에 표시 슬롯이 없음)
+            let contentAlreadyFast = gap < displayInterval * 0.75
             if gap > 0 && gap < 0.25 && !contentAlreadyFast
                 && prev.texture.width == stable.width && prev.texture.height == stable.height
                 && previousAcceptedTs == prev.rawTimestamp {
-                let displayInterval = 1.0 / max(refreshRate, 30)
-                let slots = max(1, Int((gap / displayInterval).rounded()))
-                let n = min(max(slots - 1, 1), 4)
-                let tValues = (1...n).map { Float($0) / Float(n + 1) }
+                // 보간 위상을 vsync 그리드 시각에 정렬 — 균등분할(t=k/(n+1))은
+                // 60fps→144Hz(쌍당 2.4슬롯)처럼 비정수 조합에서 쌍마다 2/3개를 오가며
+                // 시간축이 출렁였다 (Metal Flow가 AppleFI보다 덜 부드럽던 원인).
+                // 그리드 시각에 놓인 프레임은 pick 시점과 정확히 일치 → 완전 균일 모션.
+                var tValues: [Float] = []
+                if lastVsyncTarget > 0 {
+                    let gridRef = lastVsyncTarget - latencyOffset
+                    let kStart = ((prev.timestamp - gridRef) / displayInterval + 1e-6).rounded(.up)
+                    var slotTime = gridRef + kStart * displayInterval
+                    // 소스 B 직전 0.6슬롯은 비워둠 — 그 vsync는 선명한 원본 B가 차지해야 한다
+                    // (0.25로 좁히면 t≈0.9 보간이 B를 밀어내 원본 표시율이 절반으로 떨어짐, 실측)
+                    while slotTime < snappedTs - displayInterval * 0.6 && tValues.count < 5 {
+                        let t = (slotTime - prev.timestamp) / gap
+                        if t > 0.02 { tValues.append(Float(t)) }
+                        slotTime += displayInterval
+                    }
+                }
+                if tValues.isEmpty { tValues = [0.5] }
                 interpResult = pairEngine?.encodePair(
                     stableA: prev.texture, stableB: stable,
                     tsA: prev.timestamp, tsB: snappedTs,

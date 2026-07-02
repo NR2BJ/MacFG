@@ -49,6 +49,12 @@ public final class OverlayManager {
 
     /// 뷰어 창을 사용자가 닫았을 때 (캡처 정지 트리거)
     public var onViewerClosed: (() -> Void)?
+    /// 출력 창이 다른 화면으로 이동했을 때 (DisplayLink 재바인딩 트리거)
+    public var onOutputScreenChanged: ((NSScreen?) -> Void)?
+    private weak var lastOutputScreen: NSScreen?
+
+    /// 출력 창이 현재 위치한 화면
+    public var outputScreen: NSScreen? { overlayWindow?.currentScreen }
 
     public var trackingMethod: String { windowTracker.currentMethod.rawValue }
 
@@ -130,6 +136,12 @@ public final class OverlayManager {
         let overlayScreen = overlayWindow.currentScreen
         let same = sourceScreen == nil || overlayScreen == nil || sourceScreen == overlayScreen
         overlayWindow.setColorSpace(captureColorSpace, sameDisplayAsSource: same)
+
+        // 출력 화면이 바뀌면 페이싱도 그 화면 vsync로 재바인딩 필요
+        if overlayScreen !== lastOutputScreen {
+            lastOutputScreen = overlayScreen
+            onOutputScreenChanged?(overlayScreen)
+        }
     }
 
     /// 외부 CB에 렌더 인코딩. drawable 반환.

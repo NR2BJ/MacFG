@@ -13,10 +13,12 @@ public final class DisplayLinkSync: @unchecked Sendable {
     private var signalValue: UInt64 = 0
     private let logger = Logger(subsystem: "com.macfg", category: "DisplaySync")
 
+    private weak var boundScreen: NSScreen?
+
     public var refreshRate: Double {
         // 디스플레이 모드의 고정 주사율 우선 — 링크 틱 간격은 히컵 시 절반/제3값으로 읽혀
         // "콘텐츠가 이미 빠름" 오판정으로 보간을 억제한 사례 있음 (2026-07-02)
-        if let screen = NSScreen.main {
+        if let screen = boundScreen ?? NSScreen.main {
             let maxFPS = screen.maximumFramesPerSecond
             if maxFPS > 0 { return Double(maxFPS) }
         }
@@ -34,21 +36,22 @@ public final class DisplayLinkSync: @unchecked Sendable {
         self.sharedEvent = device.makeSharedEvent()!
     }
 
-    public func start(callback: @escaping @Sendable (CFTimeInterval, CFTimeInterval) -> Void) {
+    /// screen: 출력 창이 위치한 화면 (nil이면 메인) — 페이싱은 출력 화면의 vsync를 따라야 한다
+    public func start(screen: NSScreen? = nil, callback: @escaping @Sendable (CFTimeInterval, CFTimeInterval) -> Void) {
         self.callback = callback
 
-        // macOS: NSScreen.displayLink(withTarget:selector:)
-        guard let screen = NSScreen.main else {
-            logger.error("No main screen available")
+        guard let target = screen ?? NSScreen.main else {
+            logger.error("No screen available")
             return
         }
+        self.boundScreen = target
 
-        let link = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
+        let link = target.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
         // .common: 메뉴 추적/창 드래그 중에도 틱 유지 (.default만 쓰면 UI 조작 시 출력이 멈춘다)
         link.add(to: .main, forMode: .common)
         self.displayLink = link
 
-        logger.info("DisplayLink started")
+        logger.info("DisplayLink started (\(target.localizedName), \(target.maximumFramesPerSecond)Hz)")
     }
 
     public func stop() {

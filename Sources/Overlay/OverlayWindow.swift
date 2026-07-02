@@ -29,6 +29,11 @@ private final class ShaderCache: @unchecked Sendable {
             float2 texCoord;
         };
 
+        struct BlitParams {
+            float2 size;      // drawable 픽셀 크기
+            float radiusPx;   // 모서리 반경 (px, 0=마스킹 없음)
+        };
+
         vertex VertexOut blitVertex(uint vid [[vertex_id]]) {
             float2 positions[] = {
                 float2(-1, -1), float2(1, -1),
@@ -44,11 +49,24 @@ private final class ShaderCache: @unchecked Sendable {
             return out;
         }
 
+        // macOS 창의 둥근 모서리 재현 — CAMetalLayer cornerRadius는 직접 스캔아웃
+        // 경로에서 무시되는 것을 실측(모든 반경에서 픽셀 동일) → 셰이더 SDF 마스킹.
+        // 모서리 바깥은 alpha 0 (premultiplied) → 창 투명 영역으로 원본 모서리가 비침.
         fragment float4 blitFragment(VertexOut in [[stage_in]],
                                       texture2d<float> tex [[texture(0)]],
-                                      sampler samp [[sampler(0)]]) {
+                                      sampler samp [[sampler(0)]],
+                                      constant BlitParams& p [[buffer(0)]]) {
             float4 color = tex.sample(samp, in.texCoord);
             color.a = 1.0;
+            if (p.radiusPx > 0.5) {
+                float2 pos = in.texCoord * p.size;
+                float2 half_ = p.size * 0.5;
+                float2 q = fabs(pos - half_) - (half_ - p.radiusPx);
+                float d = length(max(q, 0.0)) - p.radiusPx;
+                float a = saturate(0.5 - d);   // 1px AA
+                color.rgb *= a;
+                color.a = a;
+            }
             return color;
         }
         """
@@ -76,6 +94,11 @@ private final class ShaderCache: @unchecked Sendable {
 }
 
 /// 출력 창 스타일
+public enum OverlayStyleConstants {
+    /// 표준 macOS 창 모서리 반경 (pt) — 검은 조각 경계 곡선 피팅으로 실측 14.1pt (2026-07-02)
+    public nonisolated(unsafe) static var cornerRadius: CGFloat = 14
+}
+
 public enum OverlayStyle: Sendable {
     /// borderless 오버레이 — 대상 창 위를 덮음 (Cover Source)
     case overlay
@@ -138,6 +161,10 @@ public final class OverlayWindow: NSObject {
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.hasShadow = false
             window.alphaValue = 1.0
+
+            // 모서리 마스킹은 셰이더 SDF로 수행 (CALayer.cornerRadius는 CAMetalLayer
+            // 직접 스캔아웃에서 무시됨 — 실측). 컴포지터가 알파를 쓰도록 비불투명 레이어.
+            metalLayer.isOpaque = false
 
             let contentView = NSView(frame: window.contentView!.bounds)
             contentView.wantsLayer = true
@@ -233,10 +260,21 @@ public final class OverlayWindow: NSObject {
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentTexture(texture, index: 0)
         encoder.setFragmentSamplerState(sampler, index: 0)
+        // 모서리 마스킹: overlay 스타일만 (viewer는 레터박스 배경이 검정이라 불필요)
+        var params = BlitParams(
+            size: SIMD2<Float>(Float(texW), Float(texH)),
+            radiusPx: style == .overlay ? Float(OverlayStyleConstants.cornerRadius * metalLayer.contentsScale) : 0
+        )
+        encoder.setFragmentBytes(&params, length: MemoryLayout<BlitParams>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 
         return drawable
+    }
+
+    private struct BlitParams {
+        var size: SIMD2<Float>
+        var radiusPx: Float
     }
 
     /// 뷰어: contentView 안에서 텍스처 종횡비 유지 레터박스 배치

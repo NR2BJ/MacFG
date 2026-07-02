@@ -1,45 +1,45 @@
 # MacFG
 
-macOS용 실시간 프레임 보간 오버레이 — Lossless Scaling의 맥 대응을 목표로 하는 개인 프로젝트.
+Real-time frame interpolation overlay for macOS — a personal take on Lossless Scaling for the Mac.
 
-창 하나를 골라 캡처하고, 프레임을 보간해 원본 위(또는 별도 창)에 120Hz+로 출력한다.
-4K 60→120을 M4 기본형에서 실측 검증했다 (glass 간격 σ<1ms, 소스 프레임 색 바이트 일치).
+Pick a window, and MacFG captures it, interpolates frames, and outputs at 120Hz+ either on top of the original window or in a separate viewer. Verified on a base M4 at 4K 60→120 (glass-time σ<1ms, source frames byte-identical in color).
 
-## 요구사항
+## Requirements
 
-- macOS 26 (Tahoe) 이상, Apple Silicon
-- 화면 기록 권한 (첫 실행 시 요청), 접근성 권한 (창 추적용)
+- macOS 26 (Tahoe) or later, Apple Silicon
+- Screen Recording permission (prompted on first run), Accessibility permission (window tracking)
 
-## 사용
+## Usage
 
-1. MacFG 실행 → 목록에서 대상 창 선택 → **Capture**
-2. 출력: **Cover Source** (원본 창 위에 덮음 — 클릭은 원본으로 통과) 또는 **Separate Window** (자유 이동 뷰어 창)
-3. 엔진:
-   - **Metal Flow** (권장) — LSFG 방식 순수 GPU. 저해상도 모션 지도 + 풀해상도 워프라 출력이 원본 선명도. 임의 위상 보간으로 프레임 드랍 갭 채움, 어떤 주사율에도 대응. M1부터 동작.
-   - **Apple FI** — VideoToolbox 저지연 보간 (ANE, 720p 고정·2배 고정). 복잡한 모션에서 NN 품질이 유리할 수 있음. 주사율을 원본 fps×2의 정수배로 설정 권장 (60fps→120Hz, 24fps→144Hz).
-4. 진단 로그: `/tmp/MacFG_diag.log` ([SCHED] 라인 — glass σ가 부드러움 지표)
+1. Launch MacFG → pick a target window → **Capture**
+2. Output: **Cover Source** (overlays the original window — clicks pass through) or **Separate Window** (free-floating viewer)
+3. Engine:
+   - **Metal Flow** (recommended) — LSFG-style pure-GPU pipeline. Low-resolution motion field + full-resolution warp, so output keeps native sharpness. Arbitrary-phase interpolation aligned to the display's vsync grid: fills frame-drop gaps and adapts to any refresh rate (60fps→144Hz works). Runs on any Apple Silicon.
+   - **Apple FI** — VideoToolbox low-latency frame interpolation (ANE, fixed 720p, fixed 2×). Its neural flow may handle complex motion better. Set your refresh rate to an integer multiple of source fps × 2 (60fps→120Hz, 24fps→144Hz).
+4. Diagnostics: `/tmp/MacFG_diag.log` — `[SCHED]` lines; `glass σ` is the smoothness ground truth, `skip[...]` explains any interpolation skips.
 
-## 빌드
+## Build
 
 ```sh
-swift build                    # 디버그
-scripts/make_app.sh 1.0.0      # release .app + .dmg (dist/)
+swift build                    # debug
+scripts/make_app.sh 1.0.0      # release .app + .dmg (in dist/)
 ```
 
-배포 서명이 아닌 adhoc 사인이므로, 다른 맥에서 받으면 최초 1회 우클릭→열기 (또는 `xattr -dr com.apple.quarantine MacFG.app`).
+Builds are ad-hoc signed. On another Mac, right-click → Open once (or `xattr -dr com.apple.quarantine MacFG.app`).
 
-## 구조
+## Architecture
 
-- `Sources/CaptureKit` — ScreenCaptureKit 캡처 (프레임 큐, 산포 fingerprint 중복 제거)
-- `Sources/FramePacing` — DisplayLink, 프레임 슬롯
-- `Sources/Interpolation` — 보간 엔진들 (`MetalFlowEngine`, `AppleFIEngine`, `PairEngine` 프로토콜)
-- `Sources/Overlay` — 오버레이/뷰어 창, 창 추적, 색 정책 (같은 디스플레이 passthrough)
-- `Sources/MacFGApp` — 타임스탬프 출력 스케줄러 (케이던스 PLL, 갭 적응 다중 t), UI
-- `Sources/TestPattern` — 자체 검증용 60fps 테스트 소스 (`--size W H --pos X Y --fps N`)
-- `research/rife` — RIFE CoreML 스파이크 (보류된 대안 경로)
+- `Sources/CaptureKit` — ScreenCaptureKit capture (frame queue, scattered-sample fingerprint dedup)
+- `Sources/FramePacing` — display link (bound to the output screen), frame slots
+- `Sources/Interpolation` — engines (`MetalFlowEngine`, `AppleFIEngine`, `PairEngine` protocol)
+- `Sources/Overlay` — overlay/viewer windows, window tracking, color policy (same-display passthrough for byte-exact color), shader-side rounded-corner masking
+- `Sources/MacFGApp` — timestamp output scheduler (cadence PLL, vsync-grid-aligned interpolation phases), UI
+- `Sources/TestPattern` — self-verification source (`--size W H --pos X Y --fps N`)
+- `research/rife` — RIFE CoreML spike (shelved alternative)
 
-## 알려진 한계
+## Known limitations
 
-- 장면 전환 감지는 휘도 히스토그램 기반 — 플래시/페이드 컷은 놓칠 수 있음 (8ms 모핑 프레임 1장 노출)
-- DRM 보호 콘텐츠(Netflix 등)는 캡처 자체가 검게 나옴 (macOS 제약)
-- Apple FI는 macOS 26 전용, 모델 해상도 720p 고정 (Apple 측 제약 — 세션 레벨 하드코딩 실측)
+- Scene-cut detection is luma-histogram based — flash/fade cuts may slip one 8ms morph frame through
+- DRM-protected content (Netflix, etc.) captures black (macOS restriction)
+- Apple FI is macOS 26-only and fixed at 720p (Apple-side session limit, measured)
+- Translucent title bars look flat in capture (SCK renders the window in isolation — inherent to window capture)

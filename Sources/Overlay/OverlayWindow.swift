@@ -119,6 +119,9 @@ public final class OverlayWindow: NSObject {
     private let logger = Logger(subsystem: "com.macfg", category: "OverlayWindow")
     private var appliedColorSpace: CGColorSpace?
     private var colorSpaceInitialized = false
+    private var upscaler: MetalFXUpscaler?
+    /// 출력 목표가 소스보다 클 때 MetalFX Spatial 업스케일 사용 (뷰어/큰 창). off면 이중선형.
+    public var upscaleEnabled = false
 
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
     public var onUserClose: (() -> Void)?
@@ -201,6 +204,8 @@ public final class OverlayWindow: NSObject {
         self.metalLayer = metalLayer
         super.init()
 
+        self.upscaler = MetalFXUpscaler(device: device)
+
         if style == .viewer {
             window.delegate = self
         }
@@ -242,8 +247,20 @@ public final class OverlayWindow: NSObject {
             layoutViewerLayer(textureWidth: texture.width, textureHeight: texture.height)
         }
 
-        let texW = CGFloat(texture.width)
-        let texH = CGFloat(texture.height)
+        // 업스케일: 뷰어에서 표시 목표(레터박스 영역 × 배율)가 소스보다 크면 MetalFX Spatial로
+        // 선명하게 올린다 (off이거나 실패하면 이중선형 스케일로 폴백 = 아래 그대로).
+        var source = texture
+        if upscaleEnabled, style == .viewer {
+            let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
+            let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
+            if targetW > texture.width || targetH > texture.height,
+               let up = upscaler?.upscale(texture, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
+                source = up
+            }
+        }
+
+        let texW = CGFloat(source.width)
+        let texH = CGFloat(source.height)
         if metalLayer.drawableSize.width != texW || metalLayer.drawableSize.height != texH {
             metalLayer.drawableSize = CGSize(width: texW, height: texH)
         }
@@ -258,7 +275,7 @@ public final class OverlayWindow: NSObject {
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return nil }
 
         encoder.setRenderPipelineState(pipelineState)
-        encoder.setFragmentTexture(texture, index: 0)
+        encoder.setFragmentTexture(source, index: 0)
         encoder.setFragmentSamplerState(sampler, index: 0)
         // 모서리 마스킹: overlay 스타일만 (viewer는 레터박스 배경이 검정이라 불필요)
         var params = BlitParams(

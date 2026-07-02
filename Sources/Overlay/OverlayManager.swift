@@ -29,6 +29,7 @@ public final class OverlayManager {
     private let device: any MTLDevice
     private var lastAppliedFrame: CGRect = .zero
     private var placement: OverlayPlacement = .coverSource
+    private var upscaleEnabled = false
     private var trackedWindowID: CGWindowID?
     private var captureColorSpace: CGColorSpace?
     /// 소스 창의 NS 좌표 프레임 (windowTracker.pollGeometry 결과)
@@ -82,6 +83,12 @@ public final class OverlayManager {
         logger.info("Overlay stopped")
     }
 
+    /// MetalFX 업스케일 토글 — 현재 창에 즉시 적용 + 이후 창 재생성에도 유지
+    public func setUpscaleEnabled(_ enabled: Bool) {
+        upscaleEnabled = enabled
+        overlayWindow?.upscaleEnabled = enabled
+    }
+
     public func setPlacement(_ newPlacement: OverlayPlacement) {
         let changed = placement != newPlacement
         placement = newPlacement
@@ -103,6 +110,7 @@ public final class OverlayManager {
         overlay.onUserClose = { [weak self] in
             self?.onViewerClosed?()
         }
+        overlay.upscaleEnabled = upscaleEnabled
         self.overlayWindow = overlay
 
         applyOcclusionPolicy()

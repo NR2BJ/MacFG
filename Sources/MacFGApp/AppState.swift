@@ -120,6 +120,8 @@ public final class AppState {
     // (144Hz 기준 — 24fps: 144fps/σ0.8 vs AppleFI 48fps/σ9; 지터 강건성 동급 이상)
     var selectedRenderMode: RenderMode = .metalFlow
     var selectedOverlayPlacement: OverlayPlacement = .coverSource
+    /// MetalFX Spatial 업스케일 — 출력(뷰어/큰 창)이 소스보다 클 때 선명화. Cover(1:1)엔 무영향.
+    var isUpscaleEnabled = false
 
     // MARK: - Components
     let device: any MTLDevice
@@ -258,6 +260,7 @@ public final class AppState {
             let v = args[pIdx + 1]
             selectedOverlayPlacement = (v == "viewer" || v == "beside") ? .viewerWindow : .coverSource
         }
+        if args.contains("--upscale") { isUpscaleEnabled = true }
         if let fIdx = args.firstIndex(of: "--flow-base"), fIdx + 1 < args.count,
            let base = Double(args[fIdx + 1]), base >= 120, base <= 2048 {
             MetalFlowEngine.flowBaseLongSide = base
@@ -299,6 +302,7 @@ public final class AppState {
 
             overlayManager?.setPlacement(selectedOverlayPlacement)
             try overlayManager?.start(windowID: windowID)
+            overlayManager?.setUpscaleEnabled(isUpscaleEnabled)
             trackingMethod = overlayManager?.trackingMethod ?? "Unknown"
 
             // 엔진 준비를 먼저 끝낸 뒤 렌더 루프 시작 (출력 화면의 vsync에 바인딩)
@@ -988,6 +992,10 @@ public final class AppState {
         } else {
             interpolationEngine = selectedRenderMode.displayName
         }
+    }
+
+    func updateUpscale() {
+        overlayManager?.setUpscaleEnabled(isUpscaleEnabled)
     }
 
     func updateOverlayPlacement() {

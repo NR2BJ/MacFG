@@ -114,6 +114,16 @@ struct WindowPickerView: View {
                 .onChange(of: appState.selectedOverlayPlacement) {
                     appState.updateOverlayPlacement()
                 }
+
+                // 전역 단축키 안내 (Cover 배치 전용 — 전체화면에서 창 없이 제어).
+                // 오버레이는 소스 앱이 최전면일 때만 표시되고, 벗어나면 자동으로 숨는다.
+                if appState.selectedOverlayPlacement == .coverSource {
+                    Label("⌃⌥⌘I toggle overlay · ⌃⌥⌘. stop · hides when you switch apps",
+                          systemImage: "keyboard")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
 
             Spacer()

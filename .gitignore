@@ -1,0 +1,11 @@
+worklog.md
+.DS_Store
+.build/
+research/rife/.pixi/
+research/rife/*.pkl
+research/rife/*.mlpackage
+research/rife/*.zip
+research/rife/v425/
+research/rife/__pycache__/
+dist/
+*.dmg

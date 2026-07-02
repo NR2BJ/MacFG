@@ -14,17 +14,17 @@ public final class DisplayLinkSync: @unchecked Sendable {
     private let logger = Logger(subsystem: "com.macfg", category: "DisplaySync")
 
     public var refreshRate: Double {
-        // CADisplayLink의 실제 간격에서 주사율 계산
+        // 디스플레이 모드의 고정 주사율 우선 — 링크 틱 간격은 히컵 시 절반/제3값으로 읽혀
+        // "콘텐츠가 이미 빠름" 오판정으로 보간을 억제한 사례 있음 (2026-07-02)
+        if let screen = NSScreen.main {
+            let maxFPS = screen.maximumFramesPerSecond
+            if maxFPS > 0 { return Double(maxFPS) }
+        }
         if let link = displayLink, link.targetTimestamp > link.timestamp {
             let interval = link.targetTimestamp - link.timestamp
             if interval > 0 {
                 return 1.0 / interval
             }
-        }
-        // 폴백: NSScreen.maximumFramesPerSecond
-        if let screen = NSScreen.main {
-            let maxFPS = screen.maximumFramesPerSecond
-            if maxFPS > 0 { return Double(maxFPS) }
         }
         return 60.0
     }

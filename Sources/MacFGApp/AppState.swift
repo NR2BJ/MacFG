@@ -349,6 +349,15 @@ public final class AppState {
     private var diagDrainDepthSum: Int = 0         // 매 틱 drain한 프레임 수 (버스트 판별)
     private var diagDrainDepthMax: Int = 0
     private var diagDrainSamples: Int = 0
+    // 보간 스킵 사유별 카운터 (interpEnc=0 재발 시 원인 특정)
+    private var diagSkipToggleOff = 0
+    private var diagSkipEngineNil = 0
+    private var diagSkipNoPrev = 0
+    private var diagSkipContentFast = 0
+    private var diagSkipBigGap = 0
+    private var diagSkipDiscontinuity = 0
+    private var diagSkipEngineFail = 0
+    private var diagSkipOther = 0
 
     // MARK: - Render Loop
 
@@ -465,6 +474,9 @@ public final class AppState {
               let stable = acquireStableTexture(width: sourceTexture.width, height: sourceTexture.height),
               let cb = workQueue.makeCommandBuffer() else {
             diagPoolExhaustCount += 1
+            // 이 프레임은 수용 실패 — 상태를 되돌려 다음 프레임이 정상 쌍(연속성 유지)을 만들게 함
+            lastAcceptedTimestamp = previousAcceptedTs
+            snappedLastTimestamp = 0
             return
         }
 
@@ -488,6 +500,10 @@ public final class AppState {
         var pairStartTs: CFTimeInterval = 0
         var pairGap: CFTimeInterval = 0
         let refreshRate = displaySync?.refreshRate ?? 120.0
+        // 보간 스킵 사유 진단 (재현 시 원인 즉시 특정용)
+        if !isInterpolationEnabled { diagSkipToggleOff += 1 }
+        else if pairEngine == nil { diagSkipEngineNil += 1 }
+        else if prevStable == nil { diagSkipNoPrev += 1 }
         let wantInterpolation = isInterpolationEnabled && pairEngine != nil
         if wantInterpolation, let prev = prevStable {
             let gap = snappedTs - prev.timestamp
@@ -507,9 +523,20 @@ public final class AppState {
                 )
                 pairStartTs = prev.timestamp
                 pairGap = gap
-                if interpResult != nil { diagInterpEncodedCount += tValues.count }
+                if interpResult != nil {
+                    diagInterpEncodedCount += tValues.count
+                } else {
+                    diagSkipEngineFail += 1
+                }
+            } else if contentAlreadyFast {
+                diagSkipContentFast += 1
             } else if gap >= 0.25 {
+                diagSkipBigGap += 1
                 pairEngine?.reset()
+            } else if previousAcceptedTs != prev.rawTimestamp {
+                diagSkipDiscontinuity += 1
+            } else {
+                diagSkipOther += 1
             }
         }
 
@@ -662,9 +689,23 @@ public final class AppState {
         let srcIntHi = diagSrcIntMax * 1000
         let drainAvg = diagDrainSamples > 0 ? Double(diagDrainDepthSum) / Double(diagDrainSamples) : 0
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) present=\(diagPresentCount) (I=\(diagInterpPresentCount)) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        var skipParts: [String] = []
+        if diagSkipToggleOff > 0 { skipParts.append("off:\(diagSkipToggleOff)") }
+        if diagSkipEngineNil > 0 { skipParts.append("noEng:\(diagSkipEngineNil)") }
+        if diagSkipNoPrev > 0 { skipParts.append("noPrev:\(diagSkipNoPrev)") }
+        if diagSkipContentFast > 0 { skipParts.append("fast:\(diagSkipContentFast)") }
+        if diagSkipBigGap > 0 { skipParts.append("gap:\(diagSkipBigGap)") }
+        if diagSkipDiscontinuity > 0 { skipParts.append("discont:\(diagSkipDiscontinuity)") }
+        if diagSkipEngineFail > 0 { skipParts.append("engFail:\(diagSkipEngineFail)") }
+        if diagSkipOther > 0 { skipParts.append("other:\(diagSkipOther)") }
+        let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
+
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
         diagResyncCount = 0
+        diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
+        diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
+        diagSkipEngineFail = 0; diagSkipOther = 0
 
         diagSourceCount = 0
         diagDupSkipCount = 0

@@ -48,3 +48,15 @@ extension FrameInterpolator {
         return results
     }
 }
+
+// MARK: - Errors
+
+/// 보간 엔진 공용 에러 (Blend/AppleFI/MetalFlow 공유)
+public enum InterpolationError: Error, Sendable {
+    case shaderCompilationFailed
+    case notPrepared
+    case textureAllocationFailed
+    case encoderCreationFailed
+    case opticalFlowFailed(String)
+    case visionRequestFailed(String)
+}

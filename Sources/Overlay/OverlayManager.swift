@@ -89,6 +89,9 @@ public final class OverlayManager {
         overlayWindow?.upscaleEnabled = enabled
     }
 
+    /// 업스케일 실동작 상태 (UI 표시용)
+    public var scaleStatus: String? { overlayWindow?.scaleStatus }
+
     public func setPlacement(_ newPlacement: OverlayPlacement) {
         let changed = placement != newPlacement
         placement = newPlacement

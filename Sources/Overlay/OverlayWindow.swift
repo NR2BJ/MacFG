@@ -122,6 +122,8 @@ public final class OverlayWindow: NSObject {
     private var upscaler: MetalFXUpscaler?
     /// 출력 목표가 소스보다 클 때 MetalFX Spatial 업스케일 사용 (뷰어/큰 창). off면 이중선형.
     public var upscaleEnabled = false
+    /// 업스케일 실동작 상태 (UI 표시용) — nil = 토글 off 또는 overlay 스타일
+    public private(set) var scaleStatus: String?
 
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
     public var onUserClose: (() -> Void)?
@@ -253,10 +255,16 @@ public final class OverlayWindow: NSObject {
         if upscaleEnabled, style == .viewer {
             let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
             let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
-            if targetW > texture.width || targetH > texture.height,
+            if targetW > texture.width, targetH > texture.height,
                let up = upscaler?.upscale(texture, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
                 source = up
+                scaleStatus = "MetalFX \(texture.width)×\(texture.height) → \(targetW)×\(targetH)"
+            } else {
+                // 출력이 소스 이하 크기 = 업스케일할 게 없음 (4K 소스를 작은 뷰어로 볼 때)
+                scaleStatus = "1:1 (output ≤ source, nothing to upscale)"
             }
+        } else {
+            scaleStatus = nil
         }
 
         let texW = CGFloat(source.width)

@@ -83,6 +83,15 @@ struct WindowPickerView: View {
                         .fontWeight(.medium)
                         .monospacedDigit()
                 }
+                if let scale = appState.upscaleStatus {
+                    GridRow {
+                        Text("Scale")
+                            .foregroundStyle(.secondary)
+                        Text(scale)
+                            .fontWeight(.medium)
+                            .font(.caption)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -104,6 +113,17 @@ struct WindowPickerView: View {
                 .onChange(of: appState.selectedRenderMode) {
                     appState.updateRenderMode()
                 }
+
+                // 배율: Auto = 디스플레이 슬롯 전부 채움 (30fps→120Hz면 4x),
+                // ×N = 소스 fps × N 상한 (예: 30fps ×2 → 60fps에서 멈춤)
+                Picker("Multiplier", selection: $appState.frameMultiplier) {
+                    Text("Auto").tag(0)
+                    Text("×2").tag(2)
+                    Text("×3").tag(3)
+                    Text("×4").tag(4)
+                    Text("×5").tag(5)
+                }
+                .pickerStyle(.segmented)
 
                 Picker("Output", selection: $appState.selectedOverlayPlacement) {
                     ForEach(OverlayPlacement.allCases) { placement in

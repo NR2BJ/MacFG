@@ -122,6 +122,11 @@ public final class AppState {
     var selectedOverlayPlacement: OverlayPlacement = .coverSource
     /// MetalFX Spatial 업스케일 — 출력(뷰어/큰 창)이 소스보다 클 때 선명화. Cover(1:1)엔 무영향.
     var isUpscaleEnabled = false
+    /// 업스케일 실동작 상태 (UI 표시용) — nil이면 미캡처/비활성
+    var upscaleStatus: String?
+    /// 보간 배율: 0=Auto(디스플레이 슬롯 전부 채움), 2~5=소스 fps × N 상한.
+    /// 30fps 소스를 굳이 120까지 안 올리고 60(×2)에서 멈추고 싶을 때.
+    var frameMultiplier: Int = 0
 
     // MARK: - Components
     let device: any MTLDevice
@@ -261,6 +266,11 @@ public final class AppState {
             selectedOverlayPlacement = (v == "viewer" || v == "beside") ? .viewerWindow : .coverSource
         }
         if args.contains("--upscale") { isUpscaleEnabled = true }
+        if let mIdx = args.firstIndex(of: "--multiplier"), mIdx + 1 < args.count,
+           let m = Int(args[mIdx + 1]), (2...5).contains(m) {
+            frameMultiplier = m
+            DiagnosticLog.shared.log("[AUTO] frameMultiplier=×\(m)")
+        }
         if let fIdx = args.firstIndex(of: "--flow-base"), fIdx + 1 < args.count,
            let base = Double(args[fIdx + 1]), base >= 120, base <= 2048 {
             MetalFlowEngine.flowBaseLongSide = base
@@ -697,7 +707,22 @@ public final class AppState {
                 // 시간축이 출렁였다 (Metal Flow가 AppleFI보다 덜 부드럽던 원인).
                 // 그리드 시각에 놓인 프레임은 pick 시점과 정확히 일치 → 완전 균일 모션.
                 var tValues: [Float] = []
-                if lastVsyncTarget > 0 {
+                if frameMultiplier >= 2 {
+                    // 정수배 모드: 출력 = 소스 fps × M 상한 (쌍당 M-1장 균등분할).
+                    // 갭이 크면(드랍) 스텝 비례로 늘려 M배 케이던스 유지.
+                    // M×fps가 주사율을 넘는 초과분은 표시 불가라 생성도 안 함.
+                    let interval = sourceIntervalEMA > 0 ? sourceIntervalEMA : gap
+                    let steps = max(1.0, (gap / interval).rounded())
+                    let maxUseful = max(1, Int((interval / displayInterval).rounded()))
+                    let m = min(frameMultiplier, maxUseful)
+                    let count = min(m * Int(steps) - 1, 8)
+                    if count >= 1 {
+                        // 균등분할. 주의: M×fps < 주사율이면 홀드가 2슬롯+ 이므로 위상 오차가
+                        // 가끔 1/3슬롯 홀드로 튀는 양자화 지터(σ~3ms)는 불가피 — 표시 그리드
+                        // 스냅도 개선 없음 실측 (소스 프레임이 소스 그리드에 있어 혼합 케이던스)
+                        tValues = (1...count).map { Float($0) / Float(count + 1) }
+                    }
+                } else if lastVsyncTarget > 0 {
                     let gridRef = lastVsyncTarget - latencyOffset
                     let kStart = ((prev.timestamp - gridRef) / displayInterval + 1e-6).rounded(.up)
                     var slotTime = gridRef + kStart * displayInterval
@@ -970,6 +995,7 @@ public final class AppState {
             outputFPS = 0
         }
         latencyMs = latencySamplesMs.isEmpty ? 0 : latencySamplesMs.reduce(0, +) / Double(latencySamplesMs.count)
+        upscaleStatus = overlayManager?.scaleStatus
     }
 
     // MARK: - Interpolation Control

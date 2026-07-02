@@ -345,7 +345,7 @@ public final class AppState {
         lastPresentedTexture = nil
         lastAcceptedTimestamp = 0
         lastAcceptedFingerprint = 0
-        snappedLastTimestamp = 0
+        resetSnapState()
         lastVsyncTarget = 0
         sourceIntervalEMA = 0
         hasReceivedFirstFrame = false
@@ -364,9 +364,12 @@ public final class AppState {
     private var prevStable: (texture: any MTLTexture, timestamp: CFTimeInterval, rawTimestamp: CFTimeInterval)?
     private var lastAcceptedTimestamp: CFTimeInterval = 0
     private var lastAcceptedFingerprint: UInt64 = 0
-    /// 케이던스 스냅 상태 — 캡처 ts는 디스플레이 vsync 그리드(144Hz 등)에 양자화되어
-    /// 60fps 콘텐츠가 13.9/20.8ms 교대 간격으로 도착한다. 위상고정 그리드에 스냅해
-    /// 보간 midpoint가 실제 콘텐츠 타임라인의 중점에 놓이게 한다.
+    /// 케이던스 스냅 상태 — 캡처 ts는 디스플레이 vsync 그리드(144Hz 등)에 양자화되고
+    /// 실콘텐츠(브라우저)는 PTS가 [5~99ms]로 튄다. 중앙값 간격 + 앵커 그리드로 락을 유지하고
+    /// 이탈 3연속일 때만 재동기 — 즉발 재동기는 그리드 정렬 위상을 흔들어 σ를 키운다 (실측).
+    private var snapDeltaRing: [Double] = []
+    private var snapAnchor: CFTimeInterval = 0
+    private var snapMissStreak = 0
     private var snappedLastTimestamp: CFTimeInterval = 0
     private var diagResyncCount = 0
     private var lastPresentedTimestamp: CFTimeInterval = 0
@@ -548,7 +551,7 @@ public final class AppState {
             diagPoolExhaustCount += 1
             // 이 프레임은 수용 실패 — 상태를 되돌려 다음 프레임이 정상 쌍(연속성 유지)을 만들게 함
             lastAcceptedTimestamp = previousAcceptedTs
-            snappedLastTimestamp = 0
+            resetSnapState()
             return
         }
 
@@ -596,7 +599,7 @@ public final class AppState {
                     var slotTime = gridRef + kStart * displayInterval
                     // 소스 B 직전 0.6슬롯은 비워둠 — 그 vsync는 선명한 원본 B가 차지해야 한다
                     // (0.25로 좁히면 t≈0.9 보간이 B를 밀어내 원본 표시율이 절반으로 떨어짐, 실측)
-                    while slotTime < snappedTs - displayInterval * 0.6 && tValues.count < 5 {
+                    while slotTime < snappedTs - displayInterval * 0.6 && tValues.count < 8 {
                         let t = (slotTime - prev.timestamp) / gap
                         if t > 0.02 { tValues.append(Float(t)) }
                         slotTime += displayInterval
@@ -611,8 +614,8 @@ public final class AppState {
                 )
                 pairStartTs = prev.timestamp
                 pairGap = gap
-                if interpResult != nil {
-                    diagInterpEncodedCount += tValues.count
+                if let interpResult {
+                    diagInterpEncodedCount += interpResult.frames.count
                 } else {
                     diagSkipEngineFail += 1
                 }
@@ -680,39 +683,57 @@ public final class AppState {
         cb.commit()
     }
 
-    /// 캡처 타임스탬프를 콘텐츠 케이던스 그리드에 위상고정(PLL) 스냅.
+    /// 캡처 타임스탬프를 콘텐츠 케이던스 그리드에 스냅 (중앙값 간격 + 앵커 락).
     ///
-    /// 소스 창은 자기 디스플레이 vsync에서만 프레임을 올릴 수 있어, 144Hz 모니터의
-    /// 60fps 영상은 13.9/20.8ms 교대 간격으로 캡처된다 (144/60=2.4, 비정수).
-    /// 이 지터를 그대로 쓰면 보간 midpoint가 실제 콘텐츠 중점에서 ±3.5ms 어긋나
-    /// 미세 저더가 생긴다. EMA 주기 그리드에 스냅하되 잔차의 10%만 반영해
-    /// 실제 클럭에서 벗어나지 않게 위상 추적한다.
+    /// 소스는 vsync 양자화(±dI/2) + 실콘텐츠 PTS 지터([5~99ms] 실측)를 함께 갖는다.
+    /// - 간격: 최근 델타의 중앙값 (EMA는 버스트에 끌려감)
+    /// - 위상: 앵커 그리드에 k스텝 반올림 스냅, |오차| ≤ 0.5간격이면 락 유지 (앵커는 5%만 이동)
+    /// - 재동기: 3연속 이탈 시에만 — 즉발 재동기는 그리드 정렬 보간의 위상을 흔든다
     private func snapTimestamp(raw: CFTimeInterval, rawDelta: Double) -> CFTimeInterval {
-        let interval = sourceIntervalEMA
-        guard interval > 0.002, snappedLastTimestamp > 0 else {
+        if rawDelta > 0.002 && rawDelta < 0.5 {
+            snapDeltaRing.append(rawDelta)
+            if snapDeltaRing.count > 15 { snapDeltaRing.removeFirst() }
+        }
+        guard snapDeltaRing.count >= 3, snapAnchor > 0 else {
+            snapAnchor = raw
+            snapMissStreak = 0
             snappedLastTimestamp = raw
             return raw
         }
-        // 케이던스 급변(더 빠른 콘텐츠 전환/일시정지 재개) → 재동기
-        if rawDelta < interval * 0.3 || rawDelta > 0.5 {
-            snappedLastTimestamp = raw
+        let interval = snapDeltaRing.sorted()[snapDeltaRing.count / 2]
+        // 스케줄러/힌트가 쓰는 대표 간격도 중앙값으로 유지
+        sourceIntervalEMA = interval
+
+        let k = ((raw - snapAnchor) / interval).rounded()
+        let predicted = snapAnchor + k * interval
+        let err = raw - predicted
+
+        if abs(err) <= interval * 0.5 && k >= 1 {
+            snapMissStreak = 0
+            snapAnchor += err * 0.05 // 실클럭 드리프트 추적 (천천히)
+            var snapped = predicted
+            snapped = max(snapped, snappedLastTimestamp + 0.001) // 단조 증가 (VT 세션 요구)
+            snappedLastTimestamp = snapped
+            return snapped
+        }
+
+        // 이탈 — 락은 유지하되 이 프레임은 raw로 통과, 지속되면 재동기
+        snapMissStreak += 1
+        if snapMissStreak >= 3 || rawDelta > 0.5 {
+            snapAnchor = raw
+            snapMissStreak = 0
             diagResyncCount += 1
-            return raw
         }
-        let steps = max(1.0, (rawDelta / interval).rounded())
-        var snapped = snappedLastTimestamp + steps * interval
-        // 위상 오차가 크면 그리드가 어긋난 것 → 재동기.
-        // 허용창 0.5는 비정수 주사율/콘텐츠 비율의 vsync 양자화(±displayInterval/2)
-        // + SCK 전달 지터를 흡수 — 0.35는 144Hz@60fps에서 재동기 폭풍(2초당 30회) 유발 실측.
-        if abs(raw - snapped) > interval * 0.5 {
-            snappedLastTimestamp = raw
-            diagResyncCount += 1
-            return raw
-        }
-        snapped += (raw - snapped) * 0.1
-        snapped = max(snapped, snappedLastTimestamp + 0.001) // 단조 증가 (VT 세션 요구)
+        let snapped = max(raw, snappedLastTimestamp + 0.001)
         snappedLastTimestamp = snapped
         return snapped
+    }
+
+    private func resetSnapState() {
+        snapDeltaRing = []
+        snapAnchor = 0
+        snapMissStreak = 0
+        snappedLastTimestamp = 0
     }
 
     /// 사용 중이지 않은 풀 텍스처 획득 (타임라인/직전 소스/마지막 표시/인플라이트 제외)

@@ -15,6 +15,8 @@ final class PatternView: NSView {
     private var frameIndex: UInt32 = 0
     private var lastAdvance: CFTimeInterval = 0
     var contentFPS: Double = 60.0
+    /// 실콘텐츠(브라우저)의 PTS 지터 재현용 — 프레임별 ±jitterMs 랜덤 지연
+    var jitterMs: Double = 0
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -95,9 +97,17 @@ final class PatternView: NSView {
     }
 
     @objc private func tick(_ link: CADisplayLink) {
-        // 120Hz 틱에서 60fps로 프레임 전진
+        // 디스플레이 틱에서 contentFPS로 프레임 전진 (+옵션 지터)
         let now = link.timestamp
-        if now - lastAdvance >= (1.0 / contentFPS) - 0.002 {
+        var threshold = (1.0 / contentFPS) - 0.002
+        if jitterMs > 0 {
+            // frameIndex 기반 결정적 의사난수 (splitmix) — ±jitterMs
+            var z = UInt64(frameIndex) &* 0x9e3779b97f4a7c15
+            z = (z ^ (z >> 30)) &* 0xbf58476d1ce4e5b9
+            let r = Double(z % 2000) / 1000.0 - 1.0
+            threshold += r * jitterMs / 1000.0
+        }
+        if now - lastAdvance >= threshold {
             lastAdvance = now
             frameIndex &+= 1
             render()
@@ -152,6 +162,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let i = args.firstIndex(of: "--fps"), i + 1 < args.count, let f = Double(args[i + 1]) {
             fps = f
         }
+        var jitter: Double = 0
+        if let i = args.firstIndex(of: "--jitter"), i + 1 < args.count, let j = Double(args[i + 1]) {
+            jitter = j
+        }
         window = NSWindow(
             contentRect: NSRect(x: px, y: py, width: w, height: h),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -160,6 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "MacFG Test Pattern"
         view = PatternView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         view.contentFPS = fps
+        view.jitterMs = jitter
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

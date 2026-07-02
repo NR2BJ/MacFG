@@ -150,6 +150,33 @@ public final class AppState {
                 await self.stopCapture()
             }
         }
+        // 디스플레이 구성 변경(주사율 전환/모니터 연결 해제) 시 DisplayLink 재시작 —
+        // 기존 링크는 이전 모드에 묶여 페이싱이 깨진다 (사용자가 120↔144Hz를 오가는 환경)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleScreenParametersChange()
+            }
+        }
+    }
+
+    private func handleScreenParametersChange() {
+        guard isCapturing, displaySync != nil else { return }
+        DiagnosticLog.shared.log("[DISPLAY] screen parameters changed → DisplayLink 재시작")
+        restartDisplayLink()
+    }
+
+    private func restartDisplayLink() {
+        displaySync?.stop()
+        let sync = DisplayLinkSync(device: device)
+        displaySync = sync
+        sync.start { [weak self] timestamp, targetTimestamp in
+            MainActor.assumeIsolated {
+                self?.onDisplayLinkTick(timestamp: timestamp, targetTimestamp: targetTimestamp)
+            }
+        }
     }
 
     // MARK: - Window Discovery
@@ -224,6 +251,7 @@ public final class AppState {
     // MARK: - Capture Control
 
     func startCapture() async {
+        guard !isCapturing else { return }
         guard let windowID = selectedWindowID else {
             logger.warning("No window selected")
             return
@@ -285,6 +313,23 @@ public final class AppState {
         DiagnosticLog.shared.log("Capture stopped")
     }
 
+    /// 캡처 스트림만 재시작 (오버레이/DisplayLink/엔진 유지) — 창 리사이즈 대응
+    private func restartCaptureStream(reason: String) async {
+        guard let windowID = selectedWindowID, isCapturing, !isRestartingCapture else { return }
+        isRestartingCapture = true
+        defer { isRestartingCapture = false }
+        DiagnosticLog.shared.log("[CAPTURE] stream restart: \(reason)")
+        await captureManager.stopCapture()
+        do {
+            try await captureManager.startCapture(windowID: windowID, device: device)
+            resetScheduler()
+            pairEngine?.reset()
+        } catch {
+            DiagnosticLog.shared.log("[CAPTURE] stream restart FAILED: \(error) → 캡처 종료")
+            await stopCapture()
+        }
+    }
+
     private func resetScheduler() {
         timeline = []
         inFlightTextures = []
@@ -323,6 +368,9 @@ public final class AppState {
     private var lastPresentedTexture: (any MTLTexture)?
     private var sourceIntervalEMA: Double = 0
     private var hasReceivedFirstFrame: Bool = false
+    /// 캡처 창 리사이즈 감지 (연속 감지 횟수 — 드래그 중 재시작 연발 방지)
+    private var resizeMismatchCount = 0
+    private var isRestartingCapture = false
     private var presentedTimes: [CFTimeInterval] = []
     private var latencySamplesMs: [Double] = []
 
@@ -406,6 +454,22 @@ public final class AppState {
             logger.info("Target window closed, stopping")
             Task { await stopCapture() }
             return
+        }
+
+        // 캡처 창 리사이즈 감지 — SCK 스트림은 시작 시 해상도 고정이라 리사이즈하면
+        // 늘어나거나 흐려진다. 새 크기가 ~1초 유지되면 스트림만 재시작 (오버레이/엔진 유지).
+        if diagTick % 60 == 0, isCapturing, !isRestartingCapture, stablePoolWidth > 0,
+           let src = overlayManager?.sourcePixelSize {
+            let mismatch = abs(src.width - stablePoolWidth) > 8 || abs(src.height - stablePoolHeight) > 8
+            if mismatch {
+                resizeMismatchCount += 1
+                if resizeMismatchCount >= 2 {
+                    resizeMismatchCount = 0
+                    Task { await restartCaptureStream(reason: "resize → \(src.width)x\(src.height)") }
+                }
+            } else {
+                resizeMismatchCount = 0
+            }
         }
 
         // 3) 타임라인 정리

@@ -121,7 +121,7 @@ struct WindowPickerView: View {
             // 맨 아래 고정 안내 — Apple FI는 2배 보간 고정이라 주사율 정합이 중요.
             // (Metal Flow는 갭 채움으로 임의 주사율 대응 → 안내 불필요)
             if appState.isInterpolationEnabled && appState.selectedRenderMode == .appleFI {
-                Text("Apple FI는 2배 보간 고정입니다. 모니터 주사율을 원본 fps×2의 정수배로 설정하면 가장 부드럽습니다 (60fps→120Hz, 24fps→144Hz).")
+                Text("Apple FI is fixed 2× interpolation. For smoothest playback, set your display refresh rate to an integer multiple of source fps × 2 (60fps → 120Hz, 24fps → 144Hz).")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

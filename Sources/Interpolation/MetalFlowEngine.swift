@@ -263,7 +263,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         maskTex = tex(levels[0].w, levels[0].h, .rg8Unorm)
 
         outputPool = []; statsBuffers = []; outputIndex = 0; statsIndex = 0
-        for _ in 0..<12 {
+        // 출력 풀 크기를 바이트 예산으로 스케일 — 16MP(5120x3140) 캡처에서 12×64MB=770MB
+        // 메모리 압박 실측. 예산 ~420MB: 4K→12장, 16MP→6장 (갭 채움 최소 요구 충족)
+        let bytesPerTexture = max(width * height * 4, 1)
+        let poolCount = min(12, max(6, (420 << 20) / bytesPerTexture))
+        for _ in 0..<poolCount {
             if let t = tex(width, height, .bgra8Unorm) {
                 outputPool.append(t)
             }

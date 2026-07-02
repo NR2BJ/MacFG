@@ -37,6 +37,16 @@ public final class OverlayManager {
     /// 연속 창 추적 실패 횟수 — 대상 창 종료 감지용 (성공 시 0으로 리셋)
     public private(set) var trackingFailureCount: Int = 0
 
+    /// 소스 창의 현재 픽셀 크기 (points × 해당 화면 배율) — 캡처 해상도와 비교해 리사이즈 감지용
+    public var sourcePixelSize: (width: Int, height: Int)? {
+        guard lastSourceFrame.width > 1, lastSourceFrame.height > 1 else { return nil }
+        let screen = NSScreen.screens.first {
+            $0.frame.contains(CGPoint(x: lastSourceFrame.midX, y: lastSourceFrame.midY))
+        } ?? NSScreen.main
+        let scale = screen?.backingScaleFactor ?? 2.0
+        return (Int(lastSourceFrame.width * scale), Int(lastSourceFrame.height * scale))
+    }
+
     /// 뷰어 창을 사용자가 닫았을 때 (캡처 정지 트리거)
     public var onViewerClosed: (() -> Void)?
 

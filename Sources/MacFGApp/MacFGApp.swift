@@ -14,7 +14,9 @@ struct MacFGApp: App {
     }
 
     var body: some Scene {
-        WindowGroup(id: "main") {
+        // Window(단일 인스턴스): WindowGroup은 openWindow(id:)마다 새 창을 만들어
+        // macOS 자동 탭으로 합쳐지는 문제가 있었음 — 보간 세션은 한 번에 하나면 충분
+        Window("MacFG", id: "main") {
             WindowPickerView(appState: appState)
                 .onAppear {
                     setupMenuBar()

@@ -50,6 +50,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private var flowB: [any MTLTexture] = []   // B→A
     private var flowTmp: [any MTLTexture] = [] // 스무딩 핑퐁
     private var maskTex: (any MTLTexture)?     // base res: r=신뢰도, g=정적
+    // 시간적 flow 전파: 이전 쌍의 코스 flow를 다음 쌍 시작점으로 (벡터 노이즈/shimmer 억제)
+    private var prevCoarseF: (any MTLTexture)?
+    private var prevCoarseB: (any MTLTexture)?
+    private var hasTemporalPrior = false
     // 출력 링: 갭 채움으로 쌍당 최대 4장 → 넉넉히 12 (타임라인 cap 12와 정합)
     private var outputPool: [any MTLTexture] = []
     private var outputIndex = 0
@@ -123,18 +127,23 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             dispatch(enc, levels[l].w, levels[l].h, downHalfPSO)
         }
 
-        // 2) coarse→fine 매칭 (양방향) + 스무딩
+        // 2) coarse→fine 매칭 (양방향) + 스무딩.
+        // 코스 레벨은 이전 쌍의 flow를 prior로 사용 (시간적 전파 — 프레임 간 벡터 일관성).
+        // 주의: 시간적 prior는 스케일 1(동일 레벨)이므로 priorScale=1, 공간 prior는 2.
         for l in stride(from: L - 1, through: 0, by: -1) {
+            let isCoarsest = (l == L - 1)
+            let useTemporal = isCoarsest && hasTemporalPrior
             var params = MatchParams(
-                searchRadius: l == L - 1 ? 3 : 1,
-                hasPrior: l == L - 1 ? 0 : 1,
-                refine: l == 0 ? 1 : 0  // 서브픽셀 refine은 최종 레벨만 (비용 40%↓)
+                searchRadius: isCoarsest ? 3 : 1,
+                hasPrior: (useTemporal || !isCoarsest) ? 1 : 0,
+                refine: l == 0 ? 1 : 0,  // 서브픽셀 refine은 최종 레벨만 (비용 40%↓)
+                priorScale: isCoarsest ? 1.0 : 2.0
             )
             // forward: A→B
             enc.setComputePipelineState(matchPSO)
             enc.setTexture(lumaA[l], index: 0)
             enc.setTexture(lumaB[l], index: 1)
-            enc.setTexture(l == L - 1 ? flowF[l] : flowF[l + 1], index: 2) // prior (coarser)
+            enc.setTexture(isCoarsest ? (prevCoarseF ?? flowF[l]) : flowF[l + 1], index: 2)
             enc.setTexture(flowTmp[l], index: 3)
             enc.setBytes(&params, length: MemoryLayout<MatchParams>.stride, index: 0)
             dispatch(enc, levels[l].w, levels[l].h, matchPSO)
@@ -145,7 +154,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             enc.setComputePipelineState(matchPSO)
             enc.setTexture(lumaB[l], index: 0)
             enc.setTexture(lumaA[l], index: 1)
-            enc.setTexture(l == L - 1 ? flowB[l] : flowB[l + 1], index: 2)
+            enc.setTexture(isCoarsest ? (prevCoarseB ?? flowB[l]) : flowB[l + 1], index: 2)
             enc.setTexture(flowTmp[l], index: 3)
             enc.setBytes(&params, length: MemoryLayout<MatchParams>.stride, index: 0)
             dispatch(enc, levels[l].w, levels[l].h, matchPSO)
@@ -153,36 +162,57 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             enc.setTexture(flowTmp[l], index: 0); enc.setTexture(flowB[l], index: 1)
             dispatch(enc, levels[l].w, levels[l].h, smoothPSO)
         }
+        enc.endEncoding()
+
+        // 다음 쌍을 위한 시간적 prior 백업 (코스 레벨 flow)
+        if let pf = prevCoarseF, let pb = prevCoarseB,
+           let backupBlit = commandBuffer.makeBlitCommandEncoder() {
+            let cl = levels[L - 1]
+            backupBlit.copy(from: flowF[L - 1], sourceSlice: 0, sourceLevel: 0,
+                            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                            sourceSize: MTLSize(width: cl.w, height: cl.h, depth: 1),
+                            to: pf, destinationSlice: 0, destinationLevel: 0,
+                            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            backupBlit.copy(from: flowB[L - 1], sourceSlice: 0, sourceLevel: 0,
+                            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                            sourceSize: MTLSize(width: cl.w, height: cl.h, depth: 1),
+                            to: pb, destinationSlice: 0, destinationLevel: 0,
+                            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            backupBlit.endEncoding()
+            hasTemporalPrior = true
+        }
+
+        guard let enc2 = commandBuffer.makeComputeCommandEncoder() else { return nil }
 
         // 3) finalize: 신뢰도/정적 마스크 + 히스토그램
-        enc.setComputePipelineState(finalizePSO)
-        enc.setTexture(lumaA[0], index: 0)
-        enc.setTexture(lumaB[0], index: 1)
-        enc.setTexture(flowF[0], index: 2)
-        enc.setTexture(flowB[0], index: 3)
-        enc.setTexture(maskTex, index: 4)
-        enc.setBuffer(statsBuffer, offset: 0, index: 0)
-        dispatch(enc, levels[0].w, levels[0].h, finalizePSO)
+        enc2.setComputePipelineState(finalizePSO)
+        enc2.setTexture(lumaA[0], index: 0)
+        enc2.setTexture(lumaB[0], index: 1)
+        enc2.setTexture(flowF[0], index: 2)
+        enc2.setTexture(flowB[0], index: 3)
+        enc2.setTexture(maskTex, index: 4)
+        enc2.setBuffer(statsBuffer, offset: 0, index: 0)
+        dispatch(enc2, levels[0].w, levels[0].h, finalizePSO)
 
         // 4) 풀해상도 워프 + 합성 — flow는 한 번 계산, t별로 워프만 반복 (장당 ~1ms)
         // 이게 갭 채움(드랍된 소스 프레임 자리 메꾸기)을 싸게 만드는 핵심.
         var frames: [(t: Float, texture: any MTLTexture)] = []
-        enc.setComputePipelineState(warpPSO)
-        enc.setTexture(stableA, index: 0)
-        enc.setTexture(stableB, index: 1)
-        enc.setTexture(flowF[0], index: 2)
-        enc.setTexture(flowB[0], index: 3)
-        enc.setTexture(maskTex, index: 4)
+        enc2.setComputePipelineState(warpPSO)
+        enc2.setTexture(stableA, index: 0)
+        enc2.setTexture(stableB, index: 1)
+        enc2.setTexture(flowF[0], index: 2)
+        enc2.setTexture(flowB[0], index: 3)
+        enc2.setTexture(maskTex, index: 4)
         for t in tValues.sorted() {
             let output = outputPool[outputIndex]
             outputIndex = (outputIndex + 1) % outputPool.count
             var wp = WarpParams(t: t)
-            enc.setTexture(output, index: 5)
-            enc.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
-            dispatch(enc, output.width, output.height, warpPSO)
+            enc2.setTexture(output, index: 5)
+            enc2.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
+            dispatch(enc2, output.width, output.height, warpPSO)
             frames.append((t, output))
         }
-        enc.endEncoding()
+        enc2.endEncoding()
 
         pairCount += 1
         if pairCount <= 3 || pairCount % 600 == 0 {
@@ -209,6 +239,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var searchRadius: Int32
         var hasPrior: Int32
         var refine: Int32
+        var priorScale: Float
     }
     private struct WarpParams {
         var t: Float
@@ -261,6 +292,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             flowF.append(ff); flowB.append(fb); flowTmp.append(ft)
         }
         maskTex = tex(levels[0].w, levels[0].h, .rg8Unorm)
+        let cl = levels[levels.count - 1]
+        prevCoarseF = tex(cl.w, cl.h, .rg16Float)
+        prevCoarseB = tex(cl.w, cl.h, .rg16Float)
+        hasTemporalPrior = false
 
         outputPool = []; statsBuffers = []; outputIndex = 0; statsIndex = 0
         // 출력 풀 크기를 바이트 예산으로 스케일 — 16MP(5120x3140) 캡처에서 12×64MB=770MB
@@ -280,7 +315,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         DiagnosticLog.shared.log("[MetalFlow] resources: src=\(width)x\(height) base=\(bw)x\(bh) levels=\(levels.count)")
     }
 
-    public func reset() {}
+    public func reset() {
+        hasTemporalPrior = false
+    }
 
     public func shutdown() {
         levels = []
@@ -295,7 +332,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct MatchParams { int searchRadius; int hasPrior; int refine; };
+    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; };
     struct WarpParams { float t; };
 
     constant float3 kLuma = float3(0.2126, 0.7152, 0.0722);
@@ -349,30 +386,49 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         float2 base = float2(0.0);
         if (p.hasPrior != 0) {
-            base = prior.sample(s, uv).rg * 2.0;  // 코스 레벨 픽셀 단위 → 이 레벨 단위
+            // 공간 prior(코스 레벨)는 2.0, 시간 prior(동일 레벨, 이전 쌍)는 1.0
+            base = prior.sample(s, uv).rg * p.priorScale;
         }
 
-        // 5x5 창 소스 패치 캐시
+        // 5x5 창 소스 패치 캐시 (+평균 — zero-mean 매칭용)
         float patch[25];
+        float srcMean = 0.0;
         int k = 0;
         for (int dy = -2; dy <= 2; dy++)
             for (int dx = -2; dx <= 2; dx++) {
                 float2 q = (float2(gid) + 0.5 + float2(dx, dy)) / size;
-                patch[k++] = src.sample(s, q).r;
+                float v = src.sample(s, q).r;
+                patch[k++] = v;
+                srcMean += v;
             }
+        srcMean /= 25.0;
 
+        // zero-mean SAD: 패치 평균을 빼고 비교 → 조명/밝기 변화에 불변.
+        // (일반 SAD는 페이드/노출 변화에서 flow가 무너져 물결 아티팩트 — 실측)
+        // 후보 탭을 레지스터에 캐시해 텍스처 비용 증가 없이 2-pass 계산.
         float bestSAD = 1e9;
         float2 bestOff = float2(0.0);
         for (int oy = -p.searchRadius; oy <= p.searchRadius; oy++) {
             for (int ox = -p.searchRadius; ox <= p.searchRadius; ox++) {
                 float2 cand = base + float2(ox, oy);
-                float sad = 0.0;
+                float candTaps[25];
+                float refMean = 0.0;
                 int j = 0;
                 for (int dy = -2; dy <= 2; dy++)
                     for (int dx = -2; dx <= 2; dx++) {
                         float2 q = (float2(gid) + 0.5 + cand + float2(dx, dy)) / size;
-                        sad += fabs(ref.sample(s, q).r - patch[j++]);
+                        float v = ref.sample(s, q).r;
+                        candTaps[j++] = v;
+                        refMean += v;
                     }
+                refMean /= 25.0;
+                float sad = 0.0;
+                for (int m = 0; m < 25; m++) {
+                    sad += fabs((candTaps[m] - refMean) - (patch[m] - srcMean));
+                }
+                // 평활 페널티 — 애매(평탄) 영역에서 벡터가 prior에서 멋대로 점프하는
+                // 노이즈 억제 (shimmer의 주범). SAD 25탭 스케일 대비 미세한 가중.
+                sad += 0.012 * length(float2(ox, oy));
                 if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
             }
         }
@@ -502,8 +558,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float conf = m.r;
         float staticness = m.g;
 
-        float3 crossfade = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb, t);
-        float3 moving = mix(crossfade, interp, conf);   // 저신뢰 → 소프트 크로스페이드
+        // 저신뢰 폴백: 크로스페이드는 이중상(고스트)으로 보임 → 시간상 가까운 원본을 그대로
+        // (t 경계에서 팝 방지를 위해 좁은 구간만 블렌드)
+        float3 nearest = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb,
+                             smoothstep(0.35, 0.65, t));
+        float3 moving = mix(nearest, interp, conf);
         float3 outc = mix(moving, imgB.sample(s, uv).rgb, staticness); // 정적 → B 원본 (선명)
         dst.write(float4(outc, 1.0), gid);
     }

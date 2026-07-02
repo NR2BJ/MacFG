@@ -17,6 +17,8 @@ final class PatternView: NSView {
     var contentFPS: Double = 60.0
     /// 실콘텐츠(브라우저)의 PTS 지터 재현용 — 프레임별 ±jitterMs 랜덤 지연
     var jitterMs: Double = 0
+    /// 고난도 콘텐츠 (회전/노이즈/밝기변화) — 보간 화질 검증용
+    var complexMode: Bool = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -37,8 +39,21 @@ final class PatternView: NSView {
             float2 p[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };
             VOut o; o.pos = float4(p[vid],0,1); o.uv = (p[vid]+1.0)*0.5; o.uv.y = 1.0-o.uv.y; return o;
         }
+        float vnoise(float2 p) {
+            // 해시 기반 값 노이즈 (결정적)
+            float2 i = floor(p);
+            float2 f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            float a = fract(sin(dot(i, float2(127.1, 311.7))) * 43758.5453);
+            float b = fract(sin(dot(i + float2(1, 0), float2(127.1, 311.7))) * 43758.5453);
+            float c2 = fract(sin(dot(i + float2(0, 1), float2(127.1, 311.7))) * 43758.5453);
+            float d = fract(sin(dot(i + float2(1, 1), float2(127.1, 311.7))) * 43758.5453);
+            return mix(mix(a, b, f.x), mix(c2, d, f.x), f.y);
+        }
+
         fragment float4 fmain(VOut in [[stage_in]], constant uint& frame [[buffer(0)]],
-                              constant float2& res [[buffer(1)]]) {
+                              constant float2& res [[buffer(1)]],
+                              constant uint& complexMode [[buffer(2)]]) {
             float2 px = in.uv * res;
             float3 c = float3(0.13, 0.13, 0.15); // 배경
 
@@ -68,6 +83,34 @@ final class PatternView: NSView {
                 else if (seg < 0.6) c = float3(0.0, 0.0, 1.0);
                 else if (seg < 0.8) c = float3(0.5);
                 else c = float3(1.0, 0.0, 1.0);
+            }
+
+            // 고난도 모드: 회전 휠(블록매칭 최약점) + 노이즈 텍스처 블록 + 밝기 펄스
+            if (complexMode != 0) {
+                // 회전 스포크 휠
+                float2 wc = res * float2(0.72, 0.42);
+                float2 d = px - wc;
+                float r = length(d);
+                float wheelR = min(res.x, res.y) * 0.16;
+                if (r < wheelR) {
+                    float ang = atan2(d.y, d.x) + float(frame) * 0.035;
+                    float spokes = step(0.0, sin(ang * 9.0));
+                    float rings = step(0.5, fract(r / (wheelR * 0.2)));
+                    c = mix(float3(0.15, 0.2, 0.5), float3(0.95, 0.9, 0.3), spokes * 0.7 + rings * 0.3);
+                    if (r > wheelR * 0.94) c = float3(0.9);
+                }
+                // 노이즈 텍스처 블록 (대각 이동)
+                float2 bp = float2(fmod(float(frame) * 3.0, res.x * 0.6),
+                                   res.y * 0.55 + sin(float(frame) * 0.05) * res.y * 0.1);
+                float2 lp2 = px - bp;
+                if (lp2.x >= 0.0 && lp2.x < 260.0 && lp2.y >= 0.0 && lp2.y < 200.0) {
+                    float n = vnoise(lp2 * 0.08) * 0.6 + vnoise(lp2 * 0.31) * 0.4;
+                    c = float3(n * 0.9, n * 0.75, n * 0.5);
+                }
+                // 체커 구역 밝기 펄스 (밝기 항등성 붕괴 재현)
+                if (px.y < res.y * 0.25) {
+                    c *= 0.85 + 0.15 * sin(float(frame) * 0.09);
+                }
             }
 
             // 프레임 카운터: 좌상단 8비트 바이너리 블록 (freeze 감지)
@@ -131,8 +174,10 @@ final class PatternView: NSView {
         enc.setRenderPipelineState(pso)
         var frame = frameIndex
         var res = SIMD2<Float>(Float(sz.width), Float(sz.height))
+        var cm: UInt32 = complexMode ? 1 : 0
         enc.setFragmentBytes(&frame, length: 4, index: 0)
         enc.setFragmentBytes(&res, length: 8, index: 1)
+        enc.setFragmentBytes(&cm, length: 4, index: 2)
         enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         enc.endEncoding()
         cb.present(drawable)
@@ -166,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let i = args.firstIndex(of: "--jitter"), i + 1 < args.count, let j = Double(args[i + 1]) {
             jitter = j
         }
+        let complexFlag = args.contains("--complex")
         window = NSWindow(
             contentRect: NSRect(x: px, y: py, width: w, height: h),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -175,6 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view = PatternView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         view.contentFPS = fps
         view.jitterMs = jitter
+        view.complexMode = complexFlag
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

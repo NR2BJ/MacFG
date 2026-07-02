@@ -114,7 +114,9 @@ public final class AppState {
     var availableWindows: [WindowInfo] = []
     var isInterpolationEnabled: Bool = true
     var interpolationEngine: String = "None"
-    var selectedRenderMode: RenderMode = .appleFI
+    // 기본 엔진 = Metal Flow: 24/30/60fps 전 매트릭스에서 우위 실측
+    // (144Hz 기준 — 24fps: 144fps/σ0.8 vs AppleFI 48fps/σ9; 지터 강건성 동급 이상)
+    var selectedRenderMode: RenderMode = .metalFlow
     var selectedOverlayPlacement: OverlayPlacement = .coverSource
 
     // MARK: - Components

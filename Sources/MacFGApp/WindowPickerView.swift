@@ -35,12 +35,7 @@ struct WindowPickerView: View {
             } else {
                 windowListView
                 Divider()
-                Label("⌃⌥⌘U — capture the focused window in a fullscreen viewer",
-                      systemImage: "keyboard")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal)
-                    .padding(.bottom, 8)
+                shortcutsSection
             }
         }
         .frame(width: 400, height: 400)
@@ -206,6 +201,36 @@ struct WindowPickerView: View {
     }
 
     // MARK: - Window List
+
+    // MARK: - Shortcuts (커스터마이징 — 녹화식 입력)
+
+    private var shortcutsSection: some View {
+        DisclosureGroup("Shortcuts") {
+            VStack(spacing: 6) {
+                shortcutRow("Capture focused → fullscreen", binding: $appState.hotCapture)
+                shortcutRow("Toggle overlay", binding: $appState.hotToggle)
+                shortcutRow("Stop capture", binding: $appState.hotStop)
+            }
+            .padding(.top, 4)
+        }
+        .font(.caption)
+        .padding(.horizontal)
+        .padding(.bottom, 8)
+    }
+
+    private func shortcutRow(_ label: String, binding: Binding<HotKeyBinding>) -> some View {
+        HStack {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            ShortcutRecorder(binding: binding)
+                .frame(width: 96, height: 22)
+                .onChange(of: binding.wrappedValue) {
+                    appState.updateHotKeys()
+                }
+        }
+    }
 
     private var windowListView: some View {
         Group {

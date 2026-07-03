@@ -132,6 +132,11 @@ public final class AppState {
     /// 30fps 소스를 굳이 120까지 안 올리고 60(×2)에서 멈추고 싶을 때.
     var frameMultiplier: Int = 0
 
+    // 사용자 지정 단축키 (init에서 UserDefaults 로드로 덮어씀)
+    var hotToggle = HotKeyBinding(keyCode: UInt32(kVK_ANSI_I), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘I")
+    var hotStop = HotKeyBinding(keyCode: UInt32(kVK_ANSI_Period), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘.")
+    var hotCapture = HotKeyBinding(keyCode: UInt32(kVK_ANSI_U), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘U")
+
     // MARK: - Components
     let device: any MTLDevice
     /// 보간/복사 작업용 큐 — present 큐와 분리해 4-5ms 보간 작업이 present를 막지 않게 한다
@@ -202,6 +207,8 @@ public final class AppState {
                 self?.refreshOverlayVisibility()
             }
         }
+
+        loadHotKeys()
     }
 
     private func handleScreenParametersChange() {
@@ -251,8 +258,14 @@ public final class AppState {
                 width: Int(width),
                 height: Int(height)
             )
-        }.filter { $0.ownerName != "MacFGApp" }
+        }.filter { !Self.systemOwners.contains($0.ownerName) }
     }
+
+    /// 캡처 대상 아님 — floating 레이어 완화로 딸려 나오는 시스템 UI 제외
+    static let systemOwners: Set<String> = [
+        "MacFG", "MacFGApp", "Dock", "Window Server", "WindowServer", "Control Center",
+        "Notification Center", "Spotlight", "Wallpaper", "Screenshot", "SystemUIServer",
+    ]
 
     // MARK: - Auto Start (CLI 자체 테스트용)
 
@@ -1099,7 +1112,7 @@ public final class AppState {
         for info in list {
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == frontPID,
                   let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
-                  let owner = info[kCGWindowOwnerName as String] as? String, owner != "MacFGApp",
+                  let owner = info[kCGWindowOwnerName as String] as? String, !Self.systemOwners.contains(owner),
                   let wid = info[kCGWindowNumber as String] as? CGWindowID,
                   let b = info[kCGWindowBounds as String] as? [String: CGFloat],
                   (b["Width"] ?? 0) > 50, (b["Height"] ?? 0) > 50 else { continue }
@@ -1123,23 +1136,44 @@ public final class AppState {
         }
     }
 
-    /// 전역 단축키 등록 (앱 시작 시 1회).
-    /// ⌃⌥⌘I = 오버레이 수동 토글, ⌃⌥⌘. = 캡처 정지, ⌃⌥⌘U = 포커스 창 → 전체화면 뷰어.
+    /// 전역 단축키 등록 (앱 시작 시 + 변경 시). 사용자 지정 바인딩 사용.
+    /// keyCode 0 = 미설정 → 등록 생략.
     func registerHotKeys() {
-        HotKeyCenter.shared.register([
-            .init(id: 1, keyCode: UInt32(kVK_ANSI_I),
-                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+        var bindings: [HotKeyCenter.Binding] = []
+        if hotToggle.keyCode != 0 {
+            bindings.append(.init(id: 1, keyCode: hotToggle.keyCode, modifiers: hotToggle.modifiers) { [weak self] in
                 self?.toggleOverlayManual()
-            },
-            .init(id: 2, keyCode: UInt32(kVK_ANSI_Period),
-                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+            })
+        }
+        if hotStop.keyCode != 0 {
+            bindings.append(.init(id: 2, keyCode: hotStop.keyCode, modifiers: hotStop.modifiers) { [weak self] in
                 Task { @MainActor in await self?.stopCapture() }
-            },
-            .init(id: 3, keyCode: UInt32(kVK_ANSI_U),
-                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+            })
+        }
+        if hotCapture.keyCode != 0 {
+            bindings.append(.init(id: 3, keyCode: hotCapture.keyCode, modifiers: hotCapture.modifiers) { [weak self] in
                 self?.captureFocusedFullscreen()
-            },
-        ])
+            })
+        }
+        HotKeyCenter.shared.register(bindings)
+    }
+
+    /// 단축키 변경 시: UserDefaults 저장 + 재등록
+    func updateHotKeys() {
+        for (key, b) in [("hk.toggle", hotToggle), ("hk.stop", hotStop), ("hk.capture", hotCapture)] {
+            if let data = try? JSONEncoder().encode(b) { UserDefaults.standard.set(data, forKey: key) }
+        }
+        registerHotKeys()
+    }
+
+    private func loadHotKeys() {
+        func load(_ key: String) -> HotKeyBinding? {
+            guard let d = UserDefaults.standard.data(forKey: key) else { return nil }
+            return try? JSONDecoder().decode(HotKeyBinding.self, from: d)
+        }
+        if let b = load("hk.toggle") { hotToggle = b }
+        if let b = load("hk.stop") { hotStop = b }
+        if let b = load("hk.capture") { hotCapture = b }
     }
 
     private func configurePairEngine() async {

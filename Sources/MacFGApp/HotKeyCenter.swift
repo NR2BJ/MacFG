@@ -1,6 +1,19 @@
 import AppKit
 import Carbon.HIToolbox
 
+/// 사용자 지정 가능한 단축키 (keyCode + Carbon 모디파이어 마스크 + 표시용 라벨).
+/// UserDefaults에 Codable로 저장.
+public struct HotKeyBinding: Codable, Equatable, Sendable {
+    public var keyCode: UInt32
+    public var modifiers: UInt32
+    public var label: String
+    public init(keyCode: UInt32, modifiers: UInt32, label: String) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+        self.label = label
+    }
+}
+
 /// 전역 단축키 등록기 (Carbon RegisterEventHotKey).
 ///
 /// NSEvent 전역 모니터와 달리 앱이 백그라운드일 때도, 소스 앱이 전체화면일 때도 동작한다.

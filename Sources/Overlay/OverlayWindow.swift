@@ -232,7 +232,6 @@ public final class OverlayWindow: NSObject {
             window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
             window.isOpaque = true
             window.backgroundColor = .black
-            window.isReleasedWhenClosed = false
             // 네이티브 전체화면(자기 Space) 안 씀 — 정지 시 검정 전체화면 Space가 남는 버그 회피.
             // 대신 소스 화면 visibleFrame에 최대화(윈도우드). 초록 버튼은 zoom.
             window.collectionBehavior = []
@@ -247,6 +246,10 @@ public final class OverlayWindow: NSObject {
         // .readOnly: 스크린샷/녹화에 출력이 보이도록 (검증 및 사용자 녹화용).
         // 캡처는 SCK desktopIndependentWindow(대상 창 백킹만 캡처)라 자기 캡처 루프가 생기지 않는다.
         window.sharingType = .readOnly
+        // 창 수명은 OverlayWindow가 강한 참조(let window)로 소유. close()가 창을 자동
+        // 해제하면 dealloc 시 또 해제 → 이중 해제(EXC_BAD_ACCESS, 풀 드레인에서 objc_release).
+        // cover(.borderless)는 기본 true였어서 단축키 정지 시 크래시했음 → 두 스타일 모두 false.
+        window.isReleasedWhenClosed = false
 
         self.window = window
         self.metalLayer = metalLayer
@@ -418,6 +421,10 @@ public final class OverlayWindow: NSObject {
 
     /// 창을 확실히 닫는다 (정지 시). 전체화면 상태면 먼저 빠져나와 검정 Space 잔존 방지.
     public func close() {
+        // 프로그램적 정지 — 델리게이트를 먼저 떼어 windowWillClose→onUserClose→stopCapture
+        // 재진입을 차단 (이건 사용자가 X로 닫은 게 아님).
+        onUserClose = nil
+        window.delegate = nil
         if window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
         }

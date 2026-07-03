@@ -121,7 +121,8 @@ public final class AppState {
     var selectedRenderMode: RenderMode = .metalFlow
     var selectedOverlayPlacement: OverlayPlacement = .coverSource
     /// 업스케일 방식 — 뷰어에서 출력>소스일 때. off/ane/metalfx/aneMetalfx.
-    var upscaleMode: UpscaleMode = .aneMetalfx
+    /// 기본 Off: 흔한 케이스는 Cover+보간. 업스케일 선택 시 자동으로 Separate Window로 전환.
+    var upscaleMode: UpscaleMode = .off
     /// CAS 샤프닝 on/off (업스케일과 독립, Cover 1:1 포함 어디서나)
     var casEnabled: Bool = true
     /// CAS 샤프닝 강도 0~1
@@ -1148,17 +1149,21 @@ public final class AppState {
         return nil
     }
 
-    /// 단축키(⌃⌥⌘U): 지금 보고 있는 창을 즉시 잡아 전체화면 뷰어로 (업스케일 감상 원샷).
-    func captureFocusedFullscreen() {
+    /// ⌃⌥⌘U / 버튼: 포커스 창 캡처 토글 — 설정(배치/엔진/업스케일)은 앱에서 미리 정한 대로.
+    /// 캡처 중이면 정지(LS식 단일 토글). 뷰어 배치면 전체화면으로.
+    func toggleCaptureFocused() {
         Task { @MainActor in
-            let target = frontmostWindow()
-            if isCapturing { await stopCapture() }
-            guard let target else { DiagnosticLog.shared.log("[HOTKEY] no focused window"); return }
+            if isCapturing { await stopCapture(); return }
+            guard let target = frontmostWindow() else {
+                DiagnosticLog.shared.log("[HOTKEY] no focused window to capture")
+                return
+            }
             selectedWindowID = target.id
             selectedWindowName = target.name
-            selectedOverlayPlacement = .viewerWindow
             await startCapture()
-            overlayManager?.enterViewerFullScreen()
+            if selectedOverlayPlacement == .viewerWindow {
+                overlayManager?.enterViewerFullScreen()
+            }
         }
     }
 
@@ -1178,7 +1183,7 @@ public final class AppState {
         }
         if hotCapture.keyCode != 0 {
             bindings.append(.init(id: 3, keyCode: hotCapture.keyCode, modifiers: hotCapture.modifiers) { [weak self] in
-                self?.captureFocusedFullscreen()
+                self?.toggleCaptureFocused()
             })
         }
         HotKeyCenter.shared.register(bindings)

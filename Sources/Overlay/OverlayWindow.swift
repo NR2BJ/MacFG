@@ -227,8 +227,9 @@ public final class OverlayWindow: NSObject {
                 defer: false
             )
             window.title = title
-            // 항상 위 — PiP(always-on-top floating) 위로 올라와 뷰어가 안 가려지게 (LS 방식).
-            window.level = .floating
+            // 항상 위 — Firefox PiP가 .floating(3, 실측)이라 그보다 한 단계 위로 올려
+            // 뷰어가 PiP에 안 가려지게 (LS 방식). 메뉴바(24)보단 아래.
+            window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
             window.isOpaque = true
             window.backgroundColor = .black
             window.isReleasedWhenClosed = false

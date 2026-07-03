@@ -6,6 +6,14 @@ import QuartzCore
 import FramePacing
 import os
 
+/// SCK 스트림 비정상 중단(대상 창 닫힘 등) 감지용 델리게이트 — 즉시 콜백.
+/// SCStreamDelegate는 NSObjectProtocol이라 별도 NSObject로 분리.
+private final class StreamStopObserver: NSObject, SCStreamDelegate {
+    let onStop: @Sendable () -> Void
+    init(onStop: @escaping @Sendable () -> Void) { self.onStop = onStop }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { onStop() }
+}
+
 /// ScreenCaptureKit 기반 캡처 (IOSurface 폴백)
 public final class SCKCapture: FrameSource, @unchecked Sendable {
     public let method: CaptureMethod = .screenCaptureKit
@@ -14,6 +22,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     private var device: (any MTLDevice)?
     private var stream: SCStream?
     private var outputHandler: StreamOutputHandler?
+    private var stopObserver: StreamStopObserver?
     private var latestSlot: FrameSlot?
     /// drain 대기 프레임 큐 (스케줄러용). 캡처 스레드가 push, 렌더 틱이 drain.
     private var pendingSlots: [FrameSlot] = []
@@ -21,6 +30,9 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     private let lock = NSLock()
 
     public var isAvailable: Bool { true }
+
+    /// 대상 창 닫힘 등으로 스트림이 비정상 중단됐을 때 (즉시). 우리가 stopCapture하면 호출 안 됨.
+    public var onStreamStopped: (@Sendable () -> Void)?
 
     public init() {}
 
@@ -54,7 +66,15 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         }
         self.outputHandler = handler
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+        // 대상 창 닫힘 → SCK가 스트림을 중단 → 즉시 콜백 (폴링 대기 없이)
+        let observer = StreamStopObserver { [weak self] in
+            guard let self, self.capturing else { return }
+            self.capturing = false
+            self.onStreamStopped?()
+        }
+        self.stopObserver = observer
+
+        let stream = SCStream(filter: filter, configuration: config, delegate: observer)
         try stream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
         try await stream.startCapture()
 
@@ -95,6 +115,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         }
         stream = nil
         outputHandler = nil
+        stopObserver = nil
         clearSlots()
         logger.info("SCK capture stopped")
     }

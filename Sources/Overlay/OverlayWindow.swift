@@ -227,7 +227,8 @@ public final class OverlayWindow: NSObject {
                 defer: false
             )
             window.title = title
-            window.level = .normal
+            // 항상 위 — PiP(always-on-top floating) 위로 올라와 뷰어가 안 가려지게 (LS 방식).
+            window.level = .floating
             window.isOpaque = true
             window.backgroundColor = .black
             window.isReleasedWhenClosed = false

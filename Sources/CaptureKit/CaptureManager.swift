@@ -15,6 +15,9 @@ public final class CaptureManager: Sendable {
 
     public var activeMethod: CaptureMethod { _activeMethod }
 
+    /// SCK 스트림 비정상 중단(대상 창 닫힘) 시 즉시 콜백 — AppState가 stopCapture 트리거.
+    nonisolated(unsafe) public var onStreamStopped: (@Sendable () -> Void)?
+
     public init() {}
 
     /// 캡처 시작. SCK 우선, 실패 시 IOSurface 폴백.
@@ -22,6 +25,7 @@ public final class CaptureManager: Sendable {
     public func startCapture(windowID: CGWindowID, device: any MTLDevice) async throws {
         // ScreenCaptureKit 먼저 시도
         do {
+            sckCapture.onStreamStopped = onStreamStopped
             try await sckCapture.startCapture(windowID: windowID, device: device)
             activeSource = sckCapture
             _activeMethod = .screenCaptureKit

@@ -208,6 +208,15 @@ public final class AppState {
             }
         }
 
+        // 대상 창 닫힘 → SCK 스트림 중단 즉시 캡처 정지 (폴링 대기 없이 거의 동시)
+        captureManager.onStreamStopped = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.isCapturing, !self.isRestartingCapture else { return }
+                DiagnosticLog.shared.log("[CAPTURE] source window gone (SCK stopped) → stop")
+                await self.stopCapture()
+            }
+        }
+
         loadHotKeys()
     }
 
@@ -562,7 +571,7 @@ public final class AppState {
             let (_, released, _) = mailbox.drain()
             for id in released { inFlightTextures.remove(id) }
             _ = captureManager.drainFrames()   // 파이프 적체 방지 (텍스처는 풀로 회수)
-            if isCapturing, hasReceivedFirstFrame, (overlayManager?.trackingFailureCount ?? 0) > 60 {
+            if isCapturing, hasReceivedFirstFrame, (overlayManager?.trackingFailureCount ?? 0) > 30 {
                 Task { await stopCapture() }
             }
             return
@@ -605,7 +614,7 @@ public final class AppState {
         if sawTexture {
             hasReceivedFirstFrame = true
         }
-        if isCapturing && hasReceivedFirstFrame && (overlayManager?.trackingFailureCount ?? 0) > 60 {
+        if isCapturing && hasReceivedFirstFrame && (overlayManager?.trackingFailureCount ?? 0) > 30 {
             logger.info("Target window closed, stopping")
             Task { await stopCapture() }
             return

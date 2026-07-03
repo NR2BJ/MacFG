@@ -141,7 +141,8 @@ public final class OverlayWindow: NSObject {
     private var appliedColorSpace: CGColorSpace?
     private var colorSpaceInitialized = false
     private var upscaler: MetalFXUpscaler?
-    /// 출력 목표가 소스보다 클 때 MetalFX Spatial 업스케일 사용 (뷰어/큰 창). off면 이중선형.
+    private var neuralUpscaler: NeuralUpscaler?
+    /// 출력 목표가 소스보다 클 때 업스케일 사용 (뷰어/큰 창). off면 이중선형.
     public var upscaleEnabled = false
     /// CAS 샤프닝 강도 0~1 (0=끔 — 패스스루 바이트 보존 경로 유지). Cover 1:1에서도 유효.
     public var sharpness: Float = 0
@@ -230,6 +231,7 @@ public final class OverlayWindow: NSObject {
         super.init()
 
         self.upscaler = MetalFXUpscaler(device: device)
+        self.neuralUpscaler = NeuralUpscaler(device: device)
 
         if style == .viewer {
             window.delegate = self
@@ -280,10 +282,23 @@ public final class OverlayWindow: NSObject {
             if style == .viewer {
                 let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
-                if targetW > texture.width, targetH > texture.height,
-                   let up = upscaler?.upscale(texture, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
-                    source = up
-                    parts.append("MetalFX \(texture.width)×\(texture.height) → \(targetW)×\(targetH)")
+                if targetW > texture.width || targetH > texture.height {
+                    var cur = source
+                    var chain: [String] = []
+                    // 1) 소스 ≤960이면 신경망 ANE SR 2x 먼저 (GPU-free, 신경망 화질)
+                    if texture.width <= NeuralUpscaler.maxInput, texture.height <= NeuralUpscaler.maxInput,
+                       let n = neuralUpscaler?.upscale(texture, into: commandBuffer) {
+                        cur = n
+                        chain.append("ANE→\(n.width)×\(n.height)")
+                    }
+                    // 2) 아직 목표보다 작으면 MetalFX Spatial로 마무리
+                    if targetW > cur.width || targetH > cur.height,
+                       let m = upscaler?.upscale(cur, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
+                        cur = m
+                        chain.append("MetalFX→\(targetW)×\(targetH)")
+                    }
+                    source = cur
+                    parts.append(chain.isEmpty ? "1:1" : chain.joined(separator: " + "))
                 } else {
                     parts.append("1:1")
                 }
@@ -291,7 +306,7 @@ public final class OverlayWindow: NSObject {
                 parts.append("1:1 cover")
             }
             // CAS는 스케일과 무관하게 최종 블릿에서 적용 — 브라우저가 이미 늘려놓은
-            // 저해상도(720p→4K) 영상의 뭉개짐을 되살리는 것이 Cover에서의 실효
+            // 저해상도 영상의 뭉개짐 복원이 Cover에서의 실효
             parts.append(sharpness > 0.01 ? String(format: "sharpen %.1f", sharpness) : "sharpen off")
             scaleStatus = parts.joined(separator: " · ")
         } else {

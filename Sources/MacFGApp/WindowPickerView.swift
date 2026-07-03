@@ -154,9 +154,9 @@ struct WindowPickerView: View {
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
-                    // CAS 샤프닝은 1:1(Cover)에서도 적용 — 브라우저가 늘려놓은 저해상도
-                    // 영상의 뭉개짐 복원. MetalFX 업스케일은 출력>소스일 때 추가로.
-                    Text("Sharpening works everywhere (restores soft low-res video). MetalFX upscaling additionally kicks in when the output is larger than the source.")
+                    // 업스케일은 출력>소스일 때만: ≤960 소스는 ANE 신경망 2x → 초과분 MetalFX,
+                    // 큰 소스는 MetalFX. CAS 샤픈은 1:1 포함 어디서나 (늘어난 저해상도 영상 복원).
+                    Text("Sharpening works everywhere. When the output is larger than the source, small sources (≤960px) are upscaled by the Neural Engine, larger ones by MetalFX. The Scale row shows what's active.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)

@@ -93,6 +93,7 @@ struct WindowPickerView: View {
                 Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
             }
             .pickerStyle(.segmented)
+            .onChange(of: appState.frameMultiplier) { appState.persistSettings() }
             if appState.frameMultiplier >= 3 {
                 Text("Capped at your display's refresh rate — 60fps ×3 = 180 needs a 180Hz+ display (120Hz shows 120).")
                     .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
@@ -104,6 +105,7 @@ struct WindowPickerView: View {
             }
             .pickerStyle(.segmented)
             .onChange(of: appState.sourcePreset) {
+                appState.persistSettings()
                 if appState.isCapturing && appState.sourcePreset != 0 {
                     appState.resizeSourceToPreset(appState.sourcePreset)
                 }

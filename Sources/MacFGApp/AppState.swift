@@ -218,7 +218,35 @@ public final class AppState {
             }
         }
 
+        loadSettings()
         loadHotKeys()
+    }
+
+    /// 설정을 UserDefaults에 저장 (재시작해도 유지 — 설정 우선 앱 특성)
+    func persistSettings() {
+        let d = UserDefaults.standard
+        d.set(selectedRenderMode.rawValue, forKey: "s.engine")
+        d.set(frameMultiplier, forKey: "s.mult")
+        d.set(upscaleMode.rawValue, forKey: "s.upscale")
+        d.set(casEnabled, forKey: "s.cas")
+        d.set(sharpness, forKey: "s.sharp")
+        d.set(sourcePreset, forKey: "s.preset")
+        d.set(isInterpolationEnabled, forKey: "s.interp")
+    }
+
+    private func loadSettings() {
+        let d = UserDefaults.standard
+        if let e = d.string(forKey: "s.engine"), let m = RenderMode(rawValue: e) {
+            selectedRenderMode = m; interpolationEngine = m.displayName
+        }
+        if d.object(forKey: "s.mult") != nil { frameMultiplier = d.integer(forKey: "s.mult") }
+        if let u = d.string(forKey: "s.upscale"), let m = UpscaleMode(rawValue: u) { upscaleMode = m }
+        if d.object(forKey: "s.cas") != nil { casEnabled = d.bool(forKey: "s.cas") }
+        if d.object(forKey: "s.sharp") != nil { sharpness = d.double(forKey: "s.sharp") }
+        if d.object(forKey: "s.preset") != nil { sourcePreset = d.integer(forKey: "s.preset") }
+        if d.object(forKey: "s.interp") != nil { isInterpolationEnabled = d.bool(forKey: "s.interp") }
+        // 배치는 업스케일 모드에서 파생
+        selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
     }
 
     private func handleScreenParametersChange() {
@@ -1049,6 +1077,7 @@ public final class AppState {
     // MARK: - Interpolation Control
 
     func updateInterpolationEnabled() {
+        persistSettings()
         if isCapturing {
             Task { @MainActor in
                 await configurePairEngine()
@@ -1059,6 +1088,7 @@ public final class AppState {
     }
 
     func updateRenderMode() {
+        persistSettings()
         if isCapturing {
             Task { @MainActor in
                 await configurePairEngine()
@@ -1069,6 +1099,7 @@ public final class AppState {
     }
 
     func updateUpscale() {
+        persistSettings()
         overlayManager?.setUpscaleMode(upscaleMode)
         overlayManager?.setSharpness(casEnabled ? Float(sharpness) : 0)
     }

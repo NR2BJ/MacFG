@@ -99,6 +99,11 @@ public final class OverlayManager {
     /// 업스케일 실동작 상태 (UI 표시용)
     public var scaleStatus: String? { overlayWindow?.scaleStatus }
 
+    /// 뷰어 창을 전체화면으로 (⌃⌥⌘U 원샷 캡처용). 뷰어 스타일만.
+    public func enterViewerFullScreen() {
+        overlayWindow?.enterFullScreen()
+    }
+
     public func setPlacement(_ newPlacement: OverlayPlacement) {
         let changed = placement != newPlacement
         placement = newPlacement

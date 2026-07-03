@@ -34,6 +34,13 @@ struct WindowPickerView: View {
                 captureStatusView
             } else {
                 windowListView
+                Divider()
+                Label("⌃⌥⌘U — capture the focused window in a fullscreen viewer",
+                      systemImage: "keyboard")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
             }
         }
         .frame(width: 400, height: 400)

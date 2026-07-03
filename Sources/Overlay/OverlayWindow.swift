@@ -414,6 +414,13 @@ public final class OverlayWindow: NSObject {
         window.setFrame(frame, display: true)
     }
 
+    /// 뷰어를 전체화면으로 (이미 전체화면이면 무시). 우리 창이라 항상 표시됨.
+    public func enterFullScreen() {
+        guard style == .viewer, !window.styleMask.contains(.fullScreen) else { return }
+        window.makeKeyAndOrderFront(nil)
+        window.toggleFullScreen(nil)
+    }
+
     /// 표시/숨김
     public func setVisible(_ visible: Bool) {
         if visible {

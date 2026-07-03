@@ -233,7 +233,8 @@ public final class AppState {
             guard let windowID = info[kCGWindowNumber as String] as? CGWindowID,
                   let ownerName = info[kCGWindowOwnerName as String] as? String,
                   let layer = info[kCGWindowLayer as String] as? Int,
-                  layer == 0,
+                  // layer 0 = 일반 창. floating(PiP 등, 보통 3)도 포함하되 메뉴바(24+)·데스크톱(<0)은 제외.
+                  layer >= 0, layer < 24,
                   let bounds = info[kCGWindowBounds as String] as? [String: CGFloat],
                   let width = bounds["Width"], let height = bounds["Height"],
                   width > 50, height > 50
@@ -1089,8 +1090,41 @@ public final class AppState {
         refreshOverlayVisibility()
     }
 
+    /// 현재 최전면 앱의 최상단 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
+    private func frontmostWindow() -> (id: CGWindowID, name: String)? {
+        guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        // 목록은 앞→뒤 순서 — frontmost 앱의 첫 유효 창을 고른다
+        for info in list {
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == frontPID,
+                  let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
+                  let owner = info[kCGWindowOwnerName as String] as? String, owner != "MacFGApp",
+                  let wid = info[kCGWindowNumber as String] as? CGWindowID,
+                  let b = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  (b["Width"] ?? 0) > 50, (b["Height"] ?? 0) > 50 else { continue }
+            let name = info[kCGWindowName as String] as? String ?? ""
+            return (wid, name.isEmpty ? owner : "\(owner) — \(name)")
+        }
+        return nil
+    }
+
+    /// 단축키(⌃⌥⌘U): 지금 보고 있는 창을 즉시 잡아 전체화면 뷰어로 (업스케일 감상 원샷).
+    func captureFocusedFullscreen() {
+        Task { @MainActor in
+            let target = frontmostWindow()
+            if isCapturing { await stopCapture() }
+            guard let target else { DiagnosticLog.shared.log("[HOTKEY] no focused window"); return }
+            selectedWindowID = target.id
+            selectedWindowName = target.name
+            selectedOverlayPlacement = .viewerWindow
+            await startCapture()
+            overlayManager?.enterViewerFullScreen()
+        }
+    }
+
     /// 전역 단축키 등록 (앱 시작 시 1회).
-    /// ⌃⌥⌘I = 오버레이 수동 토글, ⌃⌥⌘. = 캡처 정지 (전체화면에서 창으로 못 돌아가도 제어).
+    /// ⌃⌥⌘I = 오버레이 수동 토글, ⌃⌥⌘. = 캡처 정지, ⌃⌥⌘U = 포커스 창 → 전체화면 뷰어.
     func registerHotKeys() {
         HotKeyCenter.shared.register([
             .init(id: 1, keyCode: UInt32(kVK_ANSI_I),
@@ -1100,6 +1134,10 @@ public final class AppState {
             .init(id: 2, keyCode: UInt32(kVK_ANSI_Period),
                   modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
                 Task { @MainActor in await self?.stopCapture() }
+            },
+            .init(id: 3, keyCode: UInt32(kVK_ANSI_U),
+                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                self?.captureFocusedFullscreen()
             },
         ])
     }

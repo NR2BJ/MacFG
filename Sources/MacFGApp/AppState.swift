@@ -1072,14 +1072,23 @@ public final class AppState {
         if isCapturing { updateOverlayPlacement() }
     }
 
-    /// 캡처 중인 소스 창을 프리셋 높이(px)로 리사이즈 — 현재 종횡비 유지.
+    /// 캡처 중인 소스 창을 프리셋(짧은 변 px)으로 리사이즈 — 종횡비 유지, 방향 자동 감지.
+    /// 가로 영상: 짧은 변=세로(=preset). 세로 영상(직캠): 짧은 변=가로(=preset).
     /// 소스가 영상 네이티브 해상도에 맞을수록 1:1 렌더 → 깨끗한 캡처 → 업스케일 효과↑.
-    func resizeSourceToHeight(_ pixelHeight: Int) {
-        guard isCapturing, let src = overlayManager?.sourcePixelSize, src.height > 0 else { return }
+    /// 주의: AX는 창 전체(타이틀바 포함)를 리사이즈 → 타이틀바 있는 창은 영상이 그만큼 더 작음.
+    func resizeSourceToPreset(_ shortSide: Int) {
+        guard isCapturing, let src = overlayManager?.sourcePixelSize, src.width > 0, src.height > 0 else { return }
         let aspect = Double(src.width) / Double(src.height)
-        let w = Int((Double(pixelHeight) * aspect).rounded())
-        let ok = overlayManager?.resizeSourceWindow(toPixelWidth: w, height: pixelHeight) ?? false
-        DiagnosticLog.shared.log("[PRESET] resize source → \(w)x\(pixelHeight) (\(ok ? "ok" : "AX 실패"))")
+        let targetW: Int, targetH: Int
+        if src.width >= src.height {   // 가로 영상: 짧은 변 = 세로
+            targetH = shortSide
+            targetW = Int((Double(shortSide) * aspect).rounded())
+        } else {                        // 세로 영상(직캠): 짧은 변 = 가로
+            targetW = shortSide
+            targetH = Int((Double(shortSide) / aspect).rounded())
+        }
+        let ok = overlayManager?.resizeSourceWindow(toPixelWidth: targetW, height: targetH) ?? false
+        DiagnosticLog.shared.log("[PRESET] resize source → \(targetW)x\(targetH) (\(ok ? "ok" : "AX 실패"))")
     }
 
     func updateOverlayPlacement() {

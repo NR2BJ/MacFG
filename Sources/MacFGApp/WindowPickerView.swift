@@ -94,6 +94,10 @@ struct WindowPickerView: View {
                 Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
             }
             .pickerStyle(.segmented)
+            if appState.frameMultiplier >= 3 {
+                Text("Capped at your display's refresh rate — 60fps ×3 = 180 needs a 180Hz+ display (120Hz shows 120).")
+                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             Picker("Upscale", selection: $appState.upscaleMode) {
                 ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
@@ -131,12 +135,16 @@ struct WindowPickerView: View {
     // MARK: - During capture
 
     private var sourcePresetsRow: some View {
-        HStack(spacing: 6) {
-            Text("Source").font(.caption).foregroundStyle(.secondary)
-            ForEach([360, 480, 540, 720, 1080], id: \.self) { h in
-                Button("\(h)p") { appState.resizeSourceToHeight(h) }
-                    .buttonStyle(.bordered).controlSize(.small)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text("Source").font(.caption).foregroundStyle(.secondary)
+                ForEach([360, 480, 540, 720, 1080], id: \.self) { p in
+                    Button("\(p)p") { appState.resizeSourceToPreset(p) }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
             }
+            Text("Resizes the source's short side (landscape: height, portrait: width). Windows with a title bar shrink the video a little.")
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 

@@ -227,13 +227,14 @@ public final class OverlayManager {
         }
     }
 
-    /// 뷰어 초기 배치: 소스 창이 있는 화면에 최대화 (LS 방식 — 원본 자리에 크게).
+    /// 뷰어 초기 배치: 소스 창이 있는 화면 전체(메뉴바·Dock 포함)를 덮는다 — 초록버튼 전체화면 느낌.
+    /// visibleFrame이 아니라 frame이라 Dock/메뉴바 영역까지 채우고, 창은 shielding 레벨로 그 위에 뜬다.
     /// 영상은 뷰어 안에서 종횡비 유지 레터박스로 표시됨.
     private func initialViewerFrame(sourceFrame: CGRect) -> CGRect {
         let screens = NSScreen.screens
         let sourceScreen = screens.first(where: { $0.frame.contains(CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)) })
             ?? NSScreen.main
-        return sourceScreen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1600, height: 900)
+        return sourceScreen?.frame ?? CGRect(x: 0, y: 0, width: 1600, height: 900)
     }
 
     private func aspectFitRect(aspect: CGFloat, inside rect: CGRect) -> CGRect {

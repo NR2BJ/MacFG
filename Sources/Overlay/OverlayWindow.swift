@@ -219,22 +219,22 @@ public final class OverlayWindow: NSObject {
             window.contentView = contentView
 
         case .viewer:
-            // 일반 창 — 자유 이동/리사이즈, 레터박스 aspect-fit
+            // 보더리스 전체화면 뷰어 — 소스 화면 전체(메뉴바·Dock 포함)를 덮는다.
+            // 네이티브 전체화면(초록 버튼, 자기 Space)은 안 씀: 정지 시 검정 Space 잔존 +
+            // Space 전환이 실시간 캡처 페이싱을 무너뜨림(실측). 대신 shielding 레벨 보더리스로
+            // 메뉴바·Dock 위를 즉시(애니메이션·Space 없이) 덮어 초록버튼 전체화면과 같은 화면을 낸다.
             window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 960, height: 540),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                styleMask: [.borderless],
                 backing: .buffered,
                 defer: false
             )
             window.title = title
-            // 항상 위 — Firefox PiP가 .floating(3, 실측)이라 그보다 한 단계 위로 올려
-            // 뷰어가 PiP에 안 가려지게 (LS 방식). 메뉴바(24)보단 아래.
-            window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+            // 메뉴바(24)·Dock(20) 위로 — 화면 전체를 덮음. Firefox PiP(.floating 3)도 당연히 아래.
+            window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
             window.isOpaque = true
             window.backgroundColor = .black
-            // 네이티브 전체화면(자기 Space) 안 씀 — 정지 시 검정 전체화면 Space가 남는 버그 회피.
-            // 대신 소스 화면 visibleFrame에 최대화(윈도우드). 초록 버튼은 zoom.
-            window.collectionBehavior = []
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
             if let contentView = window.contentView {
                 contentView.wantsLayer = true

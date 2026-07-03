@@ -232,9 +232,9 @@ public final class OverlayWindow: NSObject {
             window.isOpaque = true
             window.backgroundColor = .black
             window.isReleasedWhenClosed = false
-            // .fullScreenPrimary: 초록 버튼으로 뷰어를 진짜 전체화면 가능 (우리 창이라 항상 표시).
-            // 최대화(zoom)/전체화면 시 출력 해상도가 그만큼 올라가 업스케일 목표가 됨.
-            window.collectionBehavior = [.fullScreenPrimary]
+            // 네이티브 전체화면(자기 Space) 안 씀 — 정지 시 검정 전체화면 Space가 남는 버그 회피.
+            // 대신 소스 화면 visibleFrame에 최대화(윈도우드). 초록 버튼은 zoom.
+            window.collectionBehavior = []
 
             if let contentView = window.contentView {
                 contentView.wantsLayer = true
@@ -415,11 +415,13 @@ public final class OverlayWindow: NSObject {
         window.setFrame(frame, display: true)
     }
 
-    /// 뷰어를 전체화면으로 (이미 전체화면이면 무시). 우리 창이라 항상 표시됨.
-    public func enterFullScreen() {
-        guard style == .viewer, !window.styleMask.contains(.fullScreen) else { return }
-        window.makeKeyAndOrderFront(nil)
-        window.toggleFullScreen(nil)
+    /// 창을 확실히 닫는다 (정지 시). 전체화면 상태면 먼저 빠져나와 검정 Space 잔존 방지.
+    public func close() {
+        if window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+        }
+        window.orderOut(nil)
+        window.close()
     }
 
     /// 표시/숨김

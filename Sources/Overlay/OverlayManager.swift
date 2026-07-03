@@ -75,7 +75,7 @@ public final class OverlayManager {
     /// 오버레이 중지
     public func stop() {
         windowTracker.stopTracking()
-        overlayWindow?.setVisible(false)
+        overlayWindow?.close()
         overlayWindow = nil
         trackedWindowID = nil
         lastAppliedFrame = .zero
@@ -98,11 +98,6 @@ public final class OverlayManager {
 
     /// 업스케일 실동작 상태 (UI 표시용)
     public var scaleStatus: String? { overlayWindow?.scaleStatus }
-
-    /// 뷰어 창을 전체화면으로 (⌃⌥⌘U 원샷 캡처용). 뷰어 스타일만.
-    public func enterViewerFullScreen() {
-        overlayWindow?.enterFullScreen()
-    }
 
     /// 대상 창이 아직 살아있는지 (닫힘 감지)
     public var sourceWindowExists: Bool { windowTracker.windowExists }
@@ -232,14 +227,13 @@ public final class OverlayManager {
         }
     }
 
-    /// 뷰어 초기 배치: 최대화 (LS 방식 — 캡처하면 화면 가득). 다른 디스플레이가 있으면 거기,
-    /// 없으면 소스 화면. 영상은 뷰어 안에서 종횡비 유지 레터박스로 표시됨.
+    /// 뷰어 초기 배치: 소스 창이 있는 화면에 최대화 (LS 방식 — 원본 자리에 크게).
+    /// 영상은 뷰어 안에서 종횡비 유지 레터박스로 표시됨.
     private func initialViewerFrame(sourceFrame: CGRect) -> CGRect {
         let screens = NSScreen.screens
         let sourceScreen = screens.first(where: { $0.frame.contains(CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)) })
             ?? NSScreen.main
-        let target = screens.first(where: { $0 != sourceScreen }) ?? sourceScreen ?? NSScreen.main
-        return target?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1600, height: 900)
+        return sourceScreen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1600, height: 900)
     }
 
     private func aspectFitRect(aspect: CGFloat, inside rect: CGRect) -> CGRect {

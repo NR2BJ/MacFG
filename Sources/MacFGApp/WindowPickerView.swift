@@ -16,7 +16,6 @@ struct WindowPickerView: View {
                     Divider()
                     settingsControls
                     if appState.isCapturing {
-                        sourcePresetsRow
                         statusGrid
                     }
                     Divider()
@@ -99,6 +98,21 @@ struct WindowPickerView: View {
                     .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            Picker("Source", selection: $appState.sourcePreset) {
+                Text("Off").tag(0); Text("360").tag(360); Text("480").tag(480)
+                Text("540").tag(540); Text("720").tag(720); Text("1080").tag(1080)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: appState.sourcePreset) {
+                if appState.isCapturing && appState.sourcePreset != 0 {
+                    appState.resizeSourceToPreset(appState.sourcePreset)
+                }
+            }
+            if appState.sourcePreset != 0 {
+                Text("Resizes the source to this short side on capture (landscape: height, portrait: width). Set it here beforehand — the viewer covers this panel while capturing.")
+                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Picker("Upscale", selection: $appState.upscaleMode) {
                 ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
             }
@@ -133,20 +147,6 @@ struct WindowPickerView: View {
     }
 
     // MARK: - During capture
-
-    private var sourcePresetsRow: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text("Source").font(.caption).foregroundStyle(.secondary)
-                ForEach([360, 480, 540, 720, 1080], id: \.self) { p in
-                    Button("\(p)p") { appState.resizeSourceToPreset(p) }
-                        .buttonStyle(.bordered).controlSize(.small)
-                }
-            }
-            Text("Resizes the source's short side (landscape: height, portrait: width). Windows with a title bar shrink the video a little.")
-                .font(.caption2).foregroundStyle(.secondary)
-        }
-    }
 
     private var statusGrid: some View {
         Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {

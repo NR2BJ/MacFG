@@ -132,6 +132,8 @@ public final class AppState {
     /// 보간 배율: 0=Auto(디스플레이 슬롯 전부 채움), 2~5=소스 fps × N 상한.
     /// 30fps 소스를 굳이 120까지 안 올리고 60(×2)에서 멈추고 싶을 때.
     var frameMultiplier: Int = 0
+    /// 소스 리사이즈 프리셋(짧은 변 px, 0=끔). 캡처 전 미리 설정 → 캡처 시작 시 소스 창을 이 크기로.
+    var sourcePreset: Int = 0
 
     // 사용자 지정 단축키 — 포커스 창 캡처 토글 하나로 통일 (init에서 UserDefaults 로드로 덮어씀)
     var hotCapture = HotKeyBinding(keyCode: UInt32(kVK_ANSI_U), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘U")
@@ -383,6 +385,14 @@ public final class AppState {
             }
             logger.info("Capture started: \(self.captureMethod) + \(self.trackingMethod)")
             DiagnosticLog.shared.log("Capture started: \(captureMethod) + \(trackingMethod) mode=\(selectedRenderMode.rawValue)")
+
+            // 미리 정한 소스 해상도 프리셋 적용 (추적/AX 준비 후)
+            if sourcePreset != 0 {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    if isCapturing { resizeSourceToPreset(sourcePreset) }
+                }
+            }
         } catch {
             logger.error("Failed to start capture: \(error)")
             return
@@ -1164,9 +1174,6 @@ public final class AppState {
             selectedWindowID = target.id
             selectedWindowName = target.name
             await startCapture()
-            if selectedOverlayPlacement == .viewerWindow {
-                overlayManager?.enterViewerFullScreen()
-            }
         }
     }
 

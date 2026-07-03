@@ -154,10 +154,10 @@ public final class OverlayManager {
         applyColorPolicy()
     }
 
-    /// Cover 배치는 대상 창을 완전히 덮으므로 오클루전 우회(alpha 0.999) 필요.
-    /// 뷰어는 대상이 보이므로 불필요.
+    /// Cover든 전체화면 뷰어든 대상 창을 완전히 덮으므로 오클루전 우회(alpha 0.999) 필요 —
+    /// 안 하면 소스가 occluded로 마킹돼 Firefox PiP 등 가려진 창이 렌더를 멈춰 화면이 정지한다(실측).
     private func applyOcclusionPolicy() {
-        overlayWindow?.setOcclusionBypass(placement == .coverSource)
+        overlayWindow?.setOcclusionBypass(true)
     }
 
     /// 소스 창과 출력이 같은 디스플레이면 passthrough(무변환), 다르면 캡처 태그 적용

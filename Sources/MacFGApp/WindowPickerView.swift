@@ -147,6 +147,20 @@ struct WindowPickerView: View {
                 .pickerStyle(.segmented)
                 .onChange(of: appState.upscaleMode) {
                     appState.updateUpscale()
+                    appState.autoSelectPlacementForUpscale()
+                }
+
+                // 소스 해상도 프리셋 — 캡처 창을 표준 높이로 리사이즈(종횡비 유지).
+                // 영상 네이티브 해상도에 맞추면 1:1 렌더 → 깨끗한 캡처 → 업스케일 효과↑.
+                HStack(spacing: 6) {
+                    Text("Source")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach([360, 480, 540, 720, 1080], id: \.self) { h in
+                        Button("\(h)p") { appState.resizeSourceToHeight(h) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
                 }
 
                 // CAS 샤픈은 업스케일과 독립 (Cover 1:1 포함 어디서나 — 늘어난 저해상도 영상 복원)

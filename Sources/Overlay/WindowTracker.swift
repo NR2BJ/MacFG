@@ -290,6 +290,21 @@ public final class WindowTracker {
         return readCGWindowListGeometry()
     }
 
+    /// 대상 창이 아직 존재하는지 (닫힘 감지용 — geometry는 optionIncludingWindow라 닫혀야 nil)
+    public var windowExists: Bool {
+        readCGWindowListGeometry() != nil
+    }
+
+    /// 대상 창을 지정 크기(points)로 리사이즈 — 소스 해상도 프리셋용 (AX).
+    /// AX 추적이 안 됐으면(비신뢰/폴백) false.
+    @discardableResult
+    public func resizeTrackedWindow(toPoints size: CGSize) -> Bool {
+        guard let element = axElement else { return false }
+        var sz = size
+        guard let value = AXValueCreate(.cgSize, &sz) else { return false }
+        return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value) == .success
+    }
+
     // MARK: - Helpers
 
     private func findPID(for windowID: CGWindowID) -> pid_t? {

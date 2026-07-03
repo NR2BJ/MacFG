@@ -562,7 +562,7 @@ public final class AppState {
             let (_, released, _) = mailbox.drain()
             for id in released { inFlightTextures.remove(id) }
             _ = captureManager.drainFrames()   // 파이프 적체 방지 (텍스처는 풀로 회수)
-            if isCapturing, hasReceivedFirstFrame, (overlayManager?.trackingFailureCount ?? 0) > 240 {
+            if isCapturing, hasReceivedFirstFrame, (overlayManager?.trackingFailureCount ?? 0) > 60 {
                 Task { await stopCapture() }
             }
             return
@@ -605,7 +605,7 @@ public final class AppState {
         if sawTexture {
             hasReceivedFirstFrame = true
         }
-        if isCapturing && hasReceivedFirstFrame && (overlayManager?.trackingFailureCount ?? 0) > 240 {
+        if isCapturing && hasReceivedFirstFrame && (overlayManager?.trackingFailureCount ?? 0) > 60 {
             logger.info("Target window closed, stopping")
             Task { await stopCapture() }
             return
@@ -1053,6 +1053,23 @@ public final class AppState {
     func updateUpscale() {
         overlayManager?.setUpscaleMode(upscaleMode)
         overlayManager?.setSharpness(casEnabled ? Float(sharpness) : 0)
+    }
+
+    /// 업스케일 모드 변경 시 기본 배치 자동 — 업스케일 쓰면 Separate Window(실효),
+    /// 안 쓰면 Cover(보간만이라 무방). 캡처 중엔 세션 방해 안 하려 건드리지 않음.
+    func autoSelectPlacementForUpscale() {
+        guard !isCapturing else { return }
+        selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+    }
+
+    /// 캡처 중인 소스 창을 프리셋 높이(px)로 리사이즈 — 현재 종횡비 유지.
+    /// 소스가 영상 네이티브 해상도에 맞을수록 1:1 렌더 → 깨끗한 캡처 → 업스케일 효과↑.
+    func resizeSourceToHeight(_ pixelHeight: Int) {
+        guard isCapturing, let src = overlayManager?.sourcePixelSize, src.height > 0 else { return }
+        let aspect = Double(src.width) / Double(src.height)
+        let w = Int((Double(pixelHeight) * aspect).rounded())
+        let ok = overlayManager?.resizeSourceWindow(toPixelWidth: w, height: pixelHeight) ?? false
+        DiagnosticLog.shared.log("[PRESET] resize source → \(w)x\(pixelHeight) (\(ok ? "ok" : "AX 실패"))")
     }
 
     func updateOverlayPlacement() {

@@ -104,6 +104,20 @@ public final class OverlayManager {
         overlayWindow?.enterFullScreen()
     }
 
+    /// 대상 창이 아직 살아있는지 (닫힘 감지)
+    public var sourceWindowExists: Bool { windowTracker.windowExists }
+
+    /// 소스 창을 target 픽셀 크기로 리사이즈 (해상도 프리셋 — 내부에서 point 변환). 성공 여부.
+    @discardableResult
+    public func resizeSourceWindow(toPixelWidth w: Int, height h: Int) -> Bool {
+        guard lastSourceFrame.width > 1 else { return false }
+        let screen = NSScreen.screens.first {
+            $0.frame.contains(CGPoint(x: lastSourceFrame.midX, y: lastSourceFrame.midY))
+        } ?? NSScreen.main
+        let scale = screen?.backingScaleFactor ?? 2.0
+        return windowTracker.resizeTrackedWindow(toPoints: CGSize(width: CGFloat(w) / scale, height: CGFloat(h) / scale))
+    }
+
     public func setPlacement(_ newPlacement: OverlayPlacement) {
         let changed = placement != newPlacement
         placement = newPlacement

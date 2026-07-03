@@ -295,14 +295,54 @@ public final class WindowTracker {
         readCGWindowListGeometry() != nil
     }
 
-    /// 대상 창을 지정 크기(points)로 리사이즈 — 소스 해상도 프리셋용 (AX).
-    /// AX 추적이 안 됐으면(비신뢰/폴백) false.
+    /// 대상 창을 size(pt)로 리사이즈. 목표 크기가 창이 속한 화면 밖으로 넘치면
+    /// (예: 화면 가장자리에 붙은 PiP를 더 크게) 위치를 먼저 화면 안으로 당긴 뒤 리사이즈한다.
+    /// Firefox PiP 등은 오버플로우 리사이즈를 조용히 거부(AX는 .success 반환하나 크기 불변)해
+    /// 그냥 크기만 set하면 실패 — 실측(가장자리 붙은 PiP는 1080 프리셋이 무시됨, 2026-07-04).
     @discardableResult
     public func resizeTrackedWindow(toPoints size: CGSize) -> Bool {
         guard let element = axElement else { return false }
+
+        // 넘침 방지 재배치 — 위치를 먼저 set(창이 아직 작아 새 위치에 들어감) 후 크기를 키운다.
+        if let clamped = clampedOriginForResize(element: element, newSize: size) {
+            var pos = clamped
+            if let posVal = AXValueCreate(.cgPoint, &pos) {
+                _ = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+            }
+        }
+
         var sz = size
         guard let value = AXValueCreate(.cgSize, &sz) else { return false }
         return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value) == .success
+    }
+
+    /// 목표 크기로 리사이즈 시 화면(visibleFrame) 밖으로 넘치면 안쪽으로 당긴 새 origin(CG 좌상단).
+    /// 이동이 불필요하면 nil. AX 위치/CGWindow bounds와 동일한 CG 좌표계로 계산.
+    private func clampedOriginForResize(element: AXUIElement, newSize: CGSize) -> CGPoint? {
+        var posRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posRef) == .success,
+              let posVal = posRef, CFGetTypeID(posVal) == AXValueGetTypeID() else { return nil }
+        var origin = CGPoint.zero
+        guard AXValueGetValue(posVal as! AXValue, .cgPoint, &origin) else { return nil }
+
+        // NS(좌하단) → CG(좌상단) 변환 기준: 좌표계 원점 화면(origin==.zero)의 높이
+        let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+            ?? NSScreen.main?.frame.height ?? 0
+        func toCG(_ f: CGRect) -> CGRect {
+            CGRect(x: f.origin.x, y: primaryHeight - f.origin.y - f.height, width: f.width, height: f.height)
+        }
+        // 창 좌상단이 속한 화면 (없으면 중심 기준, 그래도 없으면 main)
+        let center = CGPoint(x: origin.x + newSize.width / 2, y: origin.y + newSize.height / 2)
+        let screen = NSScreen.screens.first(where: { toCG($0.frame).contains(CGPoint(x: origin.x + 1, y: origin.y + 1)) })
+            ?? NSScreen.screens.first(where: { toCG($0.frame).contains(center) })
+            ?? NSScreen.main
+        guard let vis = screen.map({ toCG($0.visibleFrame) }) else { return nil }
+
+        var o = origin
+        o.x = min(max(o.x, vis.minX), max(vis.minX, vis.maxX - newSize.width))
+        o.y = min(max(o.y, vis.minY), max(vis.minY, vis.maxY - newSize.height))
+        if abs(o.x - origin.x) < 1, abs(o.y - origin.y) < 1 { return nil }   // 이동 불필요
+        return o
     }
 
     // MARK: - Helpers

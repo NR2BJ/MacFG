@@ -133,9 +133,7 @@ public final class AppState {
     /// 30fps 소스를 굳이 120까지 안 올리고 60(×2)에서 멈추고 싶을 때.
     var frameMultiplier: Int = 0
 
-    // 사용자 지정 단축키 (init에서 UserDefaults 로드로 덮어씀)
-    var hotToggle = HotKeyBinding(keyCode: UInt32(kVK_ANSI_I), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘I")
-    var hotStop = HotKeyBinding(keyCode: UInt32(kVK_ANSI_Period), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘.")
+    // 사용자 지정 단축키 — 포커스 창 캡처 토글 하나로 통일 (init에서 UserDefaults 로드로 덮어씀)
     var hotCapture = HotKeyBinding(keyCode: UInt32(kVK_ANSI_U), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘U")
 
     // MARK: - Components
@@ -1125,12 +1123,6 @@ public final class AppState {
         }
     }
 
-    /// 단축키: 오버레이 수동 토글 (raw 소스와 A/B 비교 / 즉시 치우기)
-    func toggleOverlayManual() {
-        guard isCapturing, selectedOverlayPlacement == .coverSource else { return }
-        overlayUserHidden.toggle()
-        refreshOverlayVisibility()
-    }
 
     /// 현재 최전면 앱의 최상단 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
     private func frontmostWindow() -> (id: CGWindowID, name: String)? {
@@ -1169,20 +1161,10 @@ public final class AppState {
         }
     }
 
-    /// 전역 단축키 등록 (앱 시작 시 + 변경 시). 사용자 지정 바인딩 사용.
+    /// 전역 단축키 등록 (앱 시작 시 + 변경 시). 포커스 창 캡처 토글 하나.
     /// keyCode 0 = 미설정 → 등록 생략.
     func registerHotKeys() {
         var bindings: [HotKeyCenter.Binding] = []
-        if hotToggle.keyCode != 0 {
-            bindings.append(.init(id: 1, keyCode: hotToggle.keyCode, modifiers: hotToggle.modifiers) { [weak self] in
-                self?.toggleOverlayManual()
-            })
-        }
-        if hotStop.keyCode != 0 {
-            bindings.append(.init(id: 2, keyCode: hotStop.keyCode, modifiers: hotStop.modifiers) { [weak self] in
-                Task { @MainActor in await self?.stopCapture() }
-            })
-        }
         if hotCapture.keyCode != 0 {
             bindings.append(.init(id: 3, keyCode: hotCapture.keyCode, modifiers: hotCapture.modifiers) { [weak self] in
                 self?.toggleCaptureFocused()
@@ -1193,20 +1175,13 @@ public final class AppState {
 
     /// 단축키 변경 시: UserDefaults 저장 + 재등록
     func updateHotKeys() {
-        for (key, b) in [("hk.toggle", hotToggle), ("hk.stop", hotStop), ("hk.capture", hotCapture)] {
-            if let data = try? JSONEncoder().encode(b) { UserDefaults.standard.set(data, forKey: key) }
-        }
+        if let data = try? JSONEncoder().encode(hotCapture) { UserDefaults.standard.set(data, forKey: "hk.capture") }
         registerHotKeys()
     }
 
     private func loadHotKeys() {
-        func load(_ key: String) -> HotKeyBinding? {
-            guard let d = UserDefaults.standard.data(forKey: key) else { return nil }
-            return try? JSONDecoder().decode(HotKeyBinding.self, from: d)
-        }
-        if let b = load("hk.toggle") { hotToggle = b }
-        if let b = load("hk.stop") { hotStop = b }
-        if let b = load("hk.capture") { hotCapture = b }
+        if let d = UserDefaults.standard.data(forKey: "hk.capture"),
+           let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotCapture = b }
     }
 
     private func configurePairEngine() async {

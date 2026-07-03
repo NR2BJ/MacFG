@@ -5,7 +5,6 @@ import Overlay
 /// 특정(비포커스) 창 캡처는 하단 "Capture a specific window"로.
 struct WindowPickerView: View {
     @Bindable var appState: AppState
-    @State private var showWindowList = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,14 +20,12 @@ struct WindowPickerView: View {
                         statusGrid
                     }
                     Divider()
-                    specificWindowDisclosure
                     shortcutsSection
                 }
                 .padding()
             }
         }
-        .frame(width: 420, height: 560)
-        .onAppear { appState.refreshWindowList() }
+        .frame(width: 420, height: 520)
     }
 
     // MARK: - Header
@@ -65,17 +62,15 @@ struct WindowPickerView: View {
                         .buttonStyle(.borderedProminent).tint(.red)
                 }
             } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    Button {
-                        appState.toggleCaptureFocused()
-                    } label: {
-                        Label("Capture Focused Window", systemImage: "viewfinder")
-                            .frame(maxWidth: .infinity)
+                HStack(spacing: 10) {
+                    Image(systemName: "viewfinder").font(.title2).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Focus a window, press \(appState.hotCapture.label.isEmpty ? "the shortcut" : appState.hotCapture.label)")
+                            .font(.headline)
+                        Text("Settings below apply. Press again to stop.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-                    Text("Focus the window you want, then click above or press \(appState.hotCapture.label). Settings below apply.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
                 }
             }
         }
@@ -166,63 +161,15 @@ struct WindowPickerView: View {
         .font(.callout)
     }
 
-    // MARK: - Secondary: specific window
-
-    private var specificWindowDisclosure: some View {
-        DisclosureGroup(isExpanded: $showWindowList) {
-            VStack(spacing: 2) {
-                Button {
-                    appState.refreshWindowList()
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise").font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-
-                ForEach(appState.availableWindows) { window in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(window.displayName).font(.caption).fontWeight(.medium).lineLimit(1)
-                            Text("\(window.width) x \(window.height)").font(.caption2).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("Capture") {
-                            appState.selectedWindowID = window.windowID
-                            appState.selectedWindowName = window.displayName
-                            Task { await appState.startCapture() }
-                        }
-                        .buttonStyle(.bordered).controlSize(.small)
-                    }
-                    .padding(.vertical, 1)
-                }
-            }
-            .padding(.top, 4)
-        } label: {
-            Text("Capture a specific window").font(.caption)
-        }
-    }
-
-    // MARK: - Shortcuts (녹화식 커스터마이징)
+    // MARK: - Shortcut (커스터마이징 — 캡처 토글 하나)
 
     private var shortcutsSection: some View {
-        DisclosureGroup("Shortcuts") {
-            VStack(spacing: 6) {
-                shortcutRow("Capture focused (toggle)", binding: $appState.hotCapture)
-                shortcutRow("Toggle overlay", binding: $appState.hotToggle)
-                shortcutRow("Stop capture", binding: $appState.hotStop)
-            }
-            .padding(.top, 4)
-        }
-        .font(.caption)
-    }
-
-    private func shortcutRow(_ label: String, binding: Binding<HotKeyBinding>) -> some View {
         HStack {
-            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text("Capture shortcut").font(.caption).foregroundStyle(.secondary)
             Spacer()
-            ShortcutRecorder(binding: binding)
+            ShortcutRecorder(binding: $appState.hotCapture)
                 .frame(width: 96, height: 22)
-                .onChange(of: binding.wrappedValue) { appState.updateHotKeys() }
+                .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
         }
     }
 }

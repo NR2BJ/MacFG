@@ -120,12 +120,14 @@ public final class AppState {
     // (144Hz 기준 — 24fps: 144fps/σ0.8 vs AppleFI 48fps/σ9; 지터 강건성 동급 이상)
     var selectedRenderMode: RenderMode = .metalFlow
     var selectedOverlayPlacement: OverlayPlacement = .coverSource
-    /// MetalFX Spatial 업스케일 — 출력(뷰어/큰 창)이 소스보다 클 때 선명화. Cover(1:1)엔 무영향.
-    var isUpscaleEnabled = false
+    /// 업스케일 방식 — 뷰어에서 출력>소스일 때. off/ane/metalfx/aneMetalfx.
+    var upscaleMode: UpscaleMode = .aneMetalfx
+    /// CAS 샤프닝 on/off (업스케일과 독립, Cover 1:1 포함 어디서나)
+    var casEnabled: Bool = true
+    /// CAS 샤프닝 강도 0~1
+    var sharpness: Double = 0.5
     /// 업스케일 실동작 상태 (UI 표시용) — nil이면 미캡처/비활성
     var upscaleStatus: String?
-    /// CAS 샤프닝 강도 0~1 — Enhance on일 때 적용. Cover 1:1에서도 유효 (LS의 샤픈 체감)
-    var sharpness: Double = 0.5
     /// 보간 배율: 0=Auto(디스플레이 슬롯 전부 채움), 2~5=소스 fps × N 상한.
     /// 30fps 소스를 굳이 120까지 안 올리고 60(×2)에서 멈추고 싶을 때.
     var frameMultiplier: Int = 0
@@ -267,10 +269,15 @@ public final class AppState {
             let v = args[pIdx + 1]
             selectedOverlayPlacement = (v == "viewer" || v == "beside") ? .viewerWindow : .coverSource
         }
-        if args.contains("--upscale") { isUpscaleEnabled = true }
+        if args.contains("--upscale") { upscaleMode = .aneMetalfx }
+        if let uIdx = args.firstIndex(of: "--upscale-mode"), uIdx + 1 < args.count,
+           let m = UpscaleMode(rawValue: args[uIdx + 1]) {
+            upscaleMode = m
+            DiagnosticLog.shared.log("[AUTO] upscaleMode=\(m.rawValue)")
+        }
         if let sIdx = args.firstIndex(of: "--sharpen"), sIdx + 1 < args.count,
            let v = Double(args[sIdx + 1]), (0.0...1.0).contains(v) {
-            isUpscaleEnabled = true
+            casEnabled = v > 0
             sharpness = v
             DiagnosticLog.shared.log("[AUTO] sharpen=\(v)")
         }
@@ -320,8 +327,8 @@ public final class AppState {
 
             overlayManager?.setPlacement(selectedOverlayPlacement)
             try overlayManager?.start(windowID: windowID)
-            overlayManager?.setUpscaleEnabled(isUpscaleEnabled)
-            overlayManager?.setSharpness(isUpscaleEnabled ? Float(sharpness) : 0)
+            overlayManager?.setUpscaleMode(upscaleMode)
+            overlayManager?.setSharpness(casEnabled ? Float(sharpness) : 0)
             trackingMethod = overlayManager?.trackingMethod ?? "Unknown"
 
             // 엔진 준비를 먼저 끝낸 뒤 렌더 루프 시작 (출력 화면의 vsync에 바인딩)
@@ -1030,8 +1037,8 @@ public final class AppState {
     }
 
     func updateUpscale() {
-        overlayManager?.setUpscaleEnabled(isUpscaleEnabled)
-        overlayManager?.setSharpness(isUpscaleEnabled ? Float(sharpness) : 0)
+        overlayManager?.setUpscaleMode(upscaleMode)
+        overlayManager?.setSharpness(casEnabled ? Float(sharpness) : 0)
     }
 
     func updateOverlayPlacement() {

@@ -135,12 +135,25 @@ struct WindowPickerView: View {
                     appState.updateOverlayPlacement()
                 }
 
-                Toggle("Enhance (Sharpen + MetalFX)", isOn: $appState.isUpscaleEnabled)
+                // 업스케일 방식: Off / ANE(신경망 2x) / MetalFX / ANE+FX(체이닝).
+                // 뷰어를 소스보다 크게(최대화·전체화면) 했을 때만 실효.
+                Picker("Upscale", selection: $appState.upscaleMode) {
+                    ForEach(UpscaleMode.allCases) { m in
+                        Text(m.displayName).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: appState.upscaleMode) {
+                    appState.updateUpscale()
+                }
+
+                // CAS 샤픈은 업스케일과 독립 (Cover 1:1 포함 어디서나 — 늘어난 저해상도 영상 복원)
+                Toggle("Sharpen (CAS)", isOn: $appState.casEnabled)
                     .toggleStyle(.switch)
-                    .onChange(of: appState.isUpscaleEnabled) {
+                    .onChange(of: appState.casEnabled) {
                         appState.updateUpscale()
                     }
-                if appState.isUpscaleEnabled {
+                if appState.casEnabled {
                     HStack(spacing: 8) {
                         Text("Sharpness")
                             .font(.caption)
@@ -154,13 +167,11 @@ struct WindowPickerView: View {
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
-                    // 업스케일은 출력>소스일 때만: ≤960 소스는 ANE 신경망 2x → 초과분 MetalFX,
-                    // 큰 소스는 MetalFX. CAS 샤픈은 1:1 포함 어디서나 (늘어난 저해상도 영상 복원).
-                    Text("Sharpening works everywhere. When the output is larger than the source, small sources (≤960px) are upscaled by the Neural Engine, larger ones by MetalFX. The Scale row shows what's active.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                Text("Upscale needs Separate Window enlarged past the source (≤960px sources use the Neural Engine). Maximize or fullscreen the viewer to fill your display. The Scale row shows what's active.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 // 전역 단축키 안내 (Cover 배치 전용 — 전체화면에서 창 없이 제어).
                 // 오버레이는 소스 앱이 최전면일 때만 표시되고, 벗어나면 자동으로 숨는다.

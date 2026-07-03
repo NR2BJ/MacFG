@@ -29,7 +29,7 @@ public final class OverlayManager {
     private let device: any MTLDevice
     private var lastAppliedFrame: CGRect = .zero
     private var placement: OverlayPlacement = .coverSource
-    private var upscaleEnabled = false
+    private var upscaleMode: UpscaleMode = .off
     private var sharpness: Float = 0
     private var trackedWindowID: CGWindowID?
     private var captureColorSpace: CGColorSpace?
@@ -84,13 +84,13 @@ public final class OverlayManager {
         logger.info("Overlay stopped")
     }
 
-    /// MetalFX 업스케일 토글 — 현재 창에 즉시 적용 + 이후 창 재생성에도 유지
-    public func setUpscaleEnabled(_ enabled: Bool) {
-        upscaleEnabled = enabled
-        overlayWindow?.upscaleEnabled = enabled
+    /// 업스케일 방식 — 현재 창에 즉시 적용 + 이후 창 재생성에도 유지
+    public func setUpscaleMode(_ mode: UpscaleMode) {
+        upscaleMode = mode
+        overlayWindow?.upscaleMode = mode
     }
 
-    /// CAS 샤프닝 강도 (0=끔) — Enhance 토글과 함께 사용, 창 재생성에도 유지
+    /// CAS 샤프닝 강도 (0=끔) — 업스케일과 독립, 창 재생성에도 유지
     public func setSharpness(_ value: Float) {
         sharpness = value
         overlayWindow?.sharpness = value
@@ -120,7 +120,7 @@ public final class OverlayManager {
         overlay.onUserClose = { [weak self] in
             self?.onViewerClosed?()
         }
-        overlay.upscaleEnabled = upscaleEnabled
+        overlay.upscaleMode = upscaleMode
         overlay.sharpness = sharpness
         self.overlayWindow = overlay
 

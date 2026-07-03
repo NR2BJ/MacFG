@@ -127,6 +127,24 @@ public enum OverlayStyle: Sendable {
     case viewer
 }
 
+/// 업스케일 방식 (출력 > 소스일 때). CAS 샤픈은 이와 독립적으로 항상 적용 가능.
+public enum UpscaleMode: String, CaseIterable, Identifiable, Sendable {
+    case off          // 업스케일 없음 (컴포지터 이중선형)
+    case ane          // ANE 신경망 2x만 (≤960 소스, 나머지는 컴포지터가 채움)
+    case metalfx      // MetalFX Spatial로 한 번에 목표까지
+    case aneMetalfx   // ANE 2x → MetalFX로 마저 (저해상도 소스 최고화질)
+
+    public var id: String { rawValue }
+    public var displayName: String {
+        switch self {
+        case .off: "Off"
+        case .ane: "ANE"
+        case .metalfx: "MetalFX"
+        case .aneMetalfx: "ANE+FX"
+        }
+    }
+}
+
 /// 출력 창: borderless 오버레이 또는 이동 가능한 뷰어
 @MainActor
 public final class OverlayWindow: NSObject {
@@ -142,11 +160,11 @@ public final class OverlayWindow: NSObject {
     private var colorSpaceInitialized = false
     private var upscaler: MetalFXUpscaler?
     private var neuralUpscaler: NeuralUpscaler?
-    /// 출력 목표가 소스보다 클 때 업스케일 사용 (뷰어/큰 창). off면 이중선형.
-    public var upscaleEnabled = false
+    /// 업스케일 방식 (뷰어에서 출력>소스일 때). off면 이중선형.
+    public var upscaleMode: UpscaleMode = .off
     /// CAS 샤프닝 강도 0~1 (0=끔 — 패스스루 바이트 보존 경로 유지). Cover 1:1에서도 유효.
     public var sharpness: Float = 0
-    /// 업스케일/샤픈 실동작 상태 (UI 표시용) — nil = 토글 off
+    /// 업스케일/샤픈 실동작 상태 (UI 표시용) — nil = 전부 off
     public private(set) var scaleStatus: String?
 
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
@@ -213,7 +231,9 @@ public final class OverlayWindow: NSObject {
             window.isOpaque = true
             window.backgroundColor = .black
             window.isReleasedWhenClosed = false
-            window.collectionBehavior = [.fullScreenAuxiliary]
+            // .fullScreenPrimary: 초록 버튼으로 뷰어를 진짜 전체화면 가능 (우리 창이라 항상 표시).
+            // 최대화(zoom)/전체화면 시 출력 해상도가 그만큼 올라가 업스케일 목표가 됨.
+            window.collectionBehavior = [.fullScreenPrimary]
 
             if let contentView = window.contentView {
                 contentView.wantsLayer = true
@@ -277,38 +297,35 @@ public final class OverlayWindow: NSObject {
         // 업스케일: 뷰어에서 표시 목표(레터박스 영역 × 배율)가 소스보다 크면 MetalFX Spatial로
         // 선명하게 올린다 (off이거나 실패하면 이중선형 스케일로 폴백 = 아래 그대로).
         var source = texture
-        if upscaleEnabled {
-            var parts: [String] = []
-            if style == .viewer {
+        if upscaleMode != .off || sharpness > 0.01 {
+            var chain: [String] = []
+            // 업스케일은 뷰어에서 출력>소스일 때만 (Cover는 1:1). 모드별로 ANE/MetalFX 선택.
+            if style == .viewer, upscaleMode != .off {
                 let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
                 if targetW > texture.width || targetH > texture.height {
                     var cur = source
-                    var chain: [String] = []
-                    // 1) 소스 ≤960이면 신경망 ANE SR 2x 먼저 (GPU-free, 신경망 화질)
-                    if texture.width <= NeuralUpscaler.maxInput, texture.height <= NeuralUpscaler.maxInput,
+                    // 1) ANE 신경망 2x (모드가 ane/aneMetalfx이고 소스 ≤960)
+                    if upscaleMode == .ane || upscaleMode == .aneMetalfx,
+                       texture.width <= NeuralUpscaler.maxInput, texture.height <= NeuralUpscaler.maxInput,
                        let n = neuralUpscaler?.upscale(texture, into: commandBuffer) {
                         cur = n
                         chain.append("ANE→\(n.width)×\(n.height)")
                     }
-                    // 2) 아직 목표보다 작으면 MetalFX Spatial로 마무리
-                    if targetW > cur.width || targetH > cur.height,
+                    // 2) MetalFX로 목표까지 (모드가 metalfx/aneMetalfx이고 아직 작으면)
+                    if upscaleMode == .metalfx || upscaleMode == .aneMetalfx,
+                       targetW > cur.width || targetH > cur.height,
                        let m = upscaler?.upscale(cur, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
                         cur = m
                         chain.append("MetalFX→\(targetW)×\(targetH)")
                     }
                     source = cur
-                    parts.append(chain.isEmpty ? "1:1" : chain.joined(separator: " + "))
-                } else {
-                    parts.append("1:1")
                 }
-            } else {
-                parts.append("1:1 cover")
             }
-            // CAS는 스케일과 무관하게 최종 블릿에서 적용 — 브라우저가 이미 늘려놓은
-            // 저해상도 영상의 뭉개짐 복원이 Cover에서의 실효
-            parts.append(sharpness > 0.01 ? String(format: "sharpen %.1f", sharpness) : "sharpen off")
-            scaleStatus = parts.joined(separator: " · ")
+            if chain.isEmpty { chain.append(style == .viewer ? "1:1" : "1:1 cover") }
+            // CAS는 스케일과 무관하게 최종 블릿에서 적용 (Cover 포함) — 늘어난 저해상도 영상 복원
+            chain.append(sharpness > 0.01 ? String(format: "sharpen %.1f", sharpness) : "sharpen off")
+            scaleStatus = chain.joined(separator: " · ")
         } else {
             scaleStatus = nil
         }
@@ -335,7 +352,7 @@ public final class OverlayWindow: NSObject {
         var params = BlitParams(
             size: SIMD2<Float>(Float(texW), Float(texH)),
             radiusPx: style == .overlay ? Float(OverlayStyleConstants.cornerRadius * metalLayer.contentsScale) : 0,
-            sharpness: upscaleEnabled ? sharpness : 0
+            sharpness: sharpness
         )
         encoder.setFragmentBytes(&params, length: MemoryLayout<BlitParams>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)

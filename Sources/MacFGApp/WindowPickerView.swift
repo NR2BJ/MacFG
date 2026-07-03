@@ -100,12 +100,6 @@ struct WindowPickerView: View {
             }
             .pickerStyle(.segmented)
 
-            Picker("Output", selection: $appState.selectedOverlayPlacement) {
-                ForEach(OverlayPlacement.allCases) { Text($0.displayName).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: appState.selectedOverlayPlacement) { appState.updateOverlayPlacement() }
-
             Picker("Upscale", selection: $appState.upscaleMode) {
                 ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
             }
@@ -114,6 +108,10 @@ struct WindowPickerView: View {
                 appState.updateUpscale()
                 appState.autoSelectPlacementForUpscale()
             }
+            Text(appState.upscaleMode == .off
+                 ? "Off: overlay sits on the source window (interpolation only)."
+                 : "Upscaling shows a separate maximized window (small source → big sharp output).")
+                .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
 
             Toggle("Sharpen (CAS)", isOn: $appState.casEnabled)
                 .toggleStyle(.switch)

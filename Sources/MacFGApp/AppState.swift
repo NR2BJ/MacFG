@@ -1065,11 +1065,13 @@ public final class AppState {
         overlayManager?.setSharpness(casEnabled ? Float(sharpness) : 0)
     }
 
-    /// 업스케일 모드 변경 시 기본 배치 자동 — 업스케일 쓰면 Separate Window(실효),
-    /// 안 쓰면 Cover(보간만이라 무방). 캡처 중엔 세션 방해 안 하려 건드리지 않음.
+    /// 배치는 업스케일 모드에서 자동 결정 (사용자 선택 없음): 업스케일 쓰면 Separate Window(실효),
+    /// 안 쓰면 Cover. 캡처 중 변경 시 오버레이 재생성.
     func autoSelectPlacementForUpscale() {
-        guard !isCapturing else { return }
-        selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+        let target: OverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+        guard target != selectedOverlayPlacement else { return }
+        selectedOverlayPlacement = target
+        if isCapturing { updateOverlayPlacement() }
     }
 
     /// 캡처 중인 소스 창을 프리셋 높이(px)로 리사이즈 — 현재 종횡비 유지.

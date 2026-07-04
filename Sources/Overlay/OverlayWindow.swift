@@ -313,13 +313,21 @@ public final class OverlayWindow: NSObject {
         surface.encode(texture: texture, into: commandBuffer)
     }
 
-    /// 창 기하/화면 변경을 surface 캐시에 반영 (메인) — 뷰어 레터박스 기준/배율
+    /// 창 기하/화면 변경을 surface 캐시에 반영 (메인) — 뷰어 레터박스 기준/배율.
+    /// drawableSize가 0이면 시딩 — CAMetalDisplayLink는 0×0 레이어에선 영영 발화하지 않는다
+    /// (기존 nextDrawable 경로는 첫 encode에서 lazy 설정이라 문제 없었음).
     public func refreshSurfaceParams() {
         let bounds = window.contentView?.bounds ?? CGRect(origin: .zero, size: window.frame.size)
         let scale = window.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         surface.update {
             $0.contentBounds = bounds
             $0.contentsScale = scale
+        }
+        if metalLayer.drawableSize.width < 1 || metalLayer.drawableSize.height < 1 {
+            metalLayer.drawableSize = CGSize(
+                width: max(bounds.width * scale, 64),
+                height: max(bounds.height * scale, 64)
+            )
         }
     }
 

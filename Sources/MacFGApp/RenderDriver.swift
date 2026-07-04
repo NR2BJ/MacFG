@@ -1,0 +1,114 @@
+import AppKit
+import QuartzCore
+import os
+import Monitoring
+
+/// 전용 렌더 스레드 + CAMetalDisplayLink 드라이버 (A2의 심장).
+///
+/// 목적 — 실측으로 확정된 두 구조 병목을 동시에 제거:
+///  1. NSScreen.displayLink는 AppKit UpdateCycle의 deferred 배달이라 앱이 한가해도
+///     vsync 콜백이 스킵됨 (tick 117Hz 천장, sample로 확증) → 링크를 전용 스레드
+///     런루프에 붙여 AppKit/SwiftUI와 완전 분리.
+///  2. nextDrawable 세마포어 대기 (10s 중 0.7-1.4s 실측) → CAMetalDisplayLink는
+///     vsync마다 드로어블을 콜백으로 직접 배달 (대기 개념 자체가 없음).
+///
+/// handler는 렌더 스레드에서 실행된다. 스레드는 최초 attach에서 기동 후 재사용.
+final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Sendable {
+    struct Tick {
+        let drawable: any CAMetalDrawable
+        /// 이 업데이트의 기준 시각 (콜백 발화 기준)
+        let timestamp: CFTimeInterval
+        /// 이 드로어블이 실제 표시될 vsync 시각 — 스케줄러의 targetTimestamp
+        let targetPresentTimestamp: CFTimeInterval
+    }
+
+    private let logger = Logger(subsystem: "com.macfg", category: "RenderDriver")
+    private let lock = NSLock()
+    private var thread: Thread?
+    private var runLoop: CFRunLoop?
+    private let threadReady = DispatchSemaphore(value: 0)
+    private var link: CAMetalDisplayLink?
+    private var handler: ((Tick) -> Void)?
+
+    /// 렌더 스레드 기동 (1회) — 런루프를 더미 소스로 유지
+    private func ensureThread() {
+        lock.lock()
+        let started = thread != nil
+        lock.unlock()
+        guard !started else { return }
+
+        let t = Thread { [weak self] in
+            guard let self else { return }
+            let rl = CFRunLoopGetCurrent()
+            self.lock.lock(); self.runLoop = rl; self.lock.unlock()
+            self.threadReady.signal()
+            var ctx = CFRunLoopSourceContext()
+            if let src = CFRunLoopSourceCreate(nil, 0, &ctx) {
+                CFRunLoopAddSource(rl, src, .defaultMode)
+            }
+            CFRunLoopRun()
+        }
+        t.name = "MacFG.Render"
+        t.qualityOfService = .userInteractive
+        lock.lock(); thread = t; lock.unlock()
+        t.start()
+        threadReady.wait()
+        logger.info("Render thread started")
+    }
+
+    /// 렌더 스레드에서 블록 실행 (완료 대기)
+    private func performSync(_ block: @escaping () -> Void) {
+        lock.lock(); let rl = runLoop; lock.unlock()
+        guard let rl else { return }
+        if CFRunLoopGetCurrent() === rl { block(); return }
+        let done = DispatchSemaphore(value: 0)
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.defaultMode.rawValue) {
+            block()
+            done.signal()
+        }
+        CFRunLoopWakeUp(rl)
+        done.wait()
+    }
+
+    /// 레이어에 링크 부착 (기존 링크는 교체). handler는 렌더 스레드에서 vsync마다 호출.
+    func attach(layer: CAMetalLayer, handler newHandler: @escaping (Tick) -> Void) {
+        ensureThread()
+        performSync { [weak self] in
+            guard let self else { return }
+            self.link?.invalidate()
+            self.lock.lock(); self.handler = newHandler; self.lock.unlock()
+            let link = CAMetalDisplayLink(metalLayer: layer)
+            link.delegate = self
+            link.add(to: RunLoop.current, forMode: .default)
+            self.link = link
+            DiagnosticLog.shared.log("[DRIVER] link attached (layer=\(Int(layer.drawableSize.width))x\(Int(layer.drawableSize.height)), thread=\(Thread.current.name ?? "?"))")
+        }
+    }
+
+    /// 링크 해제 — 반환 시점 이후 handler 호출 없음 보장 (동기)
+    func detach() {
+        performSync { [weak self] in
+            guard let self else { return }
+            self.link?.invalidate()
+            self.link = nil
+            self.lock.lock(); self.handler = nil; self.lock.unlock()
+            self.logger.info("CAMetalDisplayLink detached")
+        }
+    }
+
+    // MARK: - CAMetalDisplayLinkDelegate (렌더 스레드에서 호출됨)
+
+    private var cbCount = 0
+    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        cbCount += 1
+        if cbCount <= 3 || cbCount % 600 == 0 {
+            DiagnosticLog.shared.log("[DRIVER] update #\(cbCount) target=\(update.targetPresentationTimestamp)")
+        }
+        lock.lock(); let h = handler; lock.unlock()
+        h?(Tick(
+            drawable: update.drawable,
+            timestamp: update.targetTimestamp,
+            targetPresentTimestamp: update.targetPresentationTimestamp
+        ))
+    }
+}

@@ -99,6 +99,9 @@ public final class OverlayManager {
     /// 업스케일 실동작 상태 (UI 표시용)
     public var scaleStatus: String? { overlayWindow?.scaleStatus }
 
+    /// 현재 출력 창의 렌더 표면 (렌더 스레드가 직접 사용 — A2)
+    public var currentRenderSurface: RenderSurface? { overlayWindow?.surface }
+
     /// 대상 창이 아직 살아있는지 (닫힘 감지)
     public var sourceWindowExists: Bool { windowTracker.windowExists }
 

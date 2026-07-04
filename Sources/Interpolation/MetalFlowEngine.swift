@@ -120,13 +120,15 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         statsIndex = (statsIndex + 1) % statsBuffers.count
         let L = levels.count
 
-        // 모션 부드러움 매핑 (0.5=현재 기본): 하단은 flow 스무딩↓+폴백 좁힘, 상단은 반대.
+        // 모션 부드러움 매핑 — flow 부드러움만 조절 (고스팅 주는 폴백 폭은 슬라이더에서 분리).
+        // 하단: flow raw(예리, 디테일↑). 상단: flow 박스+워프블러(에러 완만, AppleFI 느낌).
         let sm = min(max(Self.motionSmoothness, 0), 1)
         var smoothAmt: Float = min(sm * 2, 1)                       // flow 박스스무딩: 0→raw, 0.5→full, 1→full
         let flowBlur: Float = max((sm - 0.5) * 2, 0)               // 워프 flow 블러: 0(≤0.5)→1(=1.0)
-        let fadeHalf: Float = 0.02 + 0.28 * sm                     // 폴백 폭: 0→±0.02, 0.5→±0.16, 1→±0.30
-        let fadeLo = 0.5 - fadeHalf
-        let fadeHi = 0.5 + fadeHalf
+        // 폴백 크로스페이드 폭은 좁게 고정 — 넓히면 저신뢰(물체 경계)에서 이중상(고스팅).
+        // 부드러움은 flow로만 얻고 고스팅은 늘 억제 (사용자 A/B: 오른쪽에서 고스팅 관측).
+        let fadeLo: Float = 0.44
+        let fadeHi: Float = 0.56
 
         // 0) 히스토그램 클리어
         if let fill = commandBuffer.makeBlitCommandEncoder() {

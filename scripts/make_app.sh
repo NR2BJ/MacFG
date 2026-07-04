@@ -50,8 +50,16 @@ cat > "$APP/Contents/Info.plist" << PLIST
 </plist>
 PLIST
 
-echo "── 코드사인 (adhoc)"
-codesign -f -s - --entitlements "$ROOT/MacFGApp.entitlements" "$APP"
+# 서명 정체성: "MacFG Dev" 자체서명 인증서가 유효하면 사용 — TCC(화면 녹화/손쉬운 사용)가
+# 정체성+번들ID 기준으로 유지되어 재빌드마다 권한 재허가가 필요 없어진다.
+# (ad-hoc은 빌드마다 CDHash가 바뀌어 TCC가 매번 다른 앱으로 취급)
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "MacFG Dev"; then
+  echo "── 코드사인 (MacFG Dev — TCC 영속)"
+  codesign -f -s "MacFG Dev" --entitlements "$ROOT/MacFGApp.entitlements" "$APP"
+else
+  echo "── 코드사인 (adhoc — MacFG Dev 인증서 없음/미신뢰)"
+  codesign -f -s - --entitlements "$ROOT/MacFGApp.entitlements" "$APP"
+fi
 
 echo "── DMG 생성"
 STAGE="$DIST/stage"

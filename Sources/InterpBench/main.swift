@@ -19,6 +19,7 @@ struct BenchConfig {
     var frames: Int = 30
     var engines: [String] = ["all"]
     var flowBase: Double? = nil
+    var occDirectional = false
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -30,6 +31,7 @@ struct BenchConfig {
             case "--frames": if let v = args.popFirst() { config.frames = Int(v) ?? config.frames }
             case "--engines": if let v = args.popFirst() { config.engines = v.split(separator: ",").map(String.init) }
             case "--flow-base": if let v = args.popFirst() { config.flowBase = Double(v) }
+            case "--occ-dir": config.occDirectional = true
             default: break
             }
         }
@@ -253,6 +255,7 @@ func benchmarkEngine(_ engine: any PairInterpolationEngine,
 func main() async {
     let config = BenchConfig.parse()
     if let base = config.flowBase { MetalFlowEngine.flowBaseLongSide = base }
+    MetalFlowEngine.occlusionDirectional = config.occDirectional
 
     guard let device = MTLCreateSystemDefaultDevice() else {
         print("❌ Metal not available"); return

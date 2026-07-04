@@ -9,13 +9,14 @@ import os
 /// (RIFE류는 flow 해상도에서 이미지를 "합성"하므로 해상도가 화질을 결정 — 그래서 무거움)
 ///
 /// 파이프라인 (전부 Metal 컴퓨트, 단일 CB, FidelityFX Optical Flow 계열):
-///  1. 루마 피라미드: base(≤1920 긴변, 소스 1/2) → 반씩 다운 ~7레벨
-///  2. coarse→fine 매칭: 최상위 ±3, 이하 ±1 국소 탐색 (5x5 SAD), 양방향(A→B, B→A)
-///     + 레벨마다 3x3 flow 스무딩 (노이즈/부들거림 억제)
-///  3. finalize: forward-backward 일관성 → 신뢰도 마스크, |A-B| → 정적 마스크,
-///     루마 히스토그램(장면컷 판정, AppleFI와 동일 방식)
-///  4. 풀해상도 워프: w0=A(p-t·F_ab), w1=B(p+(1-t)·F_ba) → 신뢰도 기반 합성.
-///     정적 영역=B 원본(선명도 유지), 저신뢰 영역=크로스페이드(아티팩트 대신 소프트).
+///  1. 루마 피라미드: base(flowBase 긴변) → 반씩 다운 ~7레벨, zero-mean 프리필터(Z=L-mean5x5)
+///  2. coarse→fine 매칭: 최상위 ±3, 이하 ±1 정수 국소 탐색 (6x6 SAD, gather 9회/후보,
+///     half4 벡터 누적), 양방향(A→B, B→A) + 레벨마다 3x3 flow 스무딩
+///  3. finalize: 방향별 forward-backward 일관성 → confF/confB (오클루전 판정),
+///     |A-B| → 정적 마스크, 루마 히스토그램(장면컷 판정, AppleFI와 동일 방식)
+///  4. 풀해상도 워프: w0=A(p-t·F_ab), w1=B(p-(1-t)·F_ba) → 방향별 가중 합성
+///     (한쪽만 일관한 가림/드러남 영역은 보이는 쪽 단방향 워프 — 경계 스텝/고스트 억제).
+///     정적 영역=B 원본(선명도 유지), 양쪽 다 저신뢰=가까운 원본 폴백.
 ///
 /// 임의 t 지원: flow 벡터 t배 스케일이므로 어떤 위상이든 동일 비용 (144Hz 대응 기반).
 public final class MetalFlowEngine: PairInterpolationEngine {
@@ -25,9 +26,13 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private let sceneCutIntersectionThreshold = 0.5
 
     /// flow 밀도 (긴 변 목표). 앱 시작 시 1회 설정(--flow-base) 후 읽기 전용 — 락 불필요.
-    /// 4K 실측 (M4, 2026-07-02): 480→work 8ms / 960→12-13ms / 1280→16-18ms / 1920→40ms(붕괴).
+    /// 4K 쌍당 실측 (M4): gather 최적화 전 8.3ms → 후 5.6ms (base 960). 1080p 3.7ms.
     /// 960 = 60fps 예산(16.7ms) 내 최대 밀도 — 기본값. 1280은 30fps 이하 콘텐츠용 여지.
     public nonisolated(unsafe) static var flowBaseLongSide: Double = 960
+
+    /// 오클루전 방향별 워프 (실험, --occ-directional): 가림/드러남 영역에서 보이는 쪽 단방향 워프.
+    /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.
+    public nonisolated(unsafe) static var occlusionDirectional: Bool = false
 
     private var device: (any MTLDevice)?
     private let logger = Logger(subsystem: "com.macfg", category: "MetalFlow")
@@ -218,10 +223,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         enc2.setTexture(flowF[0], index: 2)
         enc2.setTexture(flowB[0], index: 3)
         enc2.setTexture(maskTex, index: 4)
+        let dirBlend: Float = Self.occlusionDirectional ? 1.0 : 0.0
         for t in tValues.sorted() {
             let output = outputPool[outputIndex]
             outputIndex = (outputIndex + 1) % outputPool.count
-            var wp = WarpParams(t: t)
+            var wp = WarpParams(t: t, dirBlend: dirBlend)
             enc2.setTexture(output, index: 5)
             enc2.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
             dispatch(enc2, output.width, output.height, warpPSO)
@@ -258,6 +264,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     }
     private struct WarpParams {
         var t: Float
+        var dirBlend: Float
     }
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -308,7 +315,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             zmA.append(za); zmB.append(zb)
             flowF.append(ff); flowB.append(fb); flowTmp.append(ft)
         }
-        maskTex = tex(levels[0].w, levels[0].h, .rg8Unorm)
+        // r=confF(A→B 일관성), g=정적, b=confB(B→A 일관성) — 방향별 오클루전 판정용
+        maskTex = tex(levels[0].w, levels[0].h, .rgba8Unorm)
         let cl = levels[levels.count - 1]
         prevCoarseF = tex(cl.w, cl.h, .rg16Float)
         prevCoarseB = tex(cl.w, cl.h, .rg16Float)
@@ -350,7 +358,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     using namespace metal;
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; };
-    struct WarpParams { float t; };
+    struct WarpParams { float t; float dirBlend; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -510,8 +518,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     // 신뢰도(순환 일관성) + 정적(|A-B|) 마스크 + 루마 히스토그램 (장면컷)
     kernel void mfFinalize(
-        texture2d<half, access::read> lumA [[texture(0)]],
-        texture2d<half, access::read> lumB [[texture(1)]],
+        texture2d<half, access::sample> lumA [[texture(0)]],
+        texture2d<half, access::sample> lumB [[texture(1)]],
         texture2d<float, access::sample> flowF [[texture(2)]],
         texture2d<float, access::sample> flowB [[texture(3)]],
         texture2d<float, access::write> mask [[texture(4)]],
@@ -524,21 +532,33 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float2 size = float2(w, h);
         float2 uv = (float2(gid) + 0.5) / size;
 
+        // 방향별 순환 검사 — 오클루전 판정의 핵심:
+        // A에서 가려지는(사라지는) 픽셀은 F가 무효 → cycF 큼, B에서 새로 드러나는 픽셀은 그 반대.
+        // 두 방향을 따로 재면 워프가 "보이는 쪽"만 골라 쓸 수 있다 (단방향 워프).
         float2 f = flowF.sample(s, uv).rg;
-        // 순환 검사: x + F(x) 위치의 backward flow와 합이 0이어야 일관
-        float2 uv2 = (float2(gid) + 0.5 + f) / size;
-        float2 b = flowB.sample(s, uv2).rg;
-        float cyc = length(f + b);
+        float2 uvF = (float2(gid) + 0.5 + f) / size;
+        float cycF = length(f + flowB.sample(s, uvF).rg);
+        float2 b = flowB.sample(s, uv).rg;
+        float2 uvB = (float2(gid) + 0.5 + b) / size;
+        float cycB = length(b + flowF.sample(s, uvB).rg);
         // 실영상 압축 노이즈에서 순환 오차 ~2px는 정상 — 과민하면 화면 대부분이
         // 원본 폴백(60fps 스텝)으로 빠져 '프레임레이트 낮아 보임' (실측 보고)
-        float conf = 1.0 - smoothstep(2.5, 8.0, cyc);
+        float confF = 1.0 - smoothstep(2.5, 8.0, cycF);
+        float confB = 1.0 - smoothstep(2.5, 8.0, cycB);
 
-        float la = float(lumA.read(gid).r);
-        float lb = float(lumB.read(gid).r);
+        // 광도 검증(brightness constancy): flow를 따라간 곳의 밝기가 다르면 그 방향 기각.
+        // 순환 일관성만으론 "일관되게 틀린" flow(반복 패턴 aliasing)를 못 걸러냄 —
+        // 잘못된 워프가 확신을 얻는 것을 막는 2차 방어선. 문턱은 정적 마스크(0.008~0.04)보다 관대.
+        float la = float(lumA.sample(s, uv).r);
+        float lb = float(lumB.sample(s, uv).r);
+        float errF = fabs(float(lumB.sample(s, uvF).r) - la);
+        float errB = fabs(float(lumA.sample(s, uvB).r) - lb);
+        confF *= 1.0 - smoothstep(0.04, 0.14, errF);
+        confB *= 1.0 - smoothstep(0.04, 0.14, errB);
         float d = fabs(la - lb);
         float staticness = 1.0 - smoothstep(0.008, 0.04, d);
 
-        mask.write(float4(conf, staticness, 0, 0), gid);
+        mask.write(float4(confF, staticness, confB, 0), gid);
 
         if ((gid.x & 3) == 0 && (gid.y & 3) == 0) {
             uint binA = uint(clamp(la, 0.0, 0.999) * 32.0);
@@ -572,21 +592,33 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float2 b = flowB.sample(s, uv).rg / baseSize;
 
         // backward 매핑: 출력 p의 물체는 A에서 p - t·F_ab 에, B에서 p - (1-t)·F_ba 에 있었다
-        // (flow를 p에서 샘플하는 소모션 근사 — 표준 기법)
         half3 w0 = imgA.sample(s, uv - f * t).rgb;
         half3 w1 = imgB.sample(s, uv - b * (1.0 - t)).rgb;
-        half3 interp = mix(w0, w1, half(t));
 
         float4 m = mask.sample(s, uv);
-        half conf = half(m.r);
-        half staticness = half(m.g);
+        float confF = m.r;
+        float staticness = m.g;
+        float confB = m.b;
+
+        // 오클루전 합성 — dirBlend(0=기존, 1=방향별)로 A/B 가능.
+        // 방향별: 한쪽 flow만 일관한 가림/드러남 영역은 보이는 쪽 단방향 워프 + 게이트 상향
+        //   (기존엔 이 영역이 통째로 원본 폴백 → 가림 경계 60fps 스텝/고스트).
+        // 주의: 반복 패턴에선 "일관되게 틀린"(aliased) flow에 확신을 줄 리스크 —
+        //   합성 줄무늬 벤치 실측 -3dB (병리적 최악 케이스). 실영상 육안 A/B 전까지 기본 0.
+        float wa = confF * (1.0 - t);
+        float wb = confB * t;
+        float denom = wa + wb;
+        float dirFactor = (denom > 1e-4) ? (wb / denom) : t;
+        float tBlend = mix(t, dirFactor, fabs(confF - confB) * p.dirBlend);
+        half3 interp = mix(w0, w1, half(tBlend));
+        half conf = half(mix(confF, max(confF, confB), p.dirBlend));
 
         // 저신뢰 폴백: 크로스페이드는 이중상(고스트)으로 보임 → 시간상 가까운 원본을 그대로
         // (t 경계에서 팝 방지를 위해 좁은 구간만 블렌드)
         half3 nearestPix = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb,
                                half(smoothstep(0.35, 0.65, t)));
         half3 moving = mix(nearestPix, interp, conf);
-        half3 outc = mix(moving, imgB.sample(s, uv).rgb, staticness); // 정적 → B 원본 (선명)
+        half3 outc = mix(moving, imgB.sample(s, uv).rgb, half(staticness)); // 정적 → B 원본 (선명)
         dst.write(half4(outc, 1.0h), gid);
     }
     """

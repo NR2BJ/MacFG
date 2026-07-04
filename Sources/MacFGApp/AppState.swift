@@ -343,6 +343,10 @@ public final class AppState {
             MetalFlowEngine.flowBaseLongSide = base
             DiagnosticLog.shared.log("[AUTO] flowBaseLongSide=\(Int(base))")
         }
+        if args.contains("--occ-directional") {
+            MetalFlowEngine.occlusionDirectional = true
+            DiagnosticLog.shared.log("[AUTO] occlusionDirectional=on (실험 — 실영상 A/B용)")
+        }
         if let cIdx = args.firstIndex(of: "--corner-radius"), cIdx + 1 < args.count,
            let r = Double(args[cIdx + 1]), r >= 0, r <= 64 {
             OverlayStyleConstants.cornerRadius = r

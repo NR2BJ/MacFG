@@ -535,7 +535,6 @@ public final class AppState {
         paceWarmupUntilTick = diagTick + 720   // ~6s 과도기 무시 (케이던스 락)
         pendingIngest = []
         inFlightPresents.withLock { $0 = 0 }
-        presentBusySkips = 0
         _ = mailbox.drain()
     }
 
@@ -584,11 +583,8 @@ public final class AppState {
     /// vsync 콜백을 삼키지 않게 틱당 4장 캡, 나머지는 다음 틱에서 처리
     private var pendingIngest: [FrameSlot] = []
     /// 인플라이트 present 수 (presentedHandler에서 감소 — 임의 스레드라 락 보호).
-    /// CAMetalLayer 드로어블 3개 중 2개 이상이 미완이면 nextDrawable이 세마포어 블록
-    /// (10s 샘플 중 0.7-1.4s 대기 실측 — vsync 콜백을 삼키는 최대 단일 원인).
-    /// 블로킹 대신 이번 틱 표시를 건너뛰고(항목 유지) 다음 틱에 표시한다.
+    /// 인플라이트 present 수 (presentedHandler에서 감소). 드로어블 포화 진단용 (drawBusy).
     private let inFlightPresents = OSAllocatedUnfairLock(initialState: 0)
-    private var presentBusySkips = 0
     private var diagPresentBusy = 0
     private var isRestartingCapture = false
     private var presentedTimes: [CFTimeInterval] = []

@@ -41,31 +41,66 @@ struct BenchConfig {
 
 // MARK: - Test Pattern Generation
 
-/// 수평 이동 줄무늬 + 원형 오브젝트 패턴 (GPU compute). shift로 A/B/GT 생성.
+/// 비주기 테스트 패턴 (GPU compute). shift로 A/B/GT 생성 — 세 요소 모두 shift에 선형이라
+/// GT(shift=중간)가 정확한 참 중간프레임:
+///   ① 비주기 값노이즈 배경 (1× 병진) — 주기 패턴의 aliasing 이점 제거
+///   ② 3× 빠른 오클루더 박스 — 가림/드러남 경계(플로우 최약점) 측정
+///   ③ 회전 스포크 휠 (각속도 일정) — 블록매칭이 못 따라가는 회전
 func createTestPattern(device: any MTLDevice, commandQueue: any MTLCommandQueue,
                        width: Int, height: Int, shift: Float) -> (any MTLTexture)? {
     let shaderSrc = """
     #include <metal_stdlib>
     using namespace metal;
     struct PatternParams { uint2 size; float shift; float barWidth; };
+
+    float vhash(float2 p) {
+        return fract(sin(dot(floor(p), float2(127.1, 311.7))) * 43758.5453);
+    }
+    float vnoise(float2 p) {
+        float2 i = floor(p), f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        float a = vhash(i), b = vhash(i + float2(1,0));
+        float c = vhash(i + float2(0,1)), d = vhash(i + float2(1,1));
+        return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+    }
+
     kernel void generatePattern(
         texture2d<float, access::write> out [[texture(0)]],
         constant PatternParams& p [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]])
     {
         if (gid.x >= p.size.x || gid.y >= p.size.y) return;
-        float x = float(gid.x) + p.shift;
-        float y = float(gid.y);
-        float stripe = sin(x / p.barWidth * 3.14159) * 0.5 + 0.5;
-        float vstripe = cos(y / (p.barWidth * 1.5) * 3.14159) * 0.3 + 0.5;
-        float2 center = float2(float(p.size.x) * 0.5 + p.shift * 3.0,
-                               float(p.size.y) * 0.5 + p.shift * 1.5);
-        float dist = length(float2(gid) - center);
-        float circle = smoothstep(100.0, 80.0, dist);
-        float r = mix(stripe, 1.0, circle);
-        float g = mix(vstripe, 0.3, circle);
-        float b = mix(stripe * vstripe, 0.1, circle);
-        out.write(float4(r, g, b, 1.0), gid);
+        float2 px = float2(gid);
+        float2 sz = float2(p.size);
+
+        // ① 비주기 값노이즈 배경 (다중 옥타브, 1× 수평 병진)
+        float2 bp = (px - float2(p.shift, 0.0)) * 0.012;
+        float n = vnoise(bp) * 0.6 + vnoise(bp * 2.7) * 0.3 + vnoise(bp * 6.1) * 0.1;
+        float3 c = float3(n * 0.85, n * 0.72, n * 0.55);
+
+        // ③ 회전 스포크 휠 (중앙 좌측, 각속도 = shift 선형)
+        float2 wc = sz * float2(0.34, 0.5);
+        float2 wd = px - wc; float wr = length(wd);
+        float wheelR = min(sz.x, sz.y) * 0.20;
+        if (wr < wheelR) {
+            float ang = atan2(wd.y, wd.x) + p.shift * 0.025;
+            float spokes = step(0.0, sin(ang * 8.0));
+            float rings = step(0.5, fract(wr / (wheelR * 0.22)));
+            c = mix(float3(0.12, 0.16, 0.42), float3(0.95, 0.88, 0.28), spokes * 0.7 + rings * 0.3);
+            if (wr > wheelR * 0.93) c = float3(0.9);
+        }
+
+        // ② 3× 빠른 오클루더 박스 (배경/휠 위를 가로질러 가림·드러남 생성)
+        float occX = sz.x * 0.30 + p.shift * 3.0;
+        float2 bl = float2(occX, sz.y * 0.32);
+        float2 tr = bl + float2(150.0, sz.y * 0.36);
+        if (px.x >= bl.x && px.x < tr.x && px.y >= bl.y && px.y < tr.y) {
+            // 오클루더 자체도 내부 텍스처(균일색이면 경계만 평가됨) — 대각 줄
+            float band = step(0.5, fract((px.x - px.y) / 24.0));
+            c = mix(float3(0.9, 0.35, 0.1), float3(0.7, 0.2, 0.05), band);
+        }
+
+        out.write(float4(c, 1.0), gid);
     }
     """
 

@@ -2,7 +2,7 @@ import SwiftUI
 import Overlay
 
 /// 설정 우선 화면 (Lossless Scaling 방식): 설정은 앱에서 미리, 시작은 포커스 창에 단축키.
-/// 각 항목에 한 줄 설명 + (?) 아이콘(호버/클릭 상세 팝오버)으로 기술 용어를 풀어준다.
+/// 각 항목에 한 줄 설명 + (?) 아이콘(클릭 팝오버 상세)으로 기술 용어를 풀어준다. en/ko/ja는 L().
 struct WindowPickerView: View {
     @Bindable var appState: AppState
 
@@ -36,7 +36,6 @@ struct WindowPickerView: View {
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    /// 라벨(+도움말 아이콘) · 컨트롤 · 한 줄 부연 설명을 묶은 항목
     @ViewBuilder
     private func field<Control: View>(_ label: String, hint: String, detail: String? = nil,
                                       @ViewBuilder _ control: () -> Control) -> some View {
@@ -64,16 +63,21 @@ struct WindowPickerView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Stop") { Task { await appState.stopCapture() } }
+                    Button(L("Stop", "정지", "停止")) { Task { await appState.stopCapture() } }
                         .buttonStyle(.borderedProminent).tint(.red).controlSize(.large)
                 }
             } else {
                 HStack(spacing: 12) {
                     Image(systemName: "viewfinder").font(.system(size: 26)).foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Focus a window, press \(appState.hotCapture.label.isEmpty ? "the shortcut" : appState.hotCapture.label)")
+                        let key = appState.hotCapture.label.isEmpty ? L("the shortcut", "단축키", "ショートカット") : appState.hotCapture.label
+                        Text(L("Focus a window, press \(key)",
+                               "창을 포커스하고 \(key) 누르기",
+                               "ウィンドウをフォーカスして \(key) を押す"))
                             .font(.headline)
-                        Text("Set it up below · press again to stop")
+                        Text(L("Set it up below · press again to stop",
+                               "아래에서 설정 · 다시 누르면 정지",
+                               "下で設定 · もう一度で停止"))
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -89,12 +93,17 @@ struct WindowPickerView: View {
     // MARK: - Interpolation
 
     private var interpolationSection: some View {
-        section("Interpolation") {
-            Toggle("Frame interpolation", isOn: $appState.isInterpolationEnabled)
+        section(L("Interpolation", "프레임 보간", "フレーム補間")) {
+            Toggle(L("Frame interpolation", "프레임 보간", "フレーム補間"), isOn: $appState.isInterpolationEnabled)
                 .onChange(of: appState.isInterpolationEnabled) { appState.updateInterpolationEnabled() }
 
-            field("Engine", hint: "Not sure? Try both and pick what looks better.",
-                  detail: "Metal Flow — our GPU interpolator: any multiplier (×2–×5), keeps native sharpness, works on all Apple Silicon.\n\nApple FI — Apple's Neural Engine model: fixed 2× at 720p, sometimes handles complex motion more gently. Needs the display at fps × 2 (60→120, 24→144).") {
+            field(L("Engine", "엔진", "エンジン"),
+                  hint: L("Not sure? Try both and pick what looks better.",
+                          "잘 모르겠으면 둘 다 써보고 더 나은 걸 고르세요.",
+                          "迷ったら両方試して好みの方を。"),
+                  detail: L("Metal Flow — our GPU interpolator: any multiplier (×2–×5), keeps native sharpness, works on all Apple Silicon.\n\nApple FI — Apple's Neural Engine model: fixed 2× at 720p, sometimes handles complex motion more gently. Needs the display at fps × 2 (60→120, 24→144).",
+                            "Metal Flow — 자체 GPU 보간기: 임의 배율(×2–×5), 원본 선명도 유지, 모든 Apple Silicon에서 동작.\n\nApple FI — 애플 뉴럴 엔진 모델: 720p·2배 고정, 복잡한 모션을 더 부드럽게 처리할 때가 있음. 디스플레이를 fps×2로(60→120, 24→144).",
+                            "Metal Flow — 自作GPU補間: 任意倍率(×2–×5)、元の鮮明さを維持、全Apple Silicon対応。\n\nApple FI — AppleのNeural Engineモデル: 720p・2倍固定、複雑な動きをより滑らかに扱うことも。ディスプレイをfps×2に(60→120, 24→144)。")) {
                 Picker("", selection: $appState.selectedRenderMode) {
                     ForEach(RenderMode.userSelectable) { Text($0.displayName).tag($0) }
                 }
@@ -102,8 +111,13 @@ struct WindowPickerView: View {
                 .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
             }
 
-            field("Multiplier", hint: "Output frames = source fps × N. Auto fills your refresh rate.",
-                  detail: "Caps at your display's refresh rate: 60fps ×3 = 180 needs a 180Hz+ display (a 120Hz display shows 120). Auto picks the most your display can show.") {
+            field(L("Multiplier", "배율", "倍率"),
+                  hint: L("Output frames = source fps × N. Auto fills your refresh rate.",
+                          "출력 = 소스 fps × N. Auto는 주사율만큼 채움.",
+                          "出力 = ソースfps × N。Autoはリフレッシュレートまで。"),
+                  detail: L("Caps at your display's refresh rate: 60fps ×3 = 180 needs a 180Hz+ display (a 120Hz display shows 120). Auto picks the most your display can show.",
+                            "디스플레이 주사율이 상한: 60fps ×3 = 180은 180Hz+ 필요(120Hz는 120까지). Auto는 디스플레이가 낼 수 있는 최대로.",
+                            "上限はディスプレイのリフレッシュレート: 60fps ×3 = 180には180Hz+が必要(120Hzなら120)。Autoは表示可能な最大に。")) {
                 Picker("", selection: $appState.frameMultiplier) {
                     Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
                 }
@@ -114,23 +128,40 @@ struct WindowPickerView: View {
             if appState.selectedRenderMode == .metalFlow {
                 Divider().padding(.vertical, 2)
 
-                sliderField("Motion", low: "sharp", high: "smooth", value: $appState.motionSmoothness,
-                            hint: "How the motion looks — taste, not quality.",
-                            detail: "Sharp keeps more motion detail but can shimmer. Smooth is gentler and softer (closer to Apple FI's feel). Slide it while watching.") {
+                sliderField(L("Motion", "모션", "モーション"),
+                            low: L("sharp", "예리", "シャープ"), high: L("smooth", "부드러움", "スムーズ"),
+                            value: $appState.motionSmoothness,
+                            hint: L("How the motion looks — taste, not quality.",
+                                    "움직임 느낌 — 화질이 아니라 취향.",
+                                    "動きの質感 — 画質でなく好み。"),
+                            detail: L("Sharp keeps more motion detail but can shimmer. Smooth is gentler and softer (closer to Apple FI's feel). Slide it while watching.",
+                                      "예리 = 모션 디테일↑(어른거릴 수 있음). 부드러움 = 완만하고 소프트(Apple FI 느낌). 보면서 조절하세요.",
+                                      "シャープ = 動きのディテール↑(ちらつくことも)。スムーズ = 穏やかで柔らか(Apple FI寄り)。見ながら調整。")) {
                     appState.updateMotionSmoothness()
                 }
 
-                sliderField("Edges", low: "crisp", high: "soft", value: $appState.boundarySoftness,
-                            hint: "Object boundaries — pick by content.",
-                            detail: "The ghosting-vs-judder trade at moving edges. Crisp = less ghosting with a slight step (good for games / fast action). Soft = smoother with slight ghosting (good for film / slow pans).") {
+                sliderField(L("Edges", "경계", "エッジ"),
+                            low: L("crisp", "선명", "くっきり"), high: L("soft", "부드러움", "やわらか"),
+                            value: $appState.boundarySoftness,
+                            hint: L("Object boundaries — pick by content.",
+                                    "물체 경계 — 콘텐츠에 맞춰.",
+                                    "物体の境界 — コンテンツに合わせて。"),
+                            detail: L("The ghosting-vs-judder trade at moving edges. Crisp = less ghosting with a slight step (good for games / fast action). Soft = smoother with slight ghosting (good for film / slow pans).",
+                                      "움직이는 경계의 고스팅↔저더 맞바꿈. 선명 = 고스팅↓·미세 저더(게임/빠른 액션). 부드러움 = 매끄럽지만 약간 고스팅(영화/느린 팬).",
+                                      "動く境界のゴースト↔ジャダーのトレードオフ。くっきり = ゴースト↓·わずかなカクつき(ゲーム/速い動き)。やわらか = 滑らかだが少しゴースト(映画/ゆっくりパン)。")) {
                     appState.updateBoundarySoftness()
                 }
 
                 Divider().padding(.vertical, 2)
 
-                field("Occlusion warp", hint: "Experimental — off is fine for most content.",
-                      detail: "A directional warp at reveal/cover edges. Can help some fast motion, but may shimmer on repetitive patterns (grids, text). Off by default; toggle while watching to compare.") {
-                    Toggle("Enable", isOn: $appState.occlusionDirectional)
+                field(L("Occlusion warp", "오클루전 워프", "オクルージョンワープ"),
+                      hint: L("Experimental — off is fine for most content.",
+                              "실험 기능 — 대부분 꺼둬도 됩니다.",
+                              "実験機能 — 通常はオフでOK。"),
+                      detail: L("A directional warp at reveal/cover edges. Can help some fast motion, but may shimmer on repetitive patterns (grids, text). Off by default; toggle while watching to compare.",
+                                "가림/드러남 경계의 방향별 워프. 빠른 모션에 도움될 수 있으나 반복 패턴(격자·텍스트)에서 어른거릴 수 있음. 기본 off; 보면서 켜보고 비교.",
+                                "隠れ/現れる境界の方向別ワープ。速い動きに効くことがあるが、繰り返しパターン(格子·文字)でちらつくことも。既定オフ; 見ながら切り替えて比較。")) {
+                    Toggle(L("Enable", "켜기", "有効"), isOn: $appState.occlusionDirectional)
                         .toggleStyle(.switch).labelsHidden()
                         .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
                 }
@@ -159,9 +190,14 @@ struct WindowPickerView: View {
     // MARK: - Upscaling
 
     private var upscalingSection: some View {
-        section("Upscaling & sharpness") {
-            field("Upscale", hint: "Blow a small source up to a sharp fullscreen viewer.",
-                  detail: "Off — a 1:1 overlay on the source (interpolation only).\n\nANE — Apple's Neural Engine 2× upscaler (needs a ≤960px source, e.g. a small PiP).\nMetalFX — GPU spatial upscaler, any size.\nANE+FX — ANE then MetalFX, best for tiny sources up to 4K.") {
+        section(L("Upscaling & sharpness", "업스케일 & 샤픈", "アップスケール & シャープ")) {
+            field(L("Upscale", "업스케일", "アップスケール"),
+                  hint: L("Blow a small source up to a sharp fullscreen viewer.",
+                          "작은 소스를 선명한 전체화면으로 확대.",
+                          "小さいソースを鮮明な全画面に拡大。"),
+                  detail: L("Off — a 1:1 overlay on the source (interpolation only).\n\nANE — Apple's Neural Engine 2× upscaler (needs a ≤960px source, e.g. a small PiP).\nMetalFX — GPU spatial upscaler, any size.\nANE+FX — ANE then MetalFX, best for tiny sources up to 4K.",
+                            "Off — 소스 위 1:1 오버레이(보간만).\n\nANE — 애플 뉴럴 엔진 2배 업스케일(소스 ≤960px 필요, 작은 PiP 등).\nMetalFX — GPU 공간 업스케일, 크기 무관.\nANE+FX — ANE 후 MetalFX, 아주 작은 소스를 4K까지.",
+                            "Off — ソース上の1:1オーバーレイ(補間のみ)。\n\nANE — AppleのNeural Engine 2倍アップスケール(ソース≤960px、小さいPiPなど)。\nMetalFX — GPU空間アップスケール、サイズ問わず。\nANE+FX — ANEの後MetalFX、極小ソースを4Kまで。")) {
                 Picker("", selection: $appState.upscaleMode) {
                     ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
                 }
@@ -172,8 +208,13 @@ struct WindowPickerView: View {
                 }
             }
 
-            field("Source", hint: "Resize the source to a clean native resolution first.",
-                  detail: "On capture, resizes the source window so its short side hits this (landscape: height, portrait: width). A native-res source gives a clean 1:1 grab — ideal for browser Picture-in-Picture and IINA (both are chrome-free 16:9). Set it here before capturing.") {
+            field(L("Source", "소스", "ソース"),
+                  hint: L("Resize the source to a clean native resolution first.",
+                          "소스를 깔끔한 네이티브 해상도로 먼저 리사이즈.",
+                          "ソースをまず綺麗なネイティブ解像度に。"),
+                  detail: L("On capture, resizes the source window so its short side hits this (landscape: height, portrait: width). A native-res source gives a clean 1:1 grab — ideal for browser Picture-in-Picture and IINA (both are chrome-free 16:9). Set it here before capturing.",
+                            "캡처 시 소스 창의 짧은 변을 이 값으로(가로: 높이, 세로: 너비). 네이티브 해상도 소스는 1:1로 깨끗하게 잡힘 — 브라우저 PiP·IINA(둘 다 크롬 없는 16:9)에 이상적. 캡처 전에 설정.",
+                            "キャプチャ時にソースの短辺をこの値に(横: 高さ、縦: 幅)。ネイティブ解像度なら1:1で綺麗に取得 — ブラウザPiP·IINA(共にクローム無し16:9)に最適。キャプチャ前に設定。")) {
                 Picker("", selection: $appState.sourcePreset) {
                     Text("Off").tag(0); Text("360").tag(360); Text("480").tag(480)
                     Text("540").tag(540); Text("720").tag(720); Text("1080").tag(1080)
@@ -189,14 +230,17 @@ struct WindowPickerView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Toggle("Sharpen (CAS)", isOn: $appState.casEnabled)
+                    Toggle(L("Sharpen (CAS)", "샤픈 (CAS)", "シャープ (CAS)"), isOn: $appState.casEnabled)
                         .onChange(of: appState.casEnabled) { appState.updateUpscale() }
-                    HelpButton(title: "Sharpen (CAS)", text: "Contrast-Adaptive Sharpening — the 'looks crisper' feel. Restores detail on stretched or soft video and works even at 1:1. Strong on soft areas, gentle on hard edges (no halos).")
+                    HelpButton(title: L("Sharpen (CAS)", "샤픈 (CAS)", "シャープ (CAS)"),
+                               text: L("Contrast-Adaptive Sharpening — the 'looks crisper' feel. Restores detail on stretched or soft video and works even at 1:1. Strong on soft areas, gentle on hard edges (no halos).",
+                                       "대비 적응 샤프닝 — '선명해 보이는' 느낌. 늘어나거나 뭉개진 영상 디테일을 살리고 1:1에서도 유효. 부드러운 곳은 강하게, 하드 엣지는 약하게(헤일로 없음).",
+                                       "コントラスト適応シャープ — 「くっきり感」。引き伸ばした/眠い映像のディテールを復元、1:1でも有効。柔らかい所は強く、硬いエッジは弱く(ハロー無し)。"))
                     Spacer()
                 }
                 if appState.casEnabled {
                     HStack(spacing: 8) {
-                        Text("Strength").font(.caption2).foregroundStyle(.secondary)
+                        Text(L("Strength", "강도", "強度")).font(.caption2).foregroundStyle(.secondary)
                         Slider(value: $appState.sharpness, in: 0...1)
                             .onChange(of: appState.sharpness) { appState.updateUpscale() }
                         Text(String(format: "%.1f", appState.sharpness))
@@ -212,7 +256,7 @@ struct WindowPickerView: View {
 
     // 값 텍스트 고정 폭 — 자릿수 변화(99→100)가 창 오토레이아웃 연쇄로 메인 스레드 블록하던 것 방지.
     private var liveSection: some View {
-        section("Live") {
+        section(L("Live", "실시간", "リアルタイム")) {
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
                 GridRow {
                     Label("FPS", systemImage: "speedometer").foregroundStyle(.secondary).gridColumnAlignment(.leading)
@@ -220,13 +264,13 @@ struct WindowPickerView: View {
                         .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
                 }
                 GridRow {
-                    Label("Latency", systemImage: "timer").foregroundStyle(.secondary)
+                    Label(L("Latency", "지연", "遅延"), systemImage: "timer").foregroundStyle(.secondary)
                     Text(String(format: "%.0f ms", appState.latencyMs))
                         .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
                 }
                 if let scale = appState.upscaleStatus {
                     GridRow {
-                        Label("Scale", systemImage: "arrow.up.left.and.arrow.down.right").foregroundStyle(.secondary)
+                        Label(L("Scale", "스케일", "スケール"), systemImage: "arrow.up.left.and.arrow.down.right").foregroundStyle(.secondary)
                         Text(scale).font(.caption).lineLimit(1).frame(width: 250, alignment: .leading)
                     }
                 }
@@ -238,10 +282,13 @@ struct WindowPickerView: View {
     // MARK: - Shortcut
 
     private var shortcutSection: some View {
-        section("Shortcut") {
+        section(L("Shortcut", "단축키", "ショートカット")) {
             HStack {
-                Text("Capture toggle").foregroundStyle(.secondary)
-                HelpButton(title: "Capture toggle", text: "Focus any window and press this to start or stop capture. Click the field to record a new combo (must include a modifier).")
+                Text(L("Capture toggle", "캡처 토글", "キャプチャ切替")).foregroundStyle(.secondary)
+                HelpButton(title: L("Capture toggle", "캡처 토글", "キャプチャ切替"),
+                           text: L("Focus any window and press this to start or stop capture. Click the field to record a new combo (must include a modifier).",
+                                   "아무 창이나 포커스하고 이 키를 눌러 캡처 시작/정지. 필드를 클릭해 새 조합 녹화(수정키 필수).",
+                                   "任意のウィンドウをフォーカスしてこのキーでキャプチャ開始/停止。フィールドをクリックして新しい組み合わせを記録(修飾キー必須)。"))
                 Spacer()
                 ShortcutRecorder(binding: $appState.hotCapture)
                     .frame(width: 96, height: 22)
@@ -251,7 +298,7 @@ struct WindowPickerView: View {
     }
 }
 
-/// (?) 도움말 버튼 — 클릭 시 팝오버로 상세 설명. 발견 가능한 인라인 헬프.
+/// (?) 도움말 버튼 — 클릭 시 팝오버로 상세 설명.
 private struct HelpButton: View {
     let title: String
     let text: String

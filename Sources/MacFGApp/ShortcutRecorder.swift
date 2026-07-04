@@ -34,7 +34,7 @@ final class RecorderView: NSView {
         (isRecording ? NSColor.controlAccentColor : NSColor.separatorColor).setStroke()
         path.stroke()
 
-        let text = isRecording ? "Press keys…" : (binding.label.isEmpty ? "Click to set" : binding.label)
+        let text = isRecording ? L("Press keys…", "키 입력…", "キー入力…") : (binding.label.isEmpty ? L("Click to set", "클릭해 설정", "クリックで設定") : binding.label)
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: isRecording ? .medium : .regular),
             .foregroundColor: isRecording ? NSColor.controlAccentColor

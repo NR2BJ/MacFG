@@ -411,8 +411,11 @@ public final class AppState {
             }
 
             // 창 추적은 30Hz면 충분 — 틱(120Hz)마다 CGWindowList를 부르면 호출당 0.5-2ms로
-            // vsync 틱을 놓쳐 출력 fps 천장이 ~110으로 내려앉는다 (실측)
-            trackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            // vsync 틱을 놓쳐 출력 fps 천장이 ~110으로 내려앉는다 (실측).
+            // 뷰어 배치는 소스 창을 따라다닐 필요가 없어(리사이즈 감지/색 정책용) 2Hz로 —
+            // 메인 스레드 CGWindowList 경합을 더 줄여 표시 틱을 보호.
+            let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 2.0
+            trackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / trackHz, repeats: true) { [weak self] _ in
                 Task { @MainActor in
                     self?.overlayManager?.updateTracking()
                 }
@@ -524,6 +527,12 @@ public final class AppState {
         sourceIntervalEMA = 0
         hasReceivedFirstFrame = false
         presentedTimes = []
+        // 적응 지연은 소스/세션 특성이므로 새 캡처에서 다시 학습
+        extraLatencySlots = 0
+        paceMissCount = 0
+        paceCleanWindows = 0
+        lastPaceAdjustTick = 0
+        paceWarmupUntilTick = diagTick + 720   // ~6s 과도기 무시 (케이던스 락)
         _ = mailbox.drain()
     }
 
@@ -577,13 +586,54 @@ public final class AppState {
     /// 출력 지연: 콘텐츠 시각을 이만큼 과거로 조준한다.
     /// 보간 프레임 I(A,B)가 B 도착 + GPU/ANE 완료 후 표시 슬롯에 준비되어 있으려면
     /// 소스 간격의 ~1.25배 + 워크 마진이 필요. (60fps 소스 기준 ~25ms)
+    /// + 적응분(extraLatencySlots): 소스 배달 지터(PiP/브라우저 srcInt 8~30ms 실측)로
+    /// miss(staleDrop/지각 도착)가 지속되면 표시 슬롯 단위로 여유를 늘려 흡수 — LS식
+    /// "여유 지연을 두고 큐를 안정 소비". 영상 시청엔 +1-2프레임 지연이 구멍보다 낫다.
     private var latencyOffset: Double {
         let interval = sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0
         // + 반 슬롯: SCK 배달이 소스 vsync에 양자화되어 최대 반 간격 늦게 오는데,
         // 그 마진이 없으면 늦은 쌍의 보간 프레임이 표시 시한을 놓쳐 stale-drop
         // (보간 188장 생성 → 113장 표시 실측 — present 110/s의 주범)
-        let displayHalfSlot = 0.5 / max(displaySync?.refreshRate ?? 120, 60)
+        let refresh = max(displaySync?.refreshRate ?? 120, 60)
+        let displayHalfSlot = 0.5 / refresh
         return min(max(interval, 1.0 / 120.0), 1.0 / 24.0) * 1.25 + 0.004 + displayHalfSlot
+            + extraLatencySlots / refresh
+    }
+
+    // ── 적응형 페이싱 (AIMD): miss 지속 → +1슬롯(빠르게), 장기 무결 → -1슬롯(느리게) ──
+    /// 추가 지연 (표시 슬롯 단위, 0~4). 정수 슬롯만 — 인코딩 그리드(gridRef)와 표시 타깃이
+    /// 같은 격자를 유지해 위상 정렬이 깨지지 않는다 (전환 시 1회 홀드만).
+    private var extraLatencySlots: Double = 0
+    /// 최근 윈도 내 miss (staleDrop + 이미 기한 지난 도착)
+    private var paceMissCount = 0
+    private var paceCleanWindows = 0
+    private var lastPaceAdjustTick = 0
+    /// 이 틱까지는 miss 무시 — 캡처 시작/리셋 직후 케이던스 락 과도기의 miss로
+    /// 깨끗한 소스까지 +4 램프되는 것 방지 (무지터 소스 e2e 57→91ms 낭비 실측)
+    private var paceWarmupUntilTick = 0
+
+    /// ~2초마다: miss ≥4면 지연 +1슬롯 (최대 4), 3윈도(~6s) 연속 0이면 -1슬롯 회수.
+    private func adaptPacing() {
+        guard diagTick - lastPaceAdjustTick >= 240 else { return }
+        lastPaceAdjustTick = diagTick
+        defer { paceMissCount = 0 }
+        guard diagTick >= paceWarmupUntilTick else { return }   // 과도기 miss 폐기
+        if paceMissCount >= 4 {
+            paceCleanWindows = 0
+            if extraLatencySlots < 4 {
+                extraLatencySlots += 1
+                DiagnosticLog.shared.log("[PACE] miss \(paceMissCount)/2s → 지연 +1슬롯 (extra=\(Int(extraLatencySlots)))")
+            }
+        } else if paceMissCount == 0 {
+            paceCleanWindows += 1
+            if paceCleanWindows >= 3, extraLatencySlots > 0 {
+                extraLatencySlots -= 1
+                paceCleanWindows = 0
+                DiagnosticLog.shared.log("[PACE] 6s 무결 → 지연 -1슬롯 (extra=\(Int(extraLatencySlots)))")
+            }
+        } else {
+            paceCleanWindows = 0
+        }
     }
 
     // ── 진단 ──
@@ -637,6 +687,10 @@ public final class AppState {
         if !newEntries.isEmpty {
             timeline.append(contentsOf: newEntries)
             timeline.sort { $0.timestamp < $1.timestamp }
+            // 지각 도착 감지: 등재 시점에 이미 표시 기한(target)에서 1슬롯+ 지난 항목 —
+            // 지연 여유(latencyOffset)가 소스 지터/워크 스파이크보다 얇다는 신호 (적응 지연 입력)
+            let lateBar = targetTimestamp - latencyOffset - 1.0 / max(displaySync?.refreshRate ?? 120, 60)
+            paceMissCount += newEntries.lazy.filter { $0.timestamp < lateBar }.count
         }
         for record in presented {
             performanceMonitor.recordRenderTime()
@@ -702,20 +756,24 @@ public final class AppState {
         let target = targetTimestamp - latencyOffset
         let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
         // stale 한계: 평시 2.5 간격(늦은 묶음도 순서대로 표시 — 구멍보다 +1vsync 지연이 낫다),
-        // 큐가 깊어지면(≥5) 1.2로 조여 백로그를 서서히 배출 — 생성≈소비 균형에서 큐가
-        // 고여 e2e가 +40ms 눌러앉는 것 방지 (실측 75-84ms → 목표 ~55ms)
-        let staleCutoff = target - interval * (timeline.count >= 6 ? 1.2 : 2.5)
+        // 큐가 깊어지면 1.2로 조여 백로그를 서서히 배출 — 생성≈소비 균형에서 큐가
+        // 고여 e2e가 +40ms 눌러앉는 것 방지 (실측 75-84ms → 목표 ~55ms).
+        // '깊다' 기준은 적응 지연 슬롯만큼 상향 — extra 체제에선 tl 8-9가 정상 깊이인데
+        // 이를 적체로 오판해 상시 타이트 드랍하던 것 방지 (staleDrop 8-14/2s 실측 → 완화)
+        let staleCutoff = target - interval * (timeline.count >= 6 + Int(extraLatencySlots) ? 1.2 : 2.5)
         let candidates = timeline.filter { $0.timestamp > lastPresentedTimestamp && $0.timestamp <= target + 0.002 }
         var pick = candidates.first
         // 따라잡기는 틱당 최대 1장만 건너뜀 — 여러 장을 한 번에 버리면 눈에 보이는 점프
         if let current = pick, current.timestamp < staleCutoff, candidates.count > 1 {
             pick = candidates[1]
             diagStaleDropCount += 1
+            paceMissCount += 1
         }
         if let pick {
             presentEntry(pick, at: targetTimestamp)
         }
 
+        adaptPacing()
         maybeLogDiagnostics()
     }
 
@@ -840,7 +898,9 @@ public final class AppState {
                 // 이미 예약된 프레임을 드레인으로 버리는 것(눈에 보이는 딸꾹질)보다
                 // 새 보간을 덜 만드는 쪽이 시각적으로 무해 (MetalFlow만 간헐 드랍 보고의 원인).
                 // 임계값은 콘텐츠 fps에 비례 — 24fps는 쌍당 4-5장이라 tl=11이 '건강한' 깊이.
-                let expectedDepth = Int((gap / displayInterval).rounded(.up)) * 2 + 3
+                // + 적응 지연 슬롯: extra만큼 큐가 깊어지는 건 의도(지터 흡수 버퍼)이므로
+                // 배압이 이를 적체로 오판해 보간을 솎아내지 않게 문턱도 함께 올린다.
+                let expectedDepth = Int((gap / displayInterval).rounded(.up)) * 2 + 3 + Int(extraLatencySlots)
                 if timeline.count >= expectedDepth && tValues.count > 1 {
                     // 절반 솎아내기 (홀수 인덱스 유지)
                     tValues = tValues.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
@@ -989,7 +1049,9 @@ public final class AppState {
                 pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
             desc.usage = [.shaderRead]
             desc.storageMode = .private
-            for _ in 0..<6 {
+            // 8장: 적응 지연(+최대 4슬롯)으로 타임라인이 깊어져도 소스 수용이 거절되지 않게
+            // (6장에서 poolMiss 1-2/2s 실측 — 거절 시 연속성 리셋 = 눈에 보이는 홀드)
+            for _ in 0..<8 {
                 if let tex = device.makeTexture(descriptor: desc) {
                     stablePool.append(tex)
                 }
@@ -1054,7 +1116,7 @@ public final class AppState {
         if diagSkipBackpressure > 0 { skipParts.append("backpres:\(diagSkipBackpressure)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
         diagResyncCount = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
@@ -1174,8 +1236,12 @@ public final class AppState {
             overlayHiddenState = false
             return
         }
+        // MacFG 자신이 최전면일 땐 숨기지 않음 — 설정 창에서 FPS를 보는 동안 보간이 멈추는
+        // "관찰자 효과" 방지. 자동 숨김의 목적(다른 앱 가림 해소)은 제3앱일 때만 유효.
+        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let sourceFront = sourceOwnerPID == 0
-            || NSWorkspace.shared.frontmostApplication?.processIdentifier == sourceOwnerPID
+            || frontPID == sourceOwnerPID
+            || frontPID == ProcessInfo.processInfo.processIdentifier
         let shouldHide = overlayUserHidden || !sourceFront
         guard shouldHide != overlayHiddenState else { return }
         overlayHiddenState = shouldHide

@@ -89,6 +89,14 @@ struct WindowPickerView: View {
             .pickerStyle(.segmented)
             .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
 
+            if appState.selectedRenderMode == .metalFlow {
+                Toggle("Occlusion warp (experimental)", isOn: $appState.occlusionDirectional)
+                    .toggleStyle(.switch)
+                    .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
+                Text("Directional warp at reveal/cover edges — try on fast motion. Applies instantly, so in Cover mode you can toggle while watching; in fullscreen, set it before capture and rewind to compare.")
+                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Picker("Multiplier", selection: $appState.frameMultiplier) {
                 Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
             }

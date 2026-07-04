@@ -127,6 +127,9 @@ public final class AppState {
     var casEnabled: Bool = true
     /// CAS 샤프닝 강도 0~1
     var sharpness: Double = 0.5
+    /// 오클루전 방향별 워프 (실험, MetalFlow 전용) — 가림/드러남 경계에서 보이는 쪽 단방향 워프.
+    /// 반복 패턴 aliasing 부작용 가능 → 실영상 A/B용. 기본 off.
+    var occlusionDirectional: Bool = false
     /// 업스케일 실동작 상태 (UI 표시용) — nil이면 미캡처/비활성
     var upscaleStatus: String?
     /// 보간 배율: 0=Auto(디스플레이 슬롯 전부 채움), 2~5=소스 fps × N 상한.
@@ -232,6 +235,7 @@ public final class AppState {
         d.set(sharpness, forKey: "s.sharp")
         d.set(sourcePreset, forKey: "s.preset")
         d.set(isInterpolationEnabled, forKey: "s.interp")
+        d.set(occlusionDirectional, forKey: "s.occdir")
     }
 
     private func loadSettings() {
@@ -245,8 +249,17 @@ public final class AppState {
         if d.object(forKey: "s.sharp") != nil { sharpness = d.double(forKey: "s.sharp") }
         if d.object(forKey: "s.preset") != nil { sourcePreset = d.integer(forKey: "s.preset") }
         if d.object(forKey: "s.interp") != nil { isInterpolationEnabled = d.bool(forKey: "s.interp") }
+        if d.object(forKey: "s.occdir") != nil { occlusionDirectional = d.bool(forKey: "s.occdir") }
+        MetalFlowEngine.occlusionDirectional = occlusionDirectional
         // 배치는 업스케일 모드에서 파생
         selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+    }
+
+    /// 오클루전 방향별 워프 토글 (실험) — 정적 var를 워프가 매 쌍 읽으므로 캡처 중에도 즉시 반영.
+    func updateOcclusionDirectional() {
+        MetalFlowEngine.occlusionDirectional = occlusionDirectional
+        DiagnosticLog.shared.log("[OCC] directional=\(occlusionDirectional)")
+        persistSettings()
     }
 
     private func handleScreenParametersChange() {

@@ -533,6 +533,9 @@ public final class AppState {
         paceCleanWindows = 0
         lastPaceAdjustTick = 0
         paceWarmupUntilTick = diagTick + 720   // ~6s 과도기 무시 (케이던스 락)
+        pendingIngest = []
+        inFlightPresents.withLock { $0 = 0 }
+        presentBusySkips = 0
         _ = mailbox.drain()
     }
 
@@ -577,6 +580,16 @@ public final class AppState {
     private var hasReceivedFirstFrame: Bool = false
     /// 캡처 창 리사이즈 감지 (연속 감지 횟수 — 드래그 중 재시작 연발 방지)
     private var resizeMismatchCount = 0
+    /// 인제스트 이월 큐 — 버스트 틱(숨김 해제/재개 직후 최대 8장)의 인코딩 CPU가
+    /// vsync 콜백을 삼키지 않게 틱당 4장 캡, 나머지는 다음 틱에서 처리
+    private var pendingIngest: [FrameSlot] = []
+    /// 인플라이트 present 수 (presentedHandler에서 감소 — 임의 스레드라 락 보호).
+    /// CAMetalLayer 드로어블 3개 중 2개 이상이 미완이면 nextDrawable이 세마포어 블록
+    /// (10s 샘플 중 0.7-1.4s 대기 실측 — vsync 콜백을 삼키는 최대 단일 원인).
+    /// 블로킹 대신 이번 틱 표시를 건너뛰고(항목 유지) 다음 틱에 표시한다.
+    private let inFlightPresents = OSAllocatedUnfairLock(initialState: 0)
+    private var presentBusySkips = 0
+    private var diagPresentBusy = 0
     private var isRestartingCapture = false
     private var presentedTimes: [CFTimeInterval] = []
     private var latencySamplesMs: [Double] = []
@@ -662,10 +675,41 @@ public final class AppState {
     private var diagSkipOther = 0
     private var diagStaleDropCount = 0
     private var diagSkipBackpressure = 0
+    // 틱 핸들러 CPU 계측 — 8ms 초과 시 다음 vsync 콜백 스킵 = 틱 레이트 유실 (120 고정 실패 원인)
+    private var diagTickCPUSum: Double = 0
+    private var diagTickCPUMax: Double = 0
+    private var diagTickOverruns = 0
+    private var diagLastLogWall: CFTimeInterval = 0
+    // 틱 갭 구조: link.timestamp 기준 vsync 스킵 감지 + 스킵 직전 틱의 CPU (범인 판별 —
+    // 직전 cpu 낮은데 갭 = 핸들러 밖 메인스레드 작업(SwiftUI 등)이 콜백을 삼킨 것)
+    private var diagLastTickTs: CFTimeInterval = 0
+    private var diagPrevTickCPU: Double = 0
+    private var diagTickGaps = 0
+    private var diagGapPrevCPUMax: Double = 0
 
     // MARK: - Render Loop
 
     private func onDisplayLinkTick(timestamp: CFTimeInterval, targetTimestamp: CFTimeInterval) {
+        let tickStart = CFAbsoluteTimeGetCurrent()
+        defer {
+            // 틱 핸들러 CPU 시간 계측 — 8.3ms 초과가 잦으면 다음 vsync 콜백이 스킵되어
+            // 틱 레이트 자체가 117Hz로 새는(=120 고정 실패) 주범 (실사용 로그로 확증)
+            let cpuMs = (CFAbsoluteTimeGetCurrent() - tickStart) * 1000
+            diagTickCPUSum += cpuMs
+            if cpuMs > diagTickCPUMax { diagTickCPUMax = cpuMs }
+            if cpuMs > 8.0 { diagTickOverruns += 1 }
+            diagPrevTickCPU = cpuMs
+        }
+        // vsync 스킵 감지 (link.timestamp 간격 > 1.4슬롯) — 직전 틱 CPU가 낮은데 갭이면
+        // 핸들러 밖(다른 메인스레드 작업)이 콜백을 삼킨 것
+        if diagLastTickTs > 0 {
+            let dt = timestamp - diagLastTickTs
+            if dt > 1.4 / max(displaySync?.refreshRate ?? 120, 60) {
+                diagTickGaps += 1
+                if diagPrevTickCPU > diagGapPrevCPUMax { diagGapPrevCPUMax = diagPrevTickCPU }
+            }
+        }
+        diagLastTickTs = timestamp
         diagTick += 1
         lastVsyncTarget = targetTimestamp
 
@@ -675,6 +719,7 @@ public final class AppState {
             let (_, released, _) = mailbox.drain()
             for id in released { inFlightTextures.remove(id) }
             _ = captureManager.drainFrames()   // 파이프 적체 방지 (텍스처는 풀로 회수)
+            pendingIngest = []
             if isCapturing, hasReceivedFirstFrame, (overlayManager?.trackingFailureCount ?? 0) > 30 {
                 Task { await stopCapture() }
             }
@@ -703,16 +748,31 @@ public final class AppState {
             }
         }
 
-        // 2) 캡처 프레임 drain → work 인코딩
-        let slots = captureManager.drainFrames()
+        // 2) 표시 먼저 — 지연 민감 경로를 틱 선두로 (present-first).
+        // 인제스트/인코딩(CPU 1-3ms+)을 먼저 하면 틱 핸들러가 간헐적으로 8.3ms를 넘겨
+        // 다음 vsync 콜백이 스킵 → 틱 레이트가 117Hz로 새며 120 고정 실패 (실사용 로그 확증).
+        // 이 틱에 캡처된 프레임은 어차피 GPU 완료 후 다음 틱에나 표시 가능하므로 손해 없음.
+        timeline.removeAll { $0.timestamp <= lastPresentedTimestamp }
+        if timeline.count > 12 {
+            timeline.removeFirst(timeline.count - 12)
+        }
+        presentDueEntry(targetTimestamp: targetTimestamp)
+
+        // 3) 캡처 프레임 drain → work 인코딩 (무거움 — 표시 이후로).
+        // 버스트 캡: 숨김 해제/스트림 재개 직후 한 틱에 8장까지 몰리면 인코딩 CPU가
+        // 8ms를 넘겨 다음 vsync 콜백을 삼킴 — 틱당 4장, 나머지는 다음 틱으로 이월
+        // (타임스탬프 보존, 표시는 어차피 latencyOffset 뒤라 이월 8ms는 무해)
         var sawTexture = false
         var depth = 0
-        for slot in slots where slot.texture != nil {
-            sawTexture = true
-            depth += 1
-            ingest(slot)
-        }
-        if !slots.isEmpty {
+        pendingIngest.append(contentsOf: captureManager.drainFrames().filter { $0.texture != nil })
+        let ingestNow = min(pendingIngest.count, 4)
+        if ingestNow > 0 {
+            for slot in pendingIngest.prefix(ingestNow) {
+                sawTexture = true
+                depth += 1
+                ingest(slot)
+            }
+            pendingIngest.removeFirst(ingestNow)
             diagDrainDepthSum += depth
             diagDrainSamples += 1
             if depth > diagDrainDepthMax { diagDrainDepthMax = depth }
@@ -744,15 +804,14 @@ public final class AppState {
             }
         }
 
-        // 3) 타임라인 정리
-        timeline.removeAll { $0.timestamp <= lastPresentedTimestamp }
-        if timeline.count > 12 {
-            timeline.removeFirst(timeline.count - 12)
-        }
+        adaptPacing()
+        maybeLogDiagnostics()
+    }
 
-        // 4) 표시할 항목 선택 — targetTimestamp에서 latencyOffset만큼 과거의 콘텐츠.
-        // 미표시 항목 중 가장 오래된 것부터 순서대로 (늦게 도착한 보간 프레임도 순서 보존).
-        // 최신-우선으로 고르면 워크 완료가 한 틱만 늦어도 보간 프레임이 영구 드랍된다.
+    /// 표시할 항목 선택 + present — targetTimestamp에서 latencyOffset만큼 과거의 콘텐츠.
+    /// 미표시 항목 중 가장 오래된 것부터 순서대로 (늦게 도착한 보간 프레임도 순서 보존).
+    /// 최신-우선으로 고르면 워크 완료가 한 틱만 늦어도 보간 프레임이 영구 드랍된다.
+    private func presentDueEntry(targetTimestamp: CFTimeInterval) {
         let target = targetTimestamp - latencyOffset
         let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
         // stale 한계: 평시 2.5 간격(늦은 묶음도 순서대로 표시 — 구멍보다 +1vsync 지연이 낫다),
@@ -772,9 +831,6 @@ public final class AppState {
         if let pick {
             presentEntry(pick, at: targetTimestamp)
         }
-
-        adaptPacing()
-        maybeLogDiagnostics()
     }
 
     /// 새 캡처 프레임 수용: 중복 제거 → 안정 복사 + 보간 인코딩 (비동기 GPU)
@@ -963,6 +1019,20 @@ public final class AppState {
     }
 
     private func presentEntry(_ entry: TimelineEntry, at targetTimestamp: CFTimeInterval) {
+        // 드로어블 여유 가드 — 2개 이상 미완이면 nextDrawable이 블록하므로 이번 틱은 건너뜀
+        // (entry는 lastPresentedTimestamp 미갱신으로 타임라인에 남아 다음 틱에 표시).
+        // 핸들러 유실(창 재생성 등) 대비: 연속 6틱 스킵이면 카운터 리셋 후 진행.
+        let busy = inFlightPresents.withLock { $0 } >= 2
+        if busy {
+            presentBusySkips += 1
+            if presentBusySkips <= 6 {
+                diagPresentBusy += 1
+                return
+            }
+            inFlightPresents.withLock { $0 = 0 }   // 핸들러 유실 간주 — 재동기
+        }
+        presentBusySkips = 0
+
         guard let presentQueue, let cb = presentQueue.makeCommandBuffer() else { return }
         guard let drawable = overlayManager?.encodeRenderFrame(texture: entry.texture, into: cb) else {
             cb.commit()
@@ -979,10 +1049,17 @@ public final class AppState {
         let mailboxRef = mailbox
         let captureTs = entry.captureTimestamp
         let isInterp = entry.isInterpolated
+        let inFlightRef = inFlightPresents
+        inFlightRef.withLock { $0 += 1 }
         drawable.addPresentedHandler { d in
+            inFlightRef.withLock { $0 = max(0, $0 - 1) }
             mailboxRef.postPresented(at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
         }
-        cb.present(drawable, atTime: targetTimestamp)
+        // plain present — displaySyncEnabled=true라 다음 vsync 정렬은 동일한데,
+        // present(at: targetTimestamp)의 명시적 시각 예약은 드로어블을 데드라인까지 붙잡아
+        // 3개 풀이 고갈 → nextDrawable 세마포어 블록 (10s 샘플 중 1.4s 대기 실측 —
+        // 틱을 삼켜 120 고정 실패의 최대 단일 원인). 틱당 1회 present이므로 타이밍 등가.
+        cb.present(drawable)
         cb.commit()
     }
 
@@ -1078,6 +1155,15 @@ public final class AppState {
     private func maybeLogDiagnostics() {
         guard diagTick % 240 == 0 else { return }  // 진단 중 2초 주기 (@120Hz)
 
+        // 틱 레이트: 240틱의 실제 벽시계 소요 — 2.0s면 무손실 120Hz, 2.05s면 ~117Hz(틱 유실)
+        let nowWall = CFAbsoluteTimeGetCurrent()
+        let tickHz = diagLastLogWall > 0 ? 240.0 / (nowWall - diagLastLogWall) : 0
+        diagLastLogWall = nowWall
+        let tickCPUAvg = diagTickCPUSum / 240.0
+        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f)", tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax)
+        diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
+        diagTickGaps = 0; diagGapPrevCPUMax = 0
+
         let workLats = mailbox.drainWorkLatencies()
         let avgWork = workLats.isEmpty ? 0 : workLats.reduce(0, +) / Double(workLats.count)
         let maxWork = workLats.max() ?? 0
@@ -1114,15 +1200,16 @@ public final class AppState {
         if diagSkipOther > 0 { skipParts.append("other:\(diagSkipOther)") }
         if diagStaleDropCount > 0 { skipParts.append("staleDrop:\(diagStaleDropCount)") }
         if diagSkipBackpressure > 0 { skipParts.append("backpres:\(diagSkipBackpressure)") }
+        if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
         diagResyncCount = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
-        diagStaleDropCount = 0; diagSkipBackpressure = 0
+        diagStaleDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0
 
         diagSourceCount = 0
         diagDupSkipCount = 0
@@ -1138,19 +1225,39 @@ public final class AppState {
         diagDrainSamples = 0
     }
 
+    /// 설정 창이 실제로 보이는가 (일반 레벨 titled 창의 occlusion) — 전체화면 뷰어가
+    /// 덮고 있으면 false. 오버레이/뷰어는 borderless라 제외됨.
+    private var settingsWindowVisible: Bool {
+        NSApp.windows.contains {
+            $0.styleMask.contains(.titled) && $0.level == .normal && $0.occlusionState.contains(.visible)
+        }
+    }
+
     private func updateStats() {
-        inputFPS = performanceMonitor.inputFPS
+        // 아무도 못 보는 설정 창엔 갱신 생략 — 전체화면 뷰어가 덮은 상태에서도 stats 쓰기가
+        // SwiftUI 레이아웃(NSHostingView, 4K에서 10-20ms)을 돌려 vsync 콜백을 삼킴 (sample 실측).
+        // 시청 모드(뷰어 전체화면)에서 SwiftUI 부하를 0으로 — 설정을 보면 자동 재개.
+        guard settingsWindowVisible else { return }
+        // @Observable 쓰기는 값이 실제로 바뀔 때만 — 렌더 틱과 같은 메인스레드에서
+        // SwiftUI가 설정 뷰 body를 재평가(4K에서 5-15ms)해 vsync 콜백을 삼키는 것 방지.
+        // 지터 콘텐츠에서 fps 소수점이 매번 달라 0.5s마다 전체 뷰 무효화 → tick 116-117Hz로
+        // 새던 원인 (깨끗한 소스는 값 불변 → 재평가 없음 → 120.0 실측과 정합).
+        // 반올림(fps 정수, latency 정수)로 변경 빈도 자체도 낮춘다.
+        let newInput = performanceMonitor.inputFPS.rounded()
+        if inputFPS != newInput { inputFPS = newInput }
         // 출력 FPS는 실제 glass 시각(presented handler의 presentedTime)으로 계산 —
         // PerformanceMonitor의 renderTimestamps는 mailbox 드레인 시각이라 틱에 뭉쳐
         // 표시값이 80-120으로 맥놀이 (실프레임은 꾸준한데 지표만 출렁, 실측)
+        var newOutput: Double = 0
         if presentedTimes.count >= 2,
            let first = presentedTimes.first, let last = presentedTimes.last, last > first {
-            outputFPS = Double(presentedTimes.count - 1) / (last - first)
-        } else {
-            outputFPS = 0
+            newOutput = (Double(presentedTimes.count - 1) / (last - first)).rounded()
         }
-        latencyMs = latencySamplesMs.isEmpty ? 0 : latencySamplesMs.reduce(0, +) / Double(latencySamplesMs.count)
-        upscaleStatus = overlayManager?.scaleStatus
+        if outputFPS != newOutput { outputFPS = newOutput }
+        let newLatency = (latencySamplesMs.isEmpty ? 0 : latencySamplesMs.reduce(0, +) / Double(latencySamplesMs.count)).rounded()
+        if latencyMs != newLatency { latencyMs = newLatency }
+        let newScale = overlayManager?.scaleStatus
+        if upscaleStatus != newScale { upscaleStatus = newScale }
     }
 
     // MARK: - Interpolation Control

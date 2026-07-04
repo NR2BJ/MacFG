@@ -158,21 +158,26 @@ struct WindowPickerView: View {
 
     // MARK: - During capture
 
+    // 값 텍스트는 고정 폭 — 자릿수 변화(99→100 등)가 그리드→창 오토레이아웃 연쇄를 일으켜
+    // 메인 스레드를 10-20ms 블록, vsync 콜백을 삼킴 (sample 실측: NSHostingView 레이아웃 재귀)
     private var statusGrid: some View {
         Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
             GridRow {
                 Text("FPS").foregroundStyle(.secondary)
-                Text(String(format: "%.1f → %.1f", appState.inputFPS, appState.outputFPS))
+                Text(String(format: "%.0f → %.0f", appState.inputFPS, appState.outputFPS))
                     .fontWeight(.medium).monospacedDigit()
+                    .frame(width: 110, alignment: .leading)
             }
             GridRow {
                 Text("Latency").foregroundStyle(.secondary)
                 Text(String(format: "%.0f ms", appState.latencyMs)).fontWeight(.medium).monospacedDigit()
+                    .frame(width: 110, alignment: .leading)
             }
             if let scale = appState.upscaleStatus {
                 GridRow {
                     Text("Scale").foregroundStyle(.secondary)
-                    Text(scale).font(.caption)
+                    Text(scale).font(.caption).lineLimit(1)
+                        .frame(width: 240, alignment: .leading)
                 }
             }
         }

@@ -35,6 +35,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     // PSO
     private var downLumaPSO: (any MTLComputePipelineState)?
     private var downHalfPSO: (any MTLComputePipelineState)?
+    private var zeroMeanPSO: (any MTLComputePipelineState)?
     private var matchPSO: (any MTLComputePipelineState)?
     private var smoothPSO: (any MTLComputePipelineState)?
     private var finalizePSO: (any MTLComputePipelineState)?
@@ -46,6 +47,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private var levels: [(w: Int, h: Int)] = []
     private var lumaA: [any MTLTexture] = []
     private var lumaB: [any MTLTexture] = []
+    // zero-mean 루마 (Z = L - mean5x5) — 매칭 전용. 후보별 창 평균 재계산을 프리패스로 대체
+    private var zmA: [any MTLTexture] = []
+    private var zmB: [any MTLTexture] = []
     private var flowF: [any MTLTexture] = []   // A→B
     private var flowB: [any MTLTexture] = []   // B→A
     private var flowTmp: [any MTLTexture] = [] // 스무딩 핑퐁
@@ -76,6 +80,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         }
         downLumaPSO = try await pso("mfDownLuma")
         downHalfPSO = try await pso("mfDownHalf")
+        zeroMeanPSO = try await pso("mfZeroMean")
         matchPSO = try await pso("mfMatch")
         smoothPSO = try await pso("mfSmooth")
         finalizePSO = try await pso("mfFinalize")
@@ -93,7 +98,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         tValues: [Float],
         into commandBuffer: any MTLCommandBuffer
     ) -> PairEncodeResult? {
-        guard let downLumaPSO, let downHalfPSO, let matchPSO, let smoothPSO,
+        guard let downLumaPSO, let downHalfPSO, let zeroMeanPSO, let matchPSO, let smoothPSO,
               let finalizePSO, let warpPSO,
               tsB > tsA, !tValues.isEmpty else { return nil }
 
@@ -127,6 +132,16 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             dispatch(enc, levels[l].w, levels[l].h, downHalfPSO)
         }
 
+        // 1.5) zero-mean 프리필터: Z = L - mean5x5(L). 매치가 후보(≤49)마다 25탭 창 평균을
+        // 재계산하던 것을 프리패스 1회로 대체 — 매치 커널 ALU/레지스터 대폭 절감 (4K 실측 8.3→벤치 참조)
+        enc.setComputePipelineState(zeroMeanPSO)
+        for l in 0..<L {
+            enc.setTexture(lumaA[l], index: 0); enc.setTexture(zmA[l], index: 1)
+            dispatch(enc, levels[l].w, levels[l].h, zeroMeanPSO)
+            enc.setTexture(lumaB[l], index: 0); enc.setTexture(zmB[l], index: 1)
+            dispatch(enc, levels[l].w, levels[l].h, zeroMeanPSO)
+        }
+
         // 2) coarse→fine 매칭 (양방향) + 스무딩.
         // 코스 레벨은 이전 쌍의 flow를 prior로 사용 (시간적 전파 — 프레임 간 벡터 일관성).
         // 주의: 시간적 prior는 스케일 1(동일 레벨)이므로 priorScale=1, 공간 prior는 2.
@@ -139,10 +154,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 refine: l == 0 ? 1 : 0,  // 서브픽셀 refine은 최종 레벨만 (비용 40%↓)
                 priorScale: isCoarsest ? 1.0 : 2.0
             )
-            // forward: A→B
+            // forward: A→B (zero-mean 루마로 매칭)
             enc.setComputePipelineState(matchPSO)
-            enc.setTexture(lumaA[l], index: 0)
-            enc.setTexture(lumaB[l], index: 1)
+            enc.setTexture(zmA[l], index: 0)
+            enc.setTexture(zmB[l], index: 1)
             enc.setTexture(isCoarsest ? (prevCoarseF ?? flowF[l]) : flowF[l + 1], index: 2)
             enc.setTexture(flowTmp[l], index: 3)
             enc.setBytes(&params, length: MemoryLayout<MatchParams>.stride, index: 0)
@@ -152,8 +167,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             dispatch(enc, levels[l].w, levels[l].h, smoothPSO)
             // backward: B→A
             enc.setComputePipelineState(matchPSO)
-            enc.setTexture(lumaB[l], index: 0)
-            enc.setTexture(lumaA[l], index: 1)
+            enc.setTexture(zmB[l], index: 0)
+            enc.setTexture(zmA[l], index: 1)
             enc.setTexture(isCoarsest ? (prevCoarseB ?? flowB[l]) : flowB[l + 1], index: 2)
             enc.setTexture(flowTmp[l], index: 3)
             enc.setBytes(&params, length: MemoryLayout<MatchParams>.stride, index: 0)
@@ -283,12 +298,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             return device.makeTexture(descriptor: d)
         }
 
-        lumaA = []; lumaB = []; flowF = []; flowB = []; flowTmp = []
+        lumaA = []; lumaB = []; zmA = []; zmB = []; flowF = []; flowB = []; flowTmp = []
         for (w, h) in levels {
             guard let la = tex(w, h, .r16Float), let lb = tex(w, h, .r16Float),
+                  let za = tex(w, h, .r16Float), let zb = tex(w, h, .r16Float),
                   let ff = tex(w, h, .rg16Float), let fb = tex(w, h, .rg16Float),
                   let ft = tex(w, h, .rg16Float) else { levels = []; return }
             lumaA.append(la); lumaB.append(lb)
+            zmA.append(za); zmB.append(zb)
             flowF.append(ff); flowB.append(fb); flowTmp.append(ft)
         }
         maskTex = tex(levels[0].w, levels[0].h, .rg8Unorm)
@@ -321,7 +338,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     public func shutdown() {
         levels = []
-        lumaA = []; lumaB = []; flowF = []; flowB = []; flowTmp = []
+        lumaA = []; lumaB = []; zmA = []; zmB = []; flowF = []; flowB = []; flowTmp = []
         maskTex = nil
         outputPool = []; statsBuffers = []
     }
@@ -335,12 +352,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; };
     struct WarpParams { float t; };
 
-    constant float3 kLuma = float3(0.2126, 0.7152, 0.0722);
+    constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
     // BGRA 소스 → base 루마 (박스 다운샘플)
     kernel void mfDownLuma(
-        texture2d<float, access::sample> src [[texture(0)]],
-        texture2d<float, access::write> dst [[texture(1)]],
+        texture2d<half, access::sample> src [[texture(0)]],
+        texture2d<half, access::write> dst [[texture(1)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = dst.get_width(), h = dst.get_height();
@@ -348,31 +365,56 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         constexpr sampler s(filter::linear, address::clamp_to_edge);
         float2 uv = (float2(gid) + 0.5) / float2(w, h);
         float2 o = 0.25 / float2(w, h);
-        float l = dot(src.sample(s, uv + float2(-o.x,-o.y)).rgb, kLuma)
-                + dot(src.sample(s, uv + float2( o.x,-o.y)).rgb, kLuma)
-                + dot(src.sample(s, uv + float2(-o.x, o.y)).rgb, kLuma)
-                + dot(src.sample(s, uv + float2( o.x, o.y)).rgb, kLuma);
-        dst.write(float4(l * 0.25), gid);
+        half l = dot(src.sample(s, uv + float2(-o.x,-o.y)).rgb, kLuma)
+               + dot(src.sample(s, uv + float2( o.x,-o.y)).rgb, kLuma)
+               + dot(src.sample(s, uv + float2(-o.x, o.y)).rgb, kLuma)
+               + dot(src.sample(s, uv + float2( o.x, o.y)).rgb, kLuma);
+        dst.write(half4(l * 0.25h), gid);
     }
 
     // 루마 반 다운
     kernel void mfDownHalf(
-        texture2d<float, access::sample> src [[texture(0)]],
-        texture2d<float, access::write> dst [[texture(1)]],
+        texture2d<half, access::sample> src [[texture(0)]],
+        texture2d<half, access::write> dst [[texture(1)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = dst.get_width(), h = dst.get_height();
         if (gid.x >= w || gid.y >= h) return;
         constexpr sampler s(filter::linear, address::clamp_to_edge);
         float2 uv = (float2(gid) + 0.5) / float2(w, h);
-        dst.write(float4(src.sample(s, uv).r), gid);
+        dst.write(half4(src.sample(s, uv).r), gid);
     }
 
-    // 피라미드 매칭: prior(코스 레벨) flow*2를 시작점으로 ±searchRadius 국소 탐색 (5x5 SAD)
-    // flow 단위: 이 레벨의 픽셀
+    // Z = L - mean5x5(L): zero-mean 매칭 신호 사전 계산.
+    // 매치 커널이 후보마다 25탭 창 평균을 구하던 것을 제거 (조명 불변성은 동일하게 유지 —
+    // 창 중심이 후보 위치가 아닌 각 탭 자기 위치 기준이 되지만, 고역통과 신호 매칭이라 등가 이상).
+    kernel void mfZeroMean(
+        texture2d<half, access::read> src [[texture(0)]],
+        texture2d<half, access::write> dst [[texture(1)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint w = dst.get_width(), h = dst.get_height();
+        if (gid.x >= w || gid.y >= h) return;
+        int W = int(w) - 1, H = int(h) - 1;
+        half acc = 0.0h;
+        for (int dy = -2; dy <= 2; dy++)
+            for (int dx = -2; dx <= 2; dx++) {
+                uint2 q = uint2(clamp(int(gid.x) + dx, 0, W), clamp(int(gid.y) + dy, 0, H));
+                acc += src.read(q).r;
+            }
+        dst.write(half4(src.read(gid).r - acc / 25.0h), gid);
+    }
+
+    // 피라미드 매칭: prior(코스 레벨) flow를 시작점으로 ±searchRadius 정수 국소 탐색 (6x6 SAD)
+    // 입력은 zero-mean 루마(Z = L - mean5x5) — 조명/페이드 불변.
+    //
+    // gather 최적화: 6x6 창을 2x2 쿼드 9개(gather 9회)로 읽어 후보당 샘플 명령 25→9,
+    // SAD는 half4 벡터로 누적 (실측: 샘플링 바운드 커널이라 ALU 최적화만으론 불변 — gather가 관건).
+    // prior는 정수 반올림 — gather는 텍셀 정렬이 필요. 서브픽셀은 최종 레벨 refine이 복원
+    // (정수 탐색 + 최종 서브픽셀 = 고전 블록매칭 표준. 워프용 flow는 스무딩이 소수화).
     kernel void mfMatch(
-        texture2d<float, access::sample> src [[texture(0)]],   // 기준 프레임 루마
-        texture2d<float, access::sample> ref [[texture(1)]],   // 대상 프레임 루마
+        texture2d<half, access::sample> src [[texture(0)]],   // 기준 프레임 zero-mean 루마
+        texture2d<half, access::sample> ref [[texture(1)]],   // 대상 프레임 zero-mean 루마
         texture2d<float, access::sample> prior [[texture(2)]], // 코스 flow (없으면 미사용)
         texture2d<float, access::write> flowOut [[texture(3)]],
         constant MatchParams& p [[buffer(0)]],
@@ -387,80 +429,59 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float2 base = float2(0.0);
         if (p.hasPrior != 0) {
             // 공간 prior(코스 레벨)는 2.0, 시간 prior(동일 레벨, 이전 쌍)는 1.0
-            base = prior.sample(s, uv).rg * p.priorScale;
+            base = round(prior.sample(s, uv).rg * p.priorScale);
         }
 
-        // 5x5 창 소스 패치 캐시 (+평균 — zero-mean 매칭용)
-        float patch[25];
-        float srcMean = 0.0;
+        // 6x6 소스 패치를 gather 9회로 캐시 (쿼드 경계 uv: 텍셀 d..d+1 사이 = gid+d+1)
+        half4 patch[9];
         int k = 0;
-        for (int dy = -2; dy <= 2; dy++)
-            for (int dx = -2; dx <= 2; dx++) {
-                float2 q = (float2(gid) + 0.5 + float2(dx, dy)) / size;
-                float v = src.sample(s, q).r;
-                patch[k++] = v;
-                srcMean += v;
+        for (int dy = -2; dy <= 2; dy += 2)
+            for (int dx = -2; dx <= 2; dx += 2) {
+                float2 q = (float2(gid) + float2(dx + 1, dy + 1)) / size;
+                patch[k++] = src.gather(s, q);
             }
-        srcMean /= 25.0;
 
-        // zero-mean SAD: 패치 평균을 빼고 비교 → 조명/밝기 변화에 불변.
-        // (일반 SAD는 페이드/노출 변화에서 flow가 무너져 물결 아티팩트 — 실측)
-        // 후보 탭을 레지스터에 캐시해 텍스처 비용 증가 없이 2-pass 계산.
-        float bestSAD = 1e9;
+        half bestSAD = 65504.0h;
         float2 bestOff = float2(0.0);
         for (int oy = -p.searchRadius; oy <= p.searchRadius; oy++) {
             for (int ox = -p.searchRadius; ox <= p.searchRadius; ox++) {
                 float2 cand = base + float2(ox, oy);
-                float candTaps[25];
-                float refMean = 0.0;
+                half4 acc = half4(0.0h);
                 int j = 0;
-                for (int dy = -2; dy <= 2; dy++)
-                    for (int dx = -2; dx <= 2; dx++) {
-                        float2 q = (float2(gid) + 0.5 + cand + float2(dx, dy)) / size;
-                        float v = ref.sample(s, q).r;
-                        candTaps[j++] = v;
-                        refMean += v;
+                for (int dy = -2; dy <= 2; dy += 2)
+                    for (int dx = -2; dx <= 2; dx += 2) {
+                        float2 q = (float2(gid) + cand + float2(dx + 1, dy + 1)) / size;
+                        acc += abs(ref.gather(s, q) - patch[j++]);
                     }
-                refMean /= 25.0;
-                float sad = 0.0;
-                for (int m = 0; m < 25; m++) {
-                    sad += fabs((candTaps[m] - refMean) - (patch[m] - srcMean));
-                }
+                half sad = acc.x + acc.y + acc.z + acc.w;
                 // 평활 페널티 — 애매(평탄) 영역에서 벡터가 prior에서 멋대로 점프하는
-                // 노이즈 억제 (shimmer의 주범). SAD 25탭 스케일 대비 미세한 가중.
-                sad += 0.012 * length(float2(ox, oy));
+                // 노이즈 억제 (shimmer의 주범). 36탭 SAD 스케일 기준 (25탭 0.012 × 36/25).
+                sad += 0.017h * half(length(float2(ox, oy)));
                 if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
             }
         }
 
-        // 서브픽셀 refine (x/y 독립 3점 포물선) — 최종 레벨만
+        // 서브픽셀 refine (x/y 독립 3점 포물선) — 최종 레벨만. ±1 시프트도 gather 정렬 유지.
         float2 refined = bestOff;
         if (p.refine != 0) {
-            float sadC = bestSAD;
-            // x
-            float sadL = 0.0, sadR = 0.0;
+            float sadC = float(bestSAD);
+            half4 aL = half4(0.0h), aR = half4(0.0h), aU = half4(0.0h), aD = half4(0.0h);
             int j = 0;
-            for (int dy = -2; dy <= 2; dy++)
-                for (int dx = -2; dx <= 2; dx++) {
-                    float2 qL = (float2(gid) + 0.5 + bestOff + float2(dx - 1, dy)) / size;
-                    float2 qR = (float2(gid) + 0.5 + bestOff + float2(dx + 1, dy)) / size;
-                    float pv = patch[j++];
-                    sadL += fabs(ref.sample(s, qL).r - pv);
-                    sadR += fabs(ref.sample(s, qR).r - pv);
+            for (int dy = -2; dy <= 2; dy += 2)
+                for (int dx = -2; dx <= 2; dx += 2) {
+                    half4 pv = patch[j++];
+                    float2 c = float2(gid) + bestOff;
+                    aL += abs(ref.gather(s, (c + float2(dx    , dy + 1)) / size) - pv);
+                    aR += abs(ref.gather(s, (c + float2(dx + 2, dy + 1)) / size) - pv);
+                    aU += abs(ref.gather(s, (c + float2(dx + 1, dy    )) / size) - pv);
+                    aD += abs(ref.gather(s, (c + float2(dx + 1, dy + 2)) / size) - pv);
                 }
+            float sadL = float(aL.x + aL.y + aL.z + aL.w);
+            float sadR = float(aR.x + aR.y + aR.z + aR.w);
+            float sadU = float(aU.x + aU.y + aU.z + aU.w);
+            float sadD = float(aD.x + aD.y + aD.z + aD.w);
             float denomX = sadL - 2.0 * sadC + sadR;
             if (denomX > 1e-5) refined.x += clamp(0.5 * (sadL - sadR) / denomX, -0.5, 0.5);
-            // y
-            float sadU = 0.0, sadD = 0.0;
-            j = 0;
-            for (int dy = -2; dy <= 2; dy++)
-                for (int dx = -2; dx <= 2; dx++) {
-                    float2 qU = (float2(gid) + 0.5 + bestOff + float2(dx, dy - 1)) / size;
-                    float2 qD = (float2(gid) + 0.5 + bestOff + float2(dx, dy + 1)) / size;
-                    float pv = patch[j++];
-                    sadU += fabs(ref.sample(s, qU).r - pv);
-                    sadD += fabs(ref.sample(s, qD).r - pv);
-                }
             float denomY = sadU - 2.0 * sadC + sadD;
             if (denomY > 1e-5) refined.y += clamp(0.5 * (sadU - sadD) / denomY, -0.5, 0.5);
         }
@@ -489,8 +510,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     // 신뢰도(순환 일관성) + 정적(|A-B|) 마스크 + 루마 히스토그램 (장면컷)
     kernel void mfFinalize(
-        texture2d<float, access::read> lumA [[texture(0)]],
-        texture2d<float, access::read> lumB [[texture(1)]],
+        texture2d<half, access::read> lumA [[texture(0)]],
+        texture2d<half, access::read> lumB [[texture(1)]],
         texture2d<float, access::sample> flowF [[texture(2)]],
         texture2d<float, access::sample> flowB [[texture(3)]],
         texture2d<float, access::write> mask [[texture(4)]],
@@ -512,8 +533,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 원본 폴백(60fps 스텝)으로 빠져 '프레임레이트 낮아 보임' (실측 보고)
         float conf = 1.0 - smoothstep(2.5, 8.0, cyc);
 
-        float la = lumA.read(gid).r;
-        float lb = lumB.read(gid).r;
+        float la = float(lumA.read(gid).r);
+        float lb = float(lumB.read(gid).r);
         float d = fabs(la - lb);
         float staticness = 1.0 - smoothstep(0.008, 0.04, d);
 
@@ -530,12 +551,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     // 풀해상도 양방향 워프 + 합성.
     // flow는 base-res 픽셀 단위 → 풀해상도 UV 오프셋으로 변환해 샘플.
     kernel void mfWarp(
-        texture2d<float, access::sample> imgA [[texture(0)]],
-        texture2d<float, access::sample> imgB [[texture(1)]],
+        texture2d<half, access::sample> imgA [[texture(0)]],
+        texture2d<half, access::sample> imgB [[texture(1)]],
         texture2d<float, access::sample> flowF [[texture(2)]],
         texture2d<float, access::sample> flowB [[texture(3)]],
         texture2d<float, access::sample> mask [[texture(4)]],
-        texture2d<float, access::write> dst [[texture(5)]],
+        texture2d<half, access::write> dst [[texture(5)]],
         constant WarpParams& p [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
@@ -552,21 +573,21 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         // backward 매핑: 출력 p의 물체는 A에서 p - t·F_ab 에, B에서 p - (1-t)·F_ba 에 있었다
         // (flow를 p에서 샘플하는 소모션 근사 — 표준 기법)
-        float3 w0 = imgA.sample(s, uv - f * t).rgb;
-        float3 w1 = imgB.sample(s, uv - b * (1.0 - t)).rgb;
-        float3 interp = mix(w0, w1, t);
+        half3 w0 = imgA.sample(s, uv - f * t).rgb;
+        half3 w1 = imgB.sample(s, uv - b * (1.0 - t)).rgb;
+        half3 interp = mix(w0, w1, half(t));
 
         float4 m = mask.sample(s, uv);
-        float conf = m.r;
-        float staticness = m.g;
+        half conf = half(m.r);
+        half staticness = half(m.g);
 
         // 저신뢰 폴백: 크로스페이드는 이중상(고스트)으로 보임 → 시간상 가까운 원본을 그대로
         // (t 경계에서 팝 방지를 위해 좁은 구간만 블렌드)
-        float3 nearest = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb,
-                             smoothstep(0.35, 0.65, t));
-        float3 moving = mix(nearest, interp, conf);
-        float3 outc = mix(moving, imgB.sample(s, uv).rgb, staticness); // 정적 → B 원본 (선명)
-        dst.write(float4(outc, 1.0), gid);
+        half3 nearestPix = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb,
+                               half(smoothstep(0.35, 0.65, t)));
+        half3 moving = mix(nearestPix, interp, conf);
+        half3 outc = mix(moving, imgB.sample(s, uv).rgb, staticness); // 정적 → B 원본 (선명)
+        dst.write(half4(outc, 1.0h), gid);
     }
     """
 }

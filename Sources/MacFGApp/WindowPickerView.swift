@@ -263,7 +263,6 @@ private struct HelpButton: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
-        .help(text)   // 호버 시 기본 툴팁도 함께
         .popover(isPresented: $show, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(title).font(.headline)

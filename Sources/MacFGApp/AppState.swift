@@ -1019,19 +1019,8 @@ public final class AppState {
     }
 
     private func presentEntry(_ entry: TimelineEntry, at targetTimestamp: CFTimeInterval) {
-        // 드로어블 여유 가드 — 2개 이상 미완이면 nextDrawable이 블록하므로 이번 틱은 건너뜀
-        // (entry는 lastPresentedTimestamp 미갱신으로 타임라인에 남아 다음 틱에 표시).
-        // 핸들러 유실(창 재생성 등) 대비: 연속 6틱 스킵이면 카운터 리셋 후 진행.
-        let busy = inFlightPresents.withLock { $0 } >= 2
-        if busy {
-            presentBusySkips += 1
-            if presentBusySkips <= 6 {
-                diagPresentBusy += 1
-                return
-            }
-            inFlightPresents.withLock { $0 = 0 }   // 핸들러 유실 간주 — 재동기
-        }
-        presentBusySkips = 0
+        // 드로어블 포화는 진단만 (스킵 가드는 실콘텐츠에서 과도 스킵 → 80-90fps 역효과 실측)
+        if inFlightPresents.withLock({ $0 }) >= 2 { diagPresentBusy += 1 }
 
         guard let presentQueue, let cb = presentQueue.makeCommandBuffer() else { return }
         guard let drawable = overlayManager?.encodeRenderFrame(texture: entry.texture, into: cb) else {
@@ -1055,11 +1044,11 @@ public final class AppState {
             inFlightRef.withLock { $0 = max(0, $0 - 1) }
             mailboxRef.postPresented(at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
         }
-        // plain present — displaySyncEnabled=true라 다음 vsync 정렬은 동일한데,
-        // present(at: targetTimestamp)의 명시적 시각 예약은 드로어블을 데드라인까지 붙잡아
-        // 3개 풀이 고갈 → nextDrawable 세마포어 블록 (10s 샘플 중 1.4s 대기 실측 —
-        // 틱을 삼켜 120 고정 실패의 최대 단일 원인). 틱당 1회 present이므로 타이밍 등가.
-        cb.present(drawable)
+        // present(at: targetTimestamp) — 프레임을 목표 vsync에 고정 (페이싱 계약).
+        // plain present 실험은 GPU 완료 시점에 따라 표시가 흘러 실콘텐츠에서 뭉침/코어레싱
+        // (80-90fps + 시간축 왔다갔다 체감) — 롤백. 드로어블 점유가 길어지는 비용은
+        // nextDrawable 대기로 남지만, 표시 시각 정확성이 우선 (CAMetalDisplayLink 전환이 근본 해법).
+        cb.present(drawable, atTime: targetTimestamp)
         cb.commit()
     }
 

@@ -34,6 +34,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.
     public nonisolated(unsafe) static var occlusionDirectional: Bool = false
 
+    /// 모션 부드러움 0(예리)~1(부드러움), 0.5=현재 기본. 취향 슬라이더 — 개선/천장이 아니라
+    /// 예리함↔매끄러움 축(손튜닝 flow는 오클루전 정확도에선 AppleFI 천장, 이건 다른 축).
+    /// 하단: flow 스무딩↓(디테일↑) + 폴백 좁힘. 상단: flow 스무딩↑(에러 완만, AppleFI 느낌) + 폴백 넓힘.
+    public nonisolated(unsafe) static var motionSmoothness: Float = 0.5
+
     private var device: (any MTLDevice)?
     private let logger = Logger(subsystem: "com.macfg", category: "MetalFlow")
 
@@ -115,6 +120,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         statsIndex = (statsIndex + 1) % statsBuffers.count
         let L = levels.count
 
+        // 모션 부드러움 매핑 (0.5=현재 기본): 하단은 flow 스무딩↓+폴백 좁힘, 상단은 반대.
+        let sm = min(max(Self.motionSmoothness, 0), 1)
+        var smoothAmt: Float = min(sm * 2, 1)                       // flow 박스스무딩: 0→raw, 0.5→full, 1→full
+        let flowBlur: Float = max((sm - 0.5) * 2, 0)               // 워프 flow 블러: 0(≤0.5)→1(=1.0)
+        let fadeHalf: Float = 0.02 + 0.28 * sm                     // 폴백 폭: 0→±0.02, 0.5→±0.16, 1→±0.30
+        let fadeLo = 0.5 - fadeHalf
+        let fadeHi = 0.5 + fadeHalf
+
         // 0) 히스토그램 클리어
         if let fill = commandBuffer.makeBlitCommandEncoder() {
             fill.fill(buffer: statsBuffer, range: 0..<(64 * 4), value: 0)
@@ -169,6 +182,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             dispatch(enc, levels[l].w, levels[l].h, matchPSO)
             enc.setComputePipelineState(smoothPSO)
             enc.setTexture(flowTmp[l], index: 0); enc.setTexture(flowF[l], index: 1)
+            enc.setBytes(&smoothAmt, length: MemoryLayout<Float>.stride, index: 0)
             dispatch(enc, levels[l].w, levels[l].h, smoothPSO)
             // backward: B→A
             enc.setComputePipelineState(matchPSO)
@@ -180,6 +194,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             dispatch(enc, levels[l].w, levels[l].h, matchPSO)
             enc.setComputePipelineState(smoothPSO)
             enc.setTexture(flowTmp[l], index: 0); enc.setTexture(flowB[l], index: 1)
+            enc.setBytes(&smoothAmt, length: MemoryLayout<Float>.stride, index: 0)
             dispatch(enc, levels[l].w, levels[l].h, smoothPSO)
         }
         enc.endEncoding()
@@ -227,7 +242,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         for t in tValues.sorted() {
             let output = outputPool[outputIndex]
             outputIndex = (outputIndex + 1) % outputPool.count
-            var wp = WarpParams(t: t, dirBlend: dirBlend)
+            var wp = WarpParams(t: t, dirBlend: dirBlend, fadeLo: fadeLo, fadeHi: fadeHi, flowBlur: flowBlur)
             enc2.setTexture(output, index: 5)
             enc2.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
             dispatch(enc2, output.width, output.height, warpPSO)
@@ -265,6 +280,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private struct WarpParams {
         var t: Float
         var dirBlend: Float
+        var fadeLo: Float
+        var fadeHi: Float
+        var flowBlur: Float
     }
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -358,7 +376,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     using namespace metal;
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; };
-    struct WarpParams { float t; float dirBlend; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -497,23 +515,28 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         flowOut.write(float4(refined, 0, 0), gid);
     }
 
-    // 3x3 flow 스무딩 (노이즈로 인한 정적 영역 부들거림 억제)
+    // 3x3 flow 스무딩 (노이즈로 인한 정적 영역 부들거림 억제).
+    // smoothAmt: 원본 대비 박스평균 혼합량 (0=원본 flow=예리, 1=완전 박스=부드러움).
+    // "Motion smoothness" 슬라이더의 하단 절반(예리 방향)이 이 값을 낮춰 flow 디테일을 살린다.
     kernel void mfSmooth(
         texture2d<float, access::sample> src [[texture(0)]],
         texture2d<float, access::write> dst [[texture(1)]],
+        constant float& smoothAmt [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = dst.get_width(), h = dst.get_height();
         if (gid.x >= w || gid.y >= h) return;
         constexpr sampler s(filter::linear, address::clamp_to_edge);
         float2 size = float2(w, h);
+        float2 center = src.sample(s, (float2(gid) + 0.5) / size).rg;
         float2 acc = float2(0.0);
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++) {
                 float2 uv = (float2(gid) + 0.5 + float2(dx, dy)) / size;
                 acc += src.sample(s, uv).rg;
             }
-        dst.write(float4(acc / 9.0, 0, 0), gid);
+        float2 box = acc / 9.0;
+        dst.write(float4(mix(center, box, smoothAmt), 0, 0), gid);
     }
 
     // 신뢰도(순환 일관성) + 정적(|A-B|) 마스크 + 루마 히스토그램 (장면컷)
@@ -588,8 +611,20 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         float2 baseSize = float2(flowF.get_width(), flowF.get_height());
         // flow(base 픽셀 단위) → 정규화 UV 오프셋
-        float2 f = flowF.sample(s, uv).rg / baseSize;
-        float2 b = flowB.sample(s, uv).rg / baseSize;
+        float2 fRaw = flowF.sample(s, uv).rg;
+        float2 bRaw = flowB.sample(s, uv).rg;
+        // 부드러움 상단: flow를 4-이웃 평균으로 블러 → 워프가 완만(모션 경계 에러 부드럽게).
+        if (p.flowBlur > 0.001) {
+            float2 e = 1.3 / baseSize;
+            float2 fb = (flowF.sample(s, uv + float2(e.x,0)).rg + flowF.sample(s, uv - float2(e.x,0)).rg
+                       + flowF.sample(s, uv + float2(0,e.y)).rg + flowF.sample(s, uv - float2(0,e.y)).rg) * 0.25;
+            float2 bb = (flowB.sample(s, uv + float2(e.x,0)).rg + flowB.sample(s, uv - float2(e.x,0)).rg
+                       + flowB.sample(s, uv + float2(0,e.y)).rg + flowB.sample(s, uv - float2(0,e.y)).rg) * 0.25;
+            fRaw = mix(fRaw, fb, p.flowBlur);
+            bRaw = mix(bRaw, bb, p.flowBlur);
+        }
+        float2 f = fRaw / baseSize;
+        float2 b = bRaw / baseSize;
 
         // backward 매핑: 출력 p의 물체는 A에서 p - t·F_ab 에, B에서 p - (1-t)·F_ba 에 있었다
         half3 w0 = imgA.sample(s, uv - f * t).rgb;
@@ -613,10 +648,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         half3 interp = mix(w0, w1, half(tBlend));
         half conf = half(mix(confF, max(confF, confB), p.dirBlend));
 
-        // 저신뢰 폴백: 크로스페이드는 이중상(고스트)으로 보임 → 시간상 가까운 원본을 그대로
-        // (t 경계에서 팝 방지를 위해 좁은 구간만 블렌드)
+        // 저신뢰 폴백: A/B 원본 크로스페이드. 폭(fadeLo~fadeHi)이 smoothness 슬라이더:
+        // 좁으면(예리) 단일 프레임에 가까워 저더, 넓으면(부드러움) 부드러운 블렌드(약간 고스트).
         half3 nearestPix = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb,
-                               half(smoothstep(0.35, 0.65, t)));
+                               half(smoothstep(p.fadeLo, p.fadeHi, t)));
         half3 moving = mix(nearestPix, interp, conf);
         half3 outc = mix(moving, imgB.sample(s, uv).rgb, half(staticness)); // 정적 → B 원본 (선명)
         dst.write(half4(outc, 1.0h), gid);

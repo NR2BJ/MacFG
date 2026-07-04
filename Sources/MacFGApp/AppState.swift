@@ -130,6 +130,8 @@ public final class AppState {
     /// 오클루전 방향별 워프 (실험, MetalFlow 전용) — 가림/드러남 경계에서 보이는 쪽 단방향 워프.
     /// 반복 패턴 aliasing 부작용 가능 → 실영상 A/B용. 기본 off.
     var occlusionDirectional: Bool = false
+    /// 모션 부드러움 0(예리)~1(부드러움), 0.5=기본. MetalFlow 전용 취향 슬라이더 (실시간 반영).
+    var motionSmoothness: Double = 0.5
     /// 업스케일 실동작 상태 (UI 표시용) — nil이면 미캡처/비활성
     var upscaleStatus: String?
     /// 보간 배율: 0=Auto(디스플레이 슬롯 전부 채움), 2~5=소스 fps × N 상한.
@@ -255,6 +257,7 @@ public final class AppState {
         d.set(sourcePreset, forKey: "s.preset")
         d.set(isInterpolationEnabled, forKey: "s.interp")
         d.set(occlusionDirectional, forKey: "s.occdir")
+        d.set(motionSmoothness, forKey: "s.msmooth")
     }
 
     private func loadSettings() {
@@ -270,6 +273,8 @@ public final class AppState {
         if d.object(forKey: "s.interp") != nil { isInterpolationEnabled = d.bool(forKey: "s.interp") }
         if d.object(forKey: "s.occdir") != nil { occlusionDirectional = d.bool(forKey: "s.occdir") }
         MetalFlowEngine.occlusionDirectional = occlusionDirectional
+        if d.object(forKey: "s.msmooth") != nil { motionSmoothness = d.double(forKey: "s.msmooth") }
+        MetalFlowEngine.motionSmoothness = Float(motionSmoothness)
         // 배치는 업스케일 모드에서 파생
         selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
     }
@@ -278,6 +283,12 @@ public final class AppState {
     func updateOcclusionDirectional() {
         MetalFlowEngine.occlusionDirectional = occlusionDirectional
         DiagnosticLog.shared.log("[OCC] directional=\(occlusionDirectional)")
+        persistSettings()
+    }
+
+    /// 모션 부드러움 슬라이더 — 정적 var를 워프/스무딩이 매 쌍 읽으므로 캡처 중 즉시 반영.
+    func updateMotionSmoothness() {
+        MetalFlowEngine.motionSmoothness = Float(motionSmoothness)
         persistSettings()
     }
 

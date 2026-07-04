@@ -90,6 +90,16 @@ struct WindowPickerView: View {
             .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
 
             if appState.selectedRenderMode == .metalFlow {
+                HStack(spacing: 8) {
+                    Text("Motion").font(.caption).foregroundStyle(.secondary)
+                    Text("sharp").font(.caption2).foregroundStyle(.secondary)
+                    Slider(value: $appState.motionSmoothness, in: 0...1)
+                        .onChange(of: appState.motionSmoothness) { appState.updateMotionSmoothness() }
+                    Text("smooth").font(.caption2).foregroundStyle(.secondary)
+                }
+                Text("Sharp = more motion detail (can shimmer); smooth = gentler, softer motion. Taste, not quality — applies instantly, slide while watching.")
+                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+
                 Toggle("Occlusion warp (experimental)", isOn: $appState.occlusionDirectional)
                     .toggleStyle(.switch)
                     .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }

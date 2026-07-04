@@ -20,6 +20,7 @@ struct BenchConfig {
     var engines: [String] = ["all"]
     var flowBase: Double? = nil
     var occDirectional = false
+    var smoothness: Float? = nil
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -32,6 +33,7 @@ struct BenchConfig {
             case "--engines": if let v = args.popFirst() { config.engines = v.split(separator: ",").map(String.init) }
             case "--flow-base": if let v = args.popFirst() { config.flowBase = Double(v) }
             case "--occ-dir": config.occDirectional = true
+            case "--smoothness": if let v = args.popFirst() { config.smoothness = Float(v) }
             default: break
             }
         }
@@ -78,12 +80,13 @@ func createTestPattern(device: any MTLDevice, commandQueue: any MTLCommandQueue,
         float n = vnoise(bp) * 0.6 + vnoise(bp * 2.7) * 0.3 + vnoise(bp * 6.1) * 0.1;
         float3 c = float3(n * 0.85, n * 0.72, n * 0.55);
 
-        // ③ 회전 스포크 휠 (중앙 좌측, 각속도 = shift 선형)
+        // ③ 회전 스포크 휠 (중앙 좌측, 각속도 = shift 선형). 프레임당 ~12°(0.007×30/2)로
+        // 현실적 빠른 회전 — 이전 43°/frame는 병리적이라 PSNR을 회전 실패가 지배했음.
         float2 wc = sz * float2(0.34, 0.5);
         float2 wd = px - wc; float wr = length(wd);
         float wheelR = min(sz.x, sz.y) * 0.20;
         if (wr < wheelR) {
-            float ang = atan2(wd.y, wd.x) + p.shift * 0.025;
+            float ang = atan2(wd.y, wd.x) + p.shift * 0.007;
             float spokes = step(0.0, sin(ang * 8.0));
             float rings = step(0.5, fract(wr / (wheelR * 0.22)));
             c = mix(float3(0.12, 0.16, 0.42), float3(0.95, 0.88, 0.28), spokes * 0.7 + rings * 0.3);
@@ -291,6 +294,7 @@ func main() async {
     let config = BenchConfig.parse()
     if let base = config.flowBase { MetalFlowEngine.flowBaseLongSide = base }
     MetalFlowEngine.occlusionDirectional = config.occDirectional
+    if let sm = config.smoothness { MetalFlowEngine.motionSmoothness = sm }
 
     guard let device = MTLCreateSystemDefaultDevice() else {
         print("❌ Metal not available"); return

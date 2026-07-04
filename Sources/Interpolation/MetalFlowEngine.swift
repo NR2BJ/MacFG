@@ -34,10 +34,15 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.
     public nonisolated(unsafe) static var occlusionDirectional: Bool = false
 
-    /// 모션 부드러움 0(예리)~1(부드러움), 0.5=현재 기본. 취향 슬라이더 — 개선/천장이 아니라
-    /// 예리함↔매끄러움 축(손튜닝 flow는 오클루전 정확도에선 AppleFI 천장, 이건 다른 축).
-    /// 하단: flow 스무딩↓(디테일↑) + 폴백 좁힘. 상단: flow 스무딩↑(에러 완만, AppleFI 느낌) + 폴백 넓힘.
+    /// 모션 부드러움 0(예리)~1(부드러움), 0.5=현재 기본. 취향 슬라이더 — flow의 예리함↔매끄러움 축.
+    /// 하단: flow raw(디테일↑, shimmer 가능). 상단: flow 박스+워프블러(에러 완만, AppleFI 느낌).
     public nonisolated(unsafe) static var motionSmoothness: Float = 0.5
+
+    /// 경계 전환 0(crisp=저더)~1(soft=고스팅), 0.5=기본. 물체 경계(저신뢰) 폴백 크로스페이드 폭.
+    /// 축이 부드러움과 독립(부드러움=flow, 이건=경계 처리)이라 별도 노브. 콘텐츠 의존:
+    /// crisp=게임/스포츠(빠른 급전환 — 이중상이 튐, 저더는 순간이라 덜 보임),
+    /// soft=영화/다큐(느린 팬 — 저더가 톡톡 끊겨 거슬림, 고스팅은 옅게 묻힘).
+    public nonisolated(unsafe) static var boundarySoftness: Float = 0.5
 
     private var device: (any MTLDevice)?
     private let logger = Logger(subsystem: "com.macfg", category: "MetalFlow")
@@ -125,10 +130,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         let sm = min(max(Self.motionSmoothness, 0), 1)
         var smoothAmt: Float = min(sm * 2, 1)                       // flow 박스스무딩: 0→raw, 0.5→full, 1→full
         let flowBlur: Float = max((sm - 0.5) * 2, 0)               // 워프 flow 블러: 0(≤0.5)→1(=1.0)
-        // 폴백 크로스페이드 폭은 좁게 고정 — 넓히면 저신뢰(물체 경계)에서 이중상(고스팅).
-        // 부드러움은 flow로만 얻고 고스팅은 늘 억제 (사용자 A/B: 오른쪽에서 고스팅 관측).
-        let fadeLo: Float = 0.44
-        let fadeHi: Float = 0.56
+        // 경계 폴백 폭 = boundarySoftness 슬라이더 (별도 축). crisp(0)=±0.03(거의 단일프레임=저더),
+        // 0.5=±0.16(= v1.0.4 기본 동작), soft(1)=±0.29(넓은 블렌드=부드럽지만 고스팅). 콘텐츠 취향.
+        let bs = min(max(Self.boundarySoftness, 0), 1)
+        let fadeHalf: Float = 0.03 + 0.26 * bs
+        let fadeLo = 0.5 - fadeHalf
+        let fadeHi = 0.5 + fadeHalf
 
         // 0) 히스토그램 클리어
         if let fill = commandBuffer.makeBlitCommandEncoder() {

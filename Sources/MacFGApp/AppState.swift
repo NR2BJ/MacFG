@@ -132,6 +132,8 @@ public final class AppState {
     var occlusionDirectional: Bool = false
     /// 모션 부드러움 0(예리)~1(부드러움), 0.5=기본. MetalFlow 전용 취향 슬라이더 (실시간 반영).
     var motionSmoothness: Double = 0.5
+    /// 경계 전환 0(crisp/저더)~1(soft/고스팅), 0.5=기본. 콘텐츠 취향(게임 crisp / 영화 soft).
+    var boundarySoftness: Double = 0.5
     /// 업스케일 실동작 상태 (UI 표시용) — nil이면 미캡처/비활성
     var upscaleStatus: String?
     /// 보간 배율: 0=Auto(디스플레이 슬롯 전부 채움), 2~5=소스 fps × N 상한.
@@ -258,6 +260,7 @@ public final class AppState {
         d.set(isInterpolationEnabled, forKey: "s.interp")
         d.set(occlusionDirectional, forKey: "s.occdir")
         d.set(motionSmoothness, forKey: "s.msmooth")
+        d.set(boundarySoftness, forKey: "s.bsoft")
     }
 
     private func loadSettings() {
@@ -275,6 +278,8 @@ public final class AppState {
         MetalFlowEngine.occlusionDirectional = occlusionDirectional
         if d.object(forKey: "s.msmooth") != nil { motionSmoothness = d.double(forKey: "s.msmooth") }
         MetalFlowEngine.motionSmoothness = Float(motionSmoothness)
+        if d.object(forKey: "s.bsoft") != nil { boundarySoftness = d.double(forKey: "s.bsoft") }
+        MetalFlowEngine.boundarySoftness = Float(boundarySoftness)
         // 배치는 업스케일 모드에서 파생
         selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
     }
@@ -289,6 +294,12 @@ public final class AppState {
     /// 모션 부드러움 슬라이더 — 정적 var를 워프/스무딩이 매 쌍 읽으므로 캡처 중 즉시 반영.
     func updateMotionSmoothness() {
         MetalFlowEngine.motionSmoothness = Float(motionSmoothness)
+        persistSettings()
+    }
+
+    /// 경계 전환 슬라이더 — 정적 var를 워프가 매 쌍 읽으므로 캡처 중 즉시 반영.
+    func updateBoundarySoftness() {
+        MetalFlowEngine.boundarySoftness = Float(boundarySoftness)
         persistSettings()
     }
 

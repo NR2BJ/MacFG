@@ -2,10 +2,9 @@ import SwiftUI
 import Overlay
 
 /// 설정 우선 화면 (Lossless Scaling 방식): 설정은 앱에서 미리, 시작은 포커스 창에 단축키.
-/// 섹션 그룹 + 상세 설명은 컨트롤 `.help()` 툴팁(호버)으로 — 패널을 깔끔하게 유지.
+/// 각 항목에 한 줄 설명 + (?) 아이콘(호버/클릭 상세 팝오버)으로 기술 용어를 풀어준다.
 struct WindowPickerView: View {
     @Bindable var appState: AppState
-    @State private var showAdvanced = false
 
     var body: some View {
         ScrollView {
@@ -18,19 +17,18 @@ struct WindowPickerView: View {
             }
             .padding(18)
         }
-        .frame(width: 430, height: 540)
+        .frame(width: 440, height: 560)
         .background(.background)
     }
 
-    // MARK: - Reusable section shell
+    // MARK: - Reusable shells
 
     @ViewBuilder
     private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             Text(title)
                 .font(.caption).fontWeight(.semibold)
-                .foregroundStyle(.secondary).textCase(.uppercase)
-                .tracking(0.5)
+                .foregroundStyle(.secondary).textCase(.uppercase).tracking(0.5)
             content()
         }
         .padding(14)
@@ -38,14 +36,19 @@ struct WindowPickerView: View {
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    /// 라벨 + 컨트롤 한 줄 (라벨 고정폭으로 정렬)
+    /// 라벨(+도움말 아이콘) · 컨트롤 · 한 줄 부연 설명을 묶은 항목
     @ViewBuilder
-    private func row<Control: View>(_ label: String, help: String? = nil, @ViewBuilder _ control: () -> Control) -> some View {
-        HStack(spacing: 10) {
-            Text(label).frame(width: 74, alignment: .leading)
+    private func field<Control: View>(_ label: String, hint: String, detail: String? = nil,
+                                      @ViewBuilder _ control: () -> Control) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(label)
+                if let detail { HelpButton(title: label, text: detail) }
+                Spacer()
+            }
             control()
+            Text(hint).font(.caption2).foregroundStyle(.secondary)
         }
-        .help(help ?? "")
     }
 
     // MARK: - Status hero
@@ -66,8 +69,7 @@ struct WindowPickerView: View {
                 }
             } else {
                 HStack(spacing: 12) {
-                    Image(systemName: "viewfinder")
-                        .font(.system(size: 26)).foregroundStyle(.tint)
+                    Image(systemName: "viewfinder").font(.system(size: 26)).foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Focus a window, press \(appState.hotCapture.label.isEmpty ? "the shortcut" : appState.hotCapture.label)")
                             .font(.headline)
@@ -91,7 +93,8 @@ struct WindowPickerView: View {
             Toggle("Frame interpolation", isOn: $appState.isInterpolationEnabled)
                 .onChange(of: appState.isInterpolationEnabled) { appState.updateInterpolationEnabled() }
 
-            row("Engine", help: "Metal Flow: our GPU pipeline, any multiplier, keeps native sharpness. Apple FI: Apple's ANE model, fixed 2× at 720p — set the display to fps×2 (60→120, 24→144).") {
+            field("Engine", hint: "Not sure? Try both and pick what looks better.",
+                  detail: "Metal Flow — our GPU interpolator: any multiplier (×2–×5), keeps native sharpness, works on all Apple Silicon.\n\nApple FI — Apple's Neural Engine model: fixed 2× at 720p, sometimes handles complex motion more gently. Needs the display at fps × 2 (60→120, 24→144).") {
                 Picker("", selection: $appState.selectedRenderMode) {
                     ForEach(RenderMode.userSelectable) { Text($0.displayName).tag($0) }
                 }
@@ -99,7 +102,8 @@ struct WindowPickerView: View {
                 .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
             }
 
-            row("Multiplier", help: "Output = source fps × N, capped at your display refresh (60 ×3 = 180 needs 180Hz+; 120Hz shows 120). Auto fills every display slot.") {
+            field("Multiplier", hint: "Output frames = source fps × N. Auto fills your refresh rate.",
+                  detail: "Caps at your display's refresh rate: 60fps ×3 = 180 needs a 180Hz+ display (a 120Hz display shows 120). Auto picks the most your display can show.") {
                 Picker("", selection: $appState.frameMultiplier) {
                     Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
                 }
@@ -109,43 +113,55 @@ struct WindowPickerView: View {
 
             if appState.selectedRenderMode == .metalFlow {
                 Divider().padding(.vertical, 2)
-                sliderRow("Motion", low: "sharp", high: "smooth", value: $appState.motionSmoothness,
-                          help: "Flow character. Sharp keeps motion detail (can shimmer); smooth is gentler/softer. Taste, not quality.") {
+
+                sliderField("Motion", low: "sharp", high: "smooth", value: $appState.motionSmoothness,
+                            hint: "How the motion looks — taste, not quality.",
+                            detail: "Sharp keeps more motion detail but can shimmer. Smooth is gentler and softer (closer to Apple FI's feel). Slide it while watching.") {
                     appState.updateMotionSmoothness()
                 }
-                sliderRow("Edges", low: "crisp", high: "soft", value: $appState.boundarySoftness,
-                          help: "Object-boundary handling. Crisp = less ghosting, slight judder (games/fast action); soft = smoother, slight ghosting (film/slow pans).") {
+
+                sliderField("Edges", low: "crisp", high: "soft", value: $appState.boundarySoftness,
+                            hint: "Object boundaries — pick by content.",
+                            detail: "The ghosting-vs-judder trade at moving edges. Crisp = less ghosting with a slight step (good for games / fast action). Soft = smoother with slight ghosting (good for film / slow pans).") {
                     appState.updateBoundarySoftness()
                 }
 
-                DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
-                    Toggle("Occlusion warp (experimental)", isOn: $appState.occlusionDirectional)
+                Divider().padding(.vertical, 2)
+
+                field("Occlusion warp", hint: "Experimental — off is fine for most content.",
+                      detail: "A directional warp at reveal/cover edges. Can help some fast motion, but may shimmer on repetitive patterns (grids, text). Off by default; toggle while watching to compare.") {
+                    Toggle("Enable", isOn: $appState.occlusionDirectional)
+                        .toggleStyle(.switch).labelsHidden()
                         .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
-                        .help("Directional warp at reveal/cover edges. Off by default — helps some fast motion but can shimmer on repetitive patterns.")
-                        .padding(.top, 4)
                 }
-                .font(.callout)
             }
         }
     }
 
-    /// low↔high 라벨이 붙은 슬라이더 한 줄
     @ViewBuilder
-    private func sliderRow(_ label: String, low: String, high: String, value: Binding<Double>, help: String, _ onChange: @escaping () -> Void) -> some View {
-        HStack(spacing: 8) {
-            Text(label).frame(width: 52, alignment: .leading)
-            Text(low).font(.caption2).foregroundStyle(.secondary)
-            Slider(value: value, in: 0...1).onChange(of: value.wrappedValue) { onChange() }
-            Text(high).font(.caption2).foregroundStyle(.secondary)
+    private func sliderField(_ label: String, low: String, high: String, value: Binding<Double>,
+                            hint: String, detail: String, _ onChange: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(label)
+                HelpButton(title: label, text: detail)
+                Spacer()
+            }
+            HStack(spacing: 8) {
+                Text(low).font(.caption2).foregroundStyle(.secondary)
+                Slider(value: value, in: 0...1).onChange(of: value.wrappedValue) { onChange() }
+                Text(high).font(.caption2).foregroundStyle(.secondary)
+            }
+            Text(hint).font(.caption2).foregroundStyle(.secondary)
         }
-        .help(help)
     }
 
     // MARK: - Upscaling
 
     private var upscalingSection: some View {
         section("Upscaling & sharpness") {
-            row("Upscale", help: "Off: overlay sits 1:1 on the source (interpolation only). ANE/MetalFX/ANE+FX: show a fullscreen viewer that scales a small source up. ANE needs a ≤960px source.") {
+            field("Upscale", hint: "Blow a small source up to a sharp fullscreen viewer.",
+                  detail: "Off — a 1:1 overlay on the source (interpolation only).\n\nANE — Apple's Neural Engine 2× upscaler (needs a ≤960px source, e.g. a small PiP).\nMetalFX — GPU spatial upscaler, any size.\nANE+FX — ANE then MetalFX, best for tiny sources up to 4K.") {
                 Picker("", selection: $appState.upscaleMode) {
                     ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
                 }
@@ -156,7 +172,8 @@ struct WindowPickerView: View {
                 }
             }
 
-            row("Source", help: "Resize the source to this short side on capture (landscape: height, portrait: width) so it renders at native res for a clean 1:1 capture. Great for browser PiP / IINA.") {
+            field("Source", hint: "Resize the source to a clean native resolution first.",
+                  detail: "On capture, resizes the source window so its short side hits this (landscape: height, portrait: width). A native-res source gives a clean 1:1 grab — ideal for browser Picture-in-Picture and IINA (both are chrome-free 16:9). Set it here before capturing.") {
                 Picker("", selection: $appState.sourcePreset) {
                     Text("Off").tag(0); Text("360").tag(360); Text("480").tag(480)
                     Text("540").tag(540); Text("720").tag(720); Text("1080").tag(1080)
@@ -170,26 +187,30 @@ struct WindowPickerView: View {
                 }
             }
 
-            Toggle("Sharpen (CAS)", isOn: $appState.casEnabled)
-                .onChange(of: appState.casEnabled) { appState.updateUpscale() }
-                .help("Contrast-adaptive sharpening — restores crispness on stretched low-res video. Works even at 1:1.")
-            if appState.casEnabled {
-                HStack(spacing: 8) {
-                    Text("Sharpness").frame(width: 74, alignment: .leading).foregroundStyle(.secondary)
-                    Slider(value: $appState.sharpness, in: 0...1)
-                        .onChange(of: appState.sharpness) { appState.updateUpscale() }
-                    Text(String(format: "%.1f", appState.sharpness))
-                        .font(.callout).monospacedDigit().foregroundStyle(.secondary)
-                        .frame(width: 26, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Toggle("Sharpen (CAS)", isOn: $appState.casEnabled)
+                        .onChange(of: appState.casEnabled) { appState.updateUpscale() }
+                    HelpButton(title: "Sharpen (CAS)", text: "Contrast-Adaptive Sharpening — the 'looks crisper' feel. Restores detail on stretched or soft video and works even at 1:1. Strong on soft areas, gentle on hard edges (no halos).")
+                    Spacer()
+                }
+                if appState.casEnabled {
+                    HStack(spacing: 8) {
+                        Text("Strength").font(.caption2).foregroundStyle(.secondary)
+                        Slider(value: $appState.sharpness, in: 0...1)
+                            .onChange(of: appState.sharpness) { appState.updateUpscale() }
+                        Text(String(format: "%.1f", appState.sharpness))
+                            .font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                            .frame(width: 26, alignment: .trailing)
+                    }
                 }
             }
         }
     }
 
-    // MARK: - Live stats (capturing)
+    // MARK: - Live stats
 
-    // 값 텍스트는 고정 폭 — 자릿수 변화(99→100)가 창 오토레이아웃 연쇄를 일으켜 메인 스레드를
-    // 블록하던 것 방지 (렌더는 이제 전용 스레드지만 메인 부하는 여전히 줄이는 게 이득).
+    // 값 텍스트 고정 폭 — 자릿수 변화(99→100)가 창 오토레이아웃 연쇄로 메인 스레드 블록하던 것 방지.
     private var liveSection: some View {
         section("Live") {
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
@@ -206,7 +227,7 @@ struct WindowPickerView: View {
                 if let scale = appState.upscaleStatus {
                     GridRow {
                         Label("Scale", systemImage: "arrow.up.left.and.arrow.down.right").foregroundStyle(.secondary)
-                        Text(scale).font(.caption).lineLimit(1).frame(width: 240, alignment: .leading)
+                        Text(scale).font(.caption).lineLimit(1).frame(width: 250, alignment: .leading)
                     }
                 }
             }
@@ -220,12 +241,35 @@ struct WindowPickerView: View {
         section("Shortcut") {
             HStack {
                 Text("Capture toggle").foregroundStyle(.secondary)
+                HelpButton(title: "Capture toggle", text: "Focus any window and press this to start or stop capture. Click the field to record a new combo (must include a modifier).")
                 Spacer()
                 ShortcutRecorder(binding: $appState.hotCapture)
                     .frame(width: 96, height: 22)
                     .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
             }
-            .help("Focus any window and press this to start/stop capture. Click the field to record a new combo.")
+        }
+    }
+}
+
+/// (?) 도움말 버튼 — 클릭 시 팝오버로 상세 설명. 발견 가능한 인라인 헬프.
+private struct HelpButton: View {
+    let title: String
+    let text: String
+    @State private var show = false
+
+    var body: some View {
+        Button { show.toggle() } label: {
+            Image(systemName: "questionmark.circle")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help(text)   // 호버 시 기본 툴팁도 함께
+        .popover(isPresented: $show, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.headline)
+                Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14).frame(width: 300)
         }
     }
 }

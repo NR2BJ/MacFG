@@ -1,45 +1,52 @@
 # MacFG
 
-Real-time frame interpolation overlay for macOS — a personal take on Lossless Scaling for the Mac.
+Real-time frame **interpolation + upscaling** overlay for macOS — a personal take on Lossless Scaling for the Mac, mainly for watching video (streams, PiP, local players) on Apple Silicon.
 
-Pick a window, and MacFG captures it, interpolates frames, and outputs at 120Hz+ either on top of the original window or in a separate viewer. Verified on a base M4 at 4K 60→120 (glass-time σ<1ms, source frames byte-identical in color).
+Set your options once, focus any window, and press the shortcut. MacFG captures that window, interpolates it to a rock-solid 120 Hz, optionally upscales a small source to fullscreen, and shows it either 1:1 over the source or in a fullscreen viewer. Verified on a base M4 at 4K 60→120 with every presented frame exactly one vsync apart (glass-time σ = 0.00).
 
 ## Requirements
 
-- macOS 26 (Tahoe) or later, Apple Silicon
-- Screen Recording permission (prompted on first run), Accessibility permission (window tracking)
+- Apple Silicon, macOS 26 (Tahoe) or later
+- **Screen Recording** + **Accessibility** permission (prompted on first run — Accessibility is for window tracking/resize)
 
 ## Usage
 
-1. Launch MacFG → pick a target window → **Capture**
-2. Output: **Cover Source** (overlays the original window — clicks pass through) or **Separate Window** (free-floating viewer)
-3. Engine:
-   - **Metal Flow** (recommended) — LSFG-style pure-GPU pipeline. Low-resolution motion field + full-resolution warp, so output keeps native sharpness. Arbitrary-phase interpolation aligned to the display's vsync grid: fills frame-drop gaps and adapts to any refresh rate (60fps→144Hz works). Runs on any Apple Silicon.
-   - **Apple FI** — VideoToolbox low-latency frame interpolation (ANE, fixed 720p, fixed 2×). Its neural flow may handle complex motion better. Set your refresh rate to an integer multiple of source fps × 2 (60fps→120Hz, 24fps→144Hz).
-4. Diagnostics: `/tmp/MacFG_diag.log` — `[SCHED]` lines; `glass σ` is the smoothness ground truth, `skip[...]` explains any interpolation skips.
+1. Set your options in the panel (they persist).
+2. **Focus** the window you want, and **press the capture shortcut** (default ⌃⌥⌘U, customizable). Press again to stop.
+3. Placement is automatic: **Upscale off** → a 1:1 overlay on the source (interpolation only); **Upscale on** → a fullscreen viewer on the source's screen.
+
+### Settings
+
+- **Engine** — *Metal Flow* (default): our GPU pipeline (pyramid optical flow + full-res warp), any multiplier, keeps native sharpness. *Apple FI*: Apple's ANE model, fixed 2× at 720p; set the display to fps × 2 (60→120, 24→144).
+- **Multiplier** — Auto, or ×2–×5 (capped at your display's refresh rate).
+- **Motion** / **Edges** sliders (Metal Flow) — taste, not quality. *Motion* sharp↔smooth (flow detail vs gentleness). *Edges* crisp↔soft (the ghosting-vs-judder trade at object boundaries; crisp for games, soft for film).
+- **Upscale** — Off / ANE (neural 2×, ≤960px source) / MetalFX / ANE+FX. **Sharpen (CAS)** restores crispness on stretched video.
+- **Source** — resize the source to a native resolution on capture (360–1080p short side) for a clean 1:1 grab. Ideal for browser Picture-in-Picture and IINA (both are chrome-free 16:9).
+
+## Install
+
+Download the `.dmg` from [Releases](https://github.com/NR2BJ/MacFG/releases). It's self-signed; on first launch right-click → **Open** once (or `xattr -dr com.apple.quarantine MacFG.app`).
 
 ## Build
 
 ```sh
 swift build                    # debug
-scripts/make_app.sh 1.0.0      # release .app + .dmg (in dist/)
+scripts/make_app.sh 1.0.5      # release .app + .dmg (in dist/)
 ```
 
-Builds are ad-hoc signed. On another Mac, right-click → Open once (or `xattr -dr com.apple.quarantine MacFG.app`).
+`make_app.sh` signs with a local **"MacFG Dev"** identity if present (so Screen Recording / Accessibility grants survive rebuilds), else ad-hoc.
 
 ## Architecture
 
-- `Sources/CaptureKit` — ScreenCaptureKit capture (frame queue, scattered-sample fingerprint dedup)
-- `Sources/FramePacing` — display link (bound to the output screen), frame slots
-- `Sources/Interpolation` — engines (`MetalFlowEngine`, `AppleFIEngine`, `PairEngine` protocol)
-- `Sources/Overlay` — overlay/viewer windows, window tracking, color policy (same-display passthrough for byte-exact color), shader-side rounded-corner masking
-- `Sources/MacFGApp` — timestamp output scheduler (cadence PLL, vsync-grid-aligned interpolation phases), UI
-- `Sources/TestPattern` — self-verification source (`--size W H --pos X Y --fps N`)
-- `research/rife` — RIFE CoreML spike (shelved alternative)
+- `Sources/CaptureKit` — ScreenCaptureKit capture (frame queue, fingerprint dedup, seamless resize)
+- `Sources/Interpolation` — engines (`MetalFlowEngine`, `AppleFIEngine`, `PairEngine` protocol) + `InterpBench` (deterministic PSNR/timing regression tool)
+- `Sources/Overlay` — overlay/viewer windows, `RenderSurface` (thread-agnostic encode), window tracking, same-display color passthrough, shader-side rounded corners
+- `Sources/MacFGApp` — `RenderDriver` (**dedicated render thread + CAMetalDisplayLink** — true 120 Hz), timestamp output scheduler (cadence snap, vsync-grid phases, adaptive latency), SwiftUI panel
+- `Sources/TestPattern` — self-verification source (`--fps N --jitter MS --complex`)
 
-## Known limitations
+## Notes & limitations
 
-- Scene-cut detection is luma-histogram based — flash/fade cuts may slip one 8ms morph frame through
-- DRM-protected content (Netflix, etc.) captures black (macOS restriction)
-- Apple FI is macOS 26-only and fixed at 720p (Apple-side session limit, measured)
-- Translucent title bars look flat in capture (SCK renders the window in isolation — inherent to window capture)
+- Interpolated 120 fps is inherently softer in motion than native 120 — a limit shared by all real-time interpolation. The Motion/Edges sliders tune *how* it degrades, not the ceiling; occlusion quality beyond hand-tuned flow needs a learned model (planned).
+- **DRM** content (Netflix etc.) captures black by design (macOS protected-frame path) — out of scope.
+- Apple FI is macOS 26-only and fixed at 720p / 2× (Apple-side session limits, measured).
+- HDR capture/display is not implemented yet (SDR pipeline).

@@ -1,56 +1,60 @@
 import SwiftUI
 import Overlay
 
-/// 설정 우선 화면 (Lossless Scaling 방식): 설정은 앱에서 미리, 시작은 포커스 창에 ⌃⌥⌘U.
-/// 특정(비포커스) 창 캡처는 하단 "Capture a specific window"로.
+/// 설정 우선 화면 (Lossless Scaling 방식): 설정은 앱에서 미리, 시작은 포커스 창에 단축키.
+/// 섹션 그룹 + 상세 설명은 컨트롤 `.help()` 툴팁(호버)으로 — 패널을 깔끔하게 유지.
 struct WindowPickerView: View {
     @Bindable var appState: AppState
+    @State private var showAdvanced = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    startStatusCard
-                    Divider()
-                    settingsControls
-                    if appState.isCapturing {
-                        statusGrid
-                    }
-                    Divider()
-                    shortcutsSection
-                }
-                .padding()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                statusCard
+                interpolationSection
+                upscalingSection
+                if appState.isCapturing { liveSection }
+                shortcutSection
             }
+            .padding(18)
         }
-        .frame(width: 420, height: 520)
+        .frame(width: 430, height: 540)
+        .background(.background)
     }
 
-    // MARK: - Header
+    // MARK: - Reusable section shell
 
-    private var header: some View {
-        HStack {
-            Text("MacFG").font(.title2).fontWeight(.bold)
-            Spacer()
-            if appState.isCapturing { statusBadge }
+    @ViewBuilder
+    private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(.secondary).textCase(.uppercase)
+                .tracking(0.5)
+            content()
         }
-        .padding()
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private var statusBadge: some View {
-        HStack(spacing: 4) {
-            Circle().fill(.green).frame(width: 8, height: 8)
-            Text("Active").font(.caption).foregroundStyle(.green)
+    /// 라벨 + 컨트롤 한 줄 (라벨 고정폭으로 정렬)
+    @ViewBuilder
+    private func row<Control: View>(_ label: String, help: String? = nil, @ViewBuilder _ control: () -> Control) -> some View {
+        HStack(spacing: 10) {
+            Text(label).frame(width: 74, alignment: .leading)
+            control()
         }
+        .help(help ?? "")
     }
 
-    // MARK: - Start / Status
+    // MARK: - Status hero
 
-    private var startStatusCard: some View {
+    private var statusCard: some View {
         Group {
             if appState.isCapturing {
-                HStack {
+                HStack(spacing: 10) {
+                    Circle().fill(.green).frame(width: 9, height: 9)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(appState.selectedWindowName).font(.headline).lineLimit(1)
                         Text("\(appState.captureMethod) · \(appState.interpolationEngine)")
@@ -58,161 +62,170 @@ struct WindowPickerView: View {
                     }
                     Spacer()
                     Button("Stop") { Task { await appState.stopCapture() } }
-                        .buttonStyle(.borderedProminent).tint(.red)
+                        .buttonStyle(.borderedProminent).tint(.red).controlSize(.large)
                 }
             } else {
-                HStack(spacing: 10) {
-                    Image(systemName: "viewfinder").font(.title2).foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Image(systemName: "viewfinder")
+                        .font(.system(size: 26)).foregroundStyle(.tint)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Focus a window, press \(appState.hotCapture.label.isEmpty ? "the shortcut" : appState.hotCapture.label)")
                             .font(.headline)
-                        Text("Settings below apply. Press again to stop.")
+                        Text("Set it up below · press again to stop")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
                 }
             }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(appState.isCapturing ? AnyShapeStyle(.green.opacity(0.12)) : AnyShapeStyle(.tint.opacity(0.10)),
+                    in: RoundedRectangle(cornerRadius: 12))
     }
 
-    // MARK: - Settings (항상 편집 가능)
+    // MARK: - Interpolation
 
-    private var settingsControls: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Toggle("Frame Interpolation", isOn: $appState.isInterpolationEnabled)
-                .toggleStyle(.switch)
+    private var interpolationSection: some View {
+        section("Interpolation") {
+            Toggle("Frame interpolation", isOn: $appState.isInterpolationEnabled)
                 .onChange(of: appState.isInterpolationEnabled) { appState.updateInterpolationEnabled() }
 
-            Picker("Engine", selection: $appState.selectedRenderMode) {
-                ForEach(RenderMode.userSelectable) { Text($0.displayName).tag($0) }
+            row("Engine", help: "Metal Flow: our GPU pipeline, any multiplier, keeps native sharpness. Apple FI: Apple's ANE model, fixed 2× at 720p — set the display to fps×2 (60→120, 24→144).") {
+                Picker("", selection: $appState.selectedRenderMode) {
+                    ForEach(RenderMode.userSelectable) { Text($0.displayName).tag($0) }
+                }
+                .labelsHidden().pickerStyle(.segmented)
+                .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
             }
-            .pickerStyle(.segmented)
-            .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
+
+            row("Multiplier", help: "Output = source fps × N, capped at your display refresh (60 ×3 = 180 needs 180Hz+; 120Hz shows 120). Auto fills every display slot.") {
+                Picker("", selection: $appState.frameMultiplier) {
+                    Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
+                }
+                .labelsHidden().pickerStyle(.segmented)
+                .onChange(of: appState.frameMultiplier) { appState.persistSettings() }
+            }
 
             if appState.selectedRenderMode == .metalFlow {
-                HStack(spacing: 8) {
-                    Text("Motion").font(.caption).foregroundStyle(.secondary)
-                    Text("sharp").font(.caption2).foregroundStyle(.secondary)
-                    Slider(value: $appState.motionSmoothness, in: 0...1)
-                        .onChange(of: appState.motionSmoothness) { appState.updateMotionSmoothness() }
-                    Text("smooth").font(.caption2).foregroundStyle(.secondary)
+                Divider().padding(.vertical, 2)
+                sliderRow("Motion", low: "sharp", high: "smooth", value: $appState.motionSmoothness,
+                          help: "Flow character. Sharp keeps motion detail (can shimmer); smooth is gentler/softer. Taste, not quality.") {
+                    appState.updateMotionSmoothness()
                 }
-                Text("Sharp = more motion detail (can shimmer); smooth = gentler, softer motion. Taste, not quality — applies instantly, slide while watching.")
-                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-
-                HStack(spacing: 8) {
-                    Text("Edges").font(.caption).foregroundStyle(.secondary)
-                    Text("crisp").font(.caption2).foregroundStyle(.secondary)
-                    Slider(value: $appState.boundarySoftness, in: 0...1)
-                        .onChange(of: appState.boundarySoftness) { appState.updateBoundarySoftness() }
-                    Text("soft").font(.caption2).foregroundStyle(.secondary)
+                sliderRow("Edges", low: "crisp", high: "soft", value: $appState.boundarySoftness,
+                          help: "Object-boundary handling. Crisp = less ghosting, slight judder (games/fast action); soft = smoother, slight ghosting (film/slow pans).") {
+                    appState.updateBoundarySoftness()
                 }
-                Text("Object-boundary handling. Crisp = less ghosting, slight judder (games, fast action); soft = smoother, slight ghosting (film, slow pans).")
-                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
 
-                Toggle("Occlusion warp (experimental)", isOn: $appState.occlusionDirectional)
-                    .toggleStyle(.switch)
-                    .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
-                Text("Directional warp at reveal/cover edges — try on fast motion. Applies instantly, so in Cover mode you can toggle while watching; in fullscreen, set it before capture and rewind to compare.")
-                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+                    Toggle("Occlusion warp (experimental)", isOn: $appState.occlusionDirectional)
+                        .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
+                        .help("Directional warp at reveal/cover edges. Off by default — helps some fast motion but can shimmer on repetitive patterns.")
+                        .padding(.top, 4)
+                }
+                .font(.callout)
             }
+        }
+    }
 
-            Picker("Multiplier", selection: $appState.frameMultiplier) {
-                Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: appState.frameMultiplier) { appState.persistSettings() }
-            if appState.frameMultiplier >= 3 {
-                Text("Capped at your display's refresh rate — 60fps ×3 = 180 needs a 180Hz+ display (120Hz shows 120).")
-                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-            }
+    /// low↔high 라벨이 붙은 슬라이더 한 줄
+    @ViewBuilder
+    private func sliderRow(_ label: String, low: String, high: String, value: Binding<Double>, help: String, _ onChange: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            Text(label).frame(width: 52, alignment: .leading)
+            Text(low).font(.caption2).foregroundStyle(.secondary)
+            Slider(value: value, in: 0...1).onChange(of: value.wrappedValue) { onChange() }
+            Text(high).font(.caption2).foregroundStyle(.secondary)
+        }
+        .help(help)
+    }
 
-            Picker("Source", selection: $appState.sourcePreset) {
-                Text("Off").tag(0); Text("360").tag(360); Text("480").tag(480)
-                Text("540").tag(540); Text("720").tag(720); Text("1080").tag(1080)
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: appState.sourcePreset) {
-                appState.persistSettings()
-                if appState.isCapturing && appState.sourcePreset != 0 {
-                    appState.resizeSourceToPreset(appState.sourcePreset)
+    // MARK: - Upscaling
+
+    private var upscalingSection: some View {
+        section("Upscaling & sharpness") {
+            row("Upscale", help: "Off: overlay sits 1:1 on the source (interpolation only). ANE/MetalFX/ANE+FX: show a fullscreen viewer that scales a small source up. ANE needs a ≤960px source.") {
+                Picker("", selection: $appState.upscaleMode) {
+                    ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
+                }
+                .labelsHidden().pickerStyle(.segmented)
+                .onChange(of: appState.upscaleMode) {
+                    appState.updateUpscale()
+                    appState.autoSelectPlacementForUpscale()
                 }
             }
-            if appState.sourcePreset != 0 {
-                Text("Resizes the source to this short side on capture (landscape: height, portrait: width). Set it here beforehand — the viewer covers this panel while capturing.")
-                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-            }
 
-            Picker("Upscale", selection: $appState.upscaleMode) {
-                ForEach(UpscaleMode.allCases) { Text($0.displayName).tag($0) }
+            row("Source", help: "Resize the source to this short side on capture (landscape: height, portrait: width) so it renders at native res for a clean 1:1 capture. Great for browser PiP / IINA.") {
+                Picker("", selection: $appState.sourcePreset) {
+                    Text("Off").tag(0); Text("360").tag(360); Text("480").tag(480)
+                    Text("540").tag(540); Text("720").tag(720); Text("1080").tag(1080)
+                }
+                .labelsHidden().pickerStyle(.segmented)
+                .onChange(of: appState.sourcePreset) {
+                    appState.persistSettings()
+                    if appState.isCapturing && appState.sourcePreset != 0 {
+                        appState.resizeSourceToPreset(appState.sourcePreset)
+                    }
+                }
             }
-            .pickerStyle(.segmented)
-            .onChange(of: appState.upscaleMode) {
-                appState.updateUpscale()
-                appState.autoSelectPlacementForUpscale()
-            }
-            Text(appState.upscaleMode == .off
-                 ? "Off: overlay sits on the source window (interpolation only)."
-                 : "Upscaling shows a separate maximized window (small source → big sharp output).")
-                .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
 
             Toggle("Sharpen (CAS)", isOn: $appState.casEnabled)
-                .toggleStyle(.switch)
                 .onChange(of: appState.casEnabled) { appState.updateUpscale() }
+                .help("Contrast-adaptive sharpening — restores crispness on stretched low-res video. Works even at 1:1.")
             if appState.casEnabled {
                 HStack(spacing: 8) {
-                    Text("Sharpness").font(.caption).foregroundStyle(.secondary)
+                    Text("Sharpness").frame(width: 74, alignment: .leading).foregroundStyle(.secondary)
                     Slider(value: $appState.sharpness, in: 0...1)
                         .onChange(of: appState.sharpness) { appState.updateUpscale() }
                     Text(String(format: "%.1f", appState.sharpness))
-                        .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                        .font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                        .frame(width: 26, alignment: .trailing)
                 }
-            }
-
-            if appState.isInterpolationEnabled && appState.selectedRenderMode == .appleFI {
-                Text("Apple FI is fixed 2× interpolation. Set the display to an integer multiple of source fps × 2 (60→120Hz, 24→144Hz).")
-                    .font(.caption2).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
-    // MARK: - During capture
+    // MARK: - Live stats (capturing)
 
-    // 값 텍스트는 고정 폭 — 자릿수 변화(99→100 등)가 그리드→창 오토레이아웃 연쇄를 일으켜
-    // 메인 스레드를 10-20ms 블록, vsync 콜백을 삼킴 (sample 실측: NSHostingView 레이아웃 재귀)
-    private var statusGrid: some View {
-        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
-            GridRow {
-                Text("FPS").foregroundStyle(.secondary)
-                Text(String(format: "%.0f → %.0f", appState.inputFPS, appState.outputFPS))
-                    .fontWeight(.medium).monospacedDigit()
-                    .frame(width: 110, alignment: .leading)
-            }
-            GridRow {
-                Text("Latency").foregroundStyle(.secondary)
-                Text(String(format: "%.0f ms", appState.latencyMs)).fontWeight(.medium).monospacedDigit()
-                    .frame(width: 110, alignment: .leading)
-            }
-            if let scale = appState.upscaleStatus {
+    // 값 텍스트는 고정 폭 — 자릿수 변화(99→100)가 창 오토레이아웃 연쇄를 일으켜 메인 스레드를
+    // 블록하던 것 방지 (렌더는 이제 전용 스레드지만 메인 부하는 여전히 줄이는 게 이득).
+    private var liveSection: some View {
+        section("Live") {
+            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
                 GridRow {
-                    Text("Scale").foregroundStyle(.secondary)
-                    Text(scale).font(.caption).lineLimit(1)
-                        .frame(width: 240, alignment: .leading)
+                    Label("FPS", systemImage: "speedometer").foregroundStyle(.secondary).gridColumnAlignment(.leading)
+                    Text(String(format: "%.0f → %.0f", appState.inputFPS, appState.outputFPS))
+                        .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
+                }
+                GridRow {
+                    Label("Latency", systemImage: "timer").foregroundStyle(.secondary)
+                    Text(String(format: "%.0f ms", appState.latencyMs))
+                        .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
+                }
+                if let scale = appState.upscaleStatus {
+                    GridRow {
+                        Label("Scale", systemImage: "arrow.up.left.and.arrow.down.right").foregroundStyle(.secondary)
+                        Text(scale).font(.caption).lineLimit(1).frame(width: 240, alignment: .leading)
+                    }
                 }
             }
+            .font(.callout)
         }
-        .font(.callout)
     }
 
-    // MARK: - Shortcut (커스터마이징 — 캡처 토글 하나)
+    // MARK: - Shortcut
 
-    private var shortcutsSection: some View {
-        HStack {
-            Text("Capture shortcut").font(.caption).foregroundStyle(.secondary)
-            Spacer()
-            ShortcutRecorder(binding: $appState.hotCapture)
-                .frame(width: 96, height: 22)
-                .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
+    private var shortcutSection: some View {
+        section("Shortcut") {
+            HStack {
+                Text("Capture toggle").foregroundStyle(.secondary)
+                Spacer()
+                ShortcutRecorder(binding: $appState.hotCapture)
+                    .frame(width: 96, height: 22)
+                    .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
+            }
+            .help("Focus any window and press this to start/stop capture. Click the field to record a new combo.")
         }
     }
 }

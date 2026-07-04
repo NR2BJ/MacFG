@@ -158,14 +158,18 @@ public final class OverlayWindow: NSObject {
     private let logger = Logger(subsystem: "com.macfg", category: "OverlayWindow")
     private var appliedColorSpace: CGColorSpace?
     private var colorSpaceInitialized = false
-    private var upscaler: MetalFXUpscaler?
-    private var neuralUpscaler: NeuralUpscaler?
+    /// 스레드 무관 렌더 표면 — 인코딩 경로 전부 (A2: 렌더 스레드가 직접 사용)
+    public private(set) var surface: RenderSurface!
     /// 업스케일 방식 (뷰어에서 출력>소스일 때). off면 이중선형.
-    public var upscaleMode: UpscaleMode = .off
+    public var upscaleMode: UpscaleMode = .off {
+        didSet { surface?.update { $0.upscaleMode = upscaleMode } }
+    }
     /// CAS 샤프닝 강도 0~1 (0=끔 — 패스스루 바이트 보존 경로 유지). Cover 1:1에서도 유효.
-    public var sharpness: Float = 0
+    public var sharpness: Float = 0 {
+        didSet { surface?.update { $0.sharpness = sharpness } }
+    }
     /// 업스케일/샤픈 실동작 상태 (UI 표시용) — nil = 전부 off
-    public private(set) var scaleStatus: String?
+    public var scaleStatus: String? { surface?.scaleStatus }
 
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
     public var onUserClose: (() -> Void)?
@@ -255,8 +259,17 @@ public final class OverlayWindow: NSObject {
         self.metalLayer = metalLayer
         super.init()
 
-        self.upscaler = MetalFXUpscaler(device: device)
-        self.neuralUpscaler = NeuralUpscaler(device: device)
+        self.surface = RenderSurface(
+            device: device, metalLayer: metalLayer,
+            pipelineState: ps, sampler: s,
+            params: RenderSurface.Params(
+                isViewer: style == .viewer,
+                sharpness: 0, upscaleMode: .off,
+                contentBounds: CGRect(origin: .zero, size: window.frame.size),
+                contentsScale: NSScreen.main?.backingScaleFactor ?? 2.0,
+                cornerRadiusPt: OverlayStyleConstants.cornerRadius
+            )
+        )
 
         if style == .viewer {
             window.delegate = self
@@ -294,113 +307,19 @@ public final class OverlayWindow: NSObject {
         window.alphaValue = enabled ? 0.999 : 1.0
     }
 
-    /// 텍스처를 외부 commandBuffer에 렌더 인코딩.
-    /// drawable를 반환 — 호출자가 present + commit 담당.
+    /// 텍스처를 외부 commandBuffer에 렌더 인코딩. drawable 반환 — 호출자가 present + commit.
+    /// (실제 인코딩은 RenderSurface — 스레드 무관. 여기는 하위호환 위임)
     public func encodeRender(texture: any MTLTexture, into commandBuffer: any MTLCommandBuffer) -> (any CAMetalDrawable)? {
-        if style == .viewer {
-            layoutViewerLayer(textureWidth: texture.width, textureHeight: texture.height)
-        }
-
-        // 업스케일: 뷰어에서 표시 목표(레터박스 영역 × 배율)가 소스보다 크면 MetalFX Spatial로
-        // 선명하게 올린다 (off이거나 실패하면 이중선형 스케일로 폴백 = 아래 그대로).
-        var source = texture
-        if upscaleMode != .off || sharpness > 0.01 {
-            var chain: [String] = []
-            // 업스케일은 뷰어에서 출력>소스일 때만 (Cover는 1:1). 모드별로 ANE/MetalFX 선택.
-            if style == .viewer, upscaleMode != .off {
-                let targetW = Int((metalLayer.frame.width * metalLayer.contentsScale).rounded())
-                let targetH = Int((metalLayer.frame.height * metalLayer.contentsScale).rounded())
-                if targetW > texture.width || targetH > texture.height {
-                    var cur = source
-                    // 1) ANE 신경망 2x (모드가 ane/aneMetalfx이고 소스 ≤960)
-                    if upscaleMode == .ane || upscaleMode == .aneMetalfx,
-                       texture.width <= NeuralUpscaler.maxInput, texture.height <= NeuralUpscaler.maxInput,
-                       let n = neuralUpscaler?.upscale(texture, into: commandBuffer) {
-                        cur = n
-                        chain.append("ANE→\(n.width)×\(n.height)")
-                    }
-                    // 2) MetalFX로 목표까지 (모드가 metalfx/aneMetalfx이고 아직 작으면)
-                    if upscaleMode == .metalfx || upscaleMode == .aneMetalfx,
-                       targetW > cur.width || targetH > cur.height,
-                       let m = upscaler?.upscale(cur, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
-                        cur = m
-                        chain.append("MetalFX→\(targetW)×\(targetH)")
-                    }
-                    source = cur
-                }
-            }
-            if chain.isEmpty { chain.append(style == .viewer ? "1:1" : "1:1 cover") }
-            // CAS는 스케일과 무관하게 최종 블릿에서 적용 (Cover 포함) — 늘어난 저해상도 영상 복원
-            chain.append(sharpness > 0.01 ? String(format: "sharpen %.1f", sharpness) : "sharpen off")
-            scaleStatus = chain.joined(separator: " · ")
-        } else {
-            scaleStatus = nil
-        }
-
-        let texW = CGFloat(source.width)
-        let texH = CGFloat(source.height)
-        if metalLayer.drawableSize.width != texW || metalLayer.drawableSize.height != texH {
-            metalLayer.drawableSize = CGSize(width: texW, height: texH)
-        }
-
-        guard let drawable = metalLayer.nextDrawable() else { return nil }
-
-        let renderPassDesc = MTLRenderPassDescriptor()
-        renderPassDesc.colorAttachments[0].texture = drawable.texture
-        renderPassDesc.colorAttachments[0].loadAction = .dontCare
-        renderPassDesc.colorAttachments[0].storeAction = .store
-
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return nil }
-
-        encoder.setRenderPipelineState(pipelineState)
-        encoder.setFragmentTexture(source, index: 0)
-        encoder.setFragmentSamplerState(sampler, index: 0)
-        // 모서리 마스킹: overlay 스타일만 (viewer는 레터박스 배경이 검정이라 불필요)
-        var params = BlitParams(
-            size: SIMD2<Float>(Float(texW), Float(texH)),
-            radiusPx: style == .overlay ? Float(OverlayStyleConstants.cornerRadius * metalLayer.contentsScale) : 0,
-            sharpness: sharpness
-        )
-        encoder.setFragmentBytes(&params, length: MemoryLayout<BlitParams>.stride, index: 0)
-        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        encoder.endEncoding()
-
-        return drawable
+        surface.encode(texture: texture, into: commandBuffer)
     }
 
-    private struct BlitParams {
-        var size: SIMD2<Float>
-        var radiusPx: Float
-        var sharpness: Float
-    }
-
-    /// 뷰어: contentView 안에서 텍스처 종횡비 유지 레터박스 배치
-    private func layoutViewerLayer(textureWidth: Int, textureHeight: Int) {
-        guard let contentView = window.contentView, textureWidth > 0, textureHeight > 0 else { return }
-        let bounds = contentView.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
-
-        let aspect = CGFloat(textureWidth) / CGFloat(textureHeight)
-        var fitW = bounds.width
-        var fitH = fitW / aspect
-        if fitH > bounds.height {
-            fitH = bounds.height
-            fitW = fitH * aspect
-        }
-        let fit = CGRect(
-            x: (bounds.width - fitW) / 2,
-            y: (bounds.height - fitH) / 2,
-            width: fitW,
-            height: fitH
-        )
-        if metalLayer.frame != fit {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            metalLayer.frame = fit
-            CATransaction.commit()
-        }
-        if let scale = window.screen?.backingScaleFactor, metalLayer.contentsScale != scale {
-            metalLayer.contentsScale = scale
+    /// 창 기하/화면 변경을 surface 캐시에 반영 (메인) — 뷰어 레터박스 기준/배율
+    public func refreshSurfaceParams() {
+        let bounds = window.contentView?.bounds ?? CGRect(origin: .zero, size: window.frame.size)
+        let scale = window.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        surface.update {
+            $0.contentBounds = bounds
+            $0.contentsScale = scale
         }
     }
 
@@ -413,12 +332,14 @@ public final class OverlayWindow: NSObject {
         if let screen = window.screen {
             metalLayer.contentsScale = screen.backingScaleFactor
         }
+        refreshSurfaceParams()
     }
 
     /// 뷰어 초기 위치/크기 (1회)
     public func setInitialViewerFrame(_ frame: CGRect) {
         guard style == .viewer else { return }
         window.setFrame(frame, display: true)
+        refreshSurfaceParams()
     }
 
     /// 창을 확실히 닫는다 (정지 시). 전체화면 상태면 먼저 빠져나와 검정 Space 잔존 방지.

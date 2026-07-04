@@ -170,9 +170,10 @@ public final class OverlayManager {
         let same = sourceScreen == nil || overlayScreen == nil || sourceScreen == overlayScreen
         overlayWindow.setColorSpace(captureColorSpace, sameDisplayAsSource: same)
 
-        // 출력 화면이 바뀌면 페이싱도 그 화면 vsync로 재바인딩 필요
+        // 출력 화면이 바뀌면 페이싱도 그 화면 vsync로 재바인딩 필요 + 렌더 표면 배율 갱신
         if overlayScreen !== lastOutputScreen {
             lastOutputScreen = overlayScreen
+            overlayWindow.refreshSurfaceParams()
             onOutputScreenChanged?(overlayScreen)
         }
     }

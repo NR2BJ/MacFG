@@ -21,6 +21,8 @@ struct BenchConfig {
     var flowBase: Double? = nil
     var occDirectional = false
     var smoothness: Float? = nil
+    var pairDir: String? = nil      // 품질 A/B: 삼중항 디렉터리
+    var pairEngine: String = "metalflow"
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -34,6 +36,8 @@ struct BenchConfig {
             case "--flow-base": if let v = args.popFirst() { config.flowBase = Double(v) }
             case "--occ-dir": config.occDirectional = true
             case "--smoothness": if let v = args.popFirst() { config.smoothness = Float(v) }
+            case "--pair-dir": if let v = args.popFirst() { config.pairDir = v }
+            case "--engine": if let v = args.popFirst() { config.pairEngine = v }
             default: break
             }
         }
@@ -301,6 +305,13 @@ func main() async {
     }
     guard let commandQueue = device.makeCommandQueue() else {
         print("❌ Cannot create command queue"); return
+    }
+
+    // 품질 A/B 페어모드: 삼중항 디렉터리 처리 후 종료
+    if let pairDir = config.pairDir {
+        if let sm = config.smoothness { MetalFlowEngine.motionSmoothness = sm }
+        await runPairMode(engineKey: config.pairEngine, dir: pairDir, device: device, queue: commandQueue)
+        return
     }
 
     print("╔══════════════════════════════════════════════════════════════╗")

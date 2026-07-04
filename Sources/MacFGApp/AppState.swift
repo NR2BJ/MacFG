@@ -630,6 +630,7 @@ public final class AppState {
         guard diagTick - lastPaceAdjustTick >= 240 else { return }
         lastPaceAdjustTick = diagTick
         defer { paceMissCount = 0 }
+        if adaptDisabled { extraLatencySlots = 0; return }      // A/B: 적응 지연 완전 차단
         guard diagTick >= paceWarmupUntilTick else { return }   // 과도기 miss 폐기
         if paceMissCount >= 4 {
             paceCleanWindows = 0
@@ -686,6 +687,10 @@ public final class AppState {
     private var diagPrevTickCPU: Double = 0
     private var diagTickGaps = 0
     private var diagGapPrevCPUMax: Double = 0
+    // 콘텐츠-시간 간격 (표시 프레임 간 콘텐츠 진행량 ms) — 균일성이 wobble의 직접 지표
+    private var diagContentIntervals: [Double] = []
+    // 적응형 지연 A/B용 (MACFG_NO_ADAPT=1이면 extraLatencySlots 0 고정 — 회귀 판별)
+    private let adaptDisabled = ProcessInfo.processInfo.environment["MACFG_NO_ADAPT"] != nil
 
     // MARK: - Render Loop
 
@@ -1028,6 +1033,13 @@ public final class AppState {
             return
         }
 
+        // "왔다갔다"의 진짜 지표: 연속 표시 프레임의 콘텐츠-시간 간격 불균일.
+        // 균일 모션이면 매 표시가 콘텐츠를 ~동일량 전진(60→120이면 ~8.3ms). 이게 출렁이면 wobble.
+        // (glass σ는 표시 시각만 봐서 이 문제를 못 잡음 — 표시는 균등한데 콘텐츠가 출렁일 수 있음)
+        if lastPresentedTimestamp > 0 {
+            let cd = (entry.timestamp - lastPresentedTimestamp) * 1000.0
+            if cd > 0 && cd < 100 { diagContentIntervals.append(cd) }
+        }
         lastPresentedTimestamp = entry.timestamp
         lastPresentedTexture = entry.texture
         diagPresentCount += 1
@@ -1152,6 +1164,12 @@ public final class AppState {
         let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f)", tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
+        // 콘텐츠 간격 통계 (wobble 지표)
+        let ci = diagContentIntervals
+        let ciAvg = ci.isEmpty ? 0 : ci.reduce(0, +) / Double(ci.count)
+        let ciVar = ci.isEmpty ? 0 : ci.map { ($0 - ciAvg) * ($0 - ciAvg) }.reduce(0, +) / Double(ci.count)
+        let ciStats = String(format: "content=%.1f±%.1fms", ciAvg, sqrt(ciVar))
+        diagContentIntervals = []
 
         let workLats = mailbox.drainWorkLatencies()
         let avgWork = workLats.isEmpty ? 0 : workLats.reduce(0, +) / Double(workLats.count)
@@ -1192,7 +1210,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
         diagResyncCount = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0

@@ -46,7 +46,8 @@ public final class IOSurfaceCapture: FrameSource, @unchecked Sendable {
 
     public init() {}
 
-    public func startCapture(windowID: CGWindowID, device: any MTLDevice) async throws {
+    public func startCapture(windowID: CGWindowID, device: any MTLDevice, captureRect: CGRect? = nil) async throws {
+        // captureRect(영역 캡처)는 SCK 전용 — IOSurface 폴백은 전체 창만 지원(무시)
         self.device = device
         self.windowID = windowID
 

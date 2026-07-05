@@ -10,8 +10,8 @@ public enum CaptureMethod: String, Sendable {
 
 /// 프레임 캡처 프로토콜
 public protocol FrameSource: AnyObject, Sendable {
-    /// 캡처 시작. 창 ID 지정.
-    func startCapture(windowID: CGWindowID, device: any MTLDevice) async throws
+    /// 캡처 시작. 창 ID 지정. captureRect(창 상대 pt)면 그 영역만 크롭 캡처(SCK 전용, nil=전체).
+    func startCapture(windowID: CGWindowID, device: any MTLDevice, captureRect: CGRect?) async throws
     /// 캡처 중지
     func stopCapture() async
     /// 최신 프레임 가져오기

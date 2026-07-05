@@ -164,6 +164,9 @@ public final class AppState {
     /// present 전용 큐 (틱당 ~0.3ms 렌더패스만)
     @ObservationIgnored nonisolated(unsafe) private var presentQueue: (any MTLCommandQueue)?
     private let captureManager = CaptureManager()
+    /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
+    /// 설정되면 resize-reconfigure를 끈다(영역이 창-리사이즈 재구성으로 날아가지 않게).
+    @ObservationIgnored nonisolated(unsafe) var captureRegion: CGRect?
     private var overlayManager: OverlayManager?
     private let performanceMonitor = PerformanceMonitor()
     @ObservationIgnored nonisolated(unsafe) private var pairEngine: (any PairInterpolationEngine)?
@@ -412,6 +415,14 @@ public final class AppState {
             selectedOverlayPlacement = (v == "viewer" || v == "beside") ? .viewerWindow : .coverSource
         }
         if args.contains("--upscale") { upscaleMode = .aneMetalfx }
+        // 영역 캡처 테스트: --capture-rect x,y,w,h (소스 창 상대 pt)
+        if let rIdx = args.firstIndex(of: "--capture-rect"), rIdx + 1 < args.count {
+            let parts = args[rIdx + 1].split(separator: ",").compactMap { Double($0) }
+            if parts.count == 4 {
+                captureRegion = CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+                DiagnosticLog.shared.log("[AUTO] captureRegion=\(captureRegion!)")
+            }
+        }
         if let uIdx = args.firstIndex(of: "--upscale-mode"), uIdx + 1 < args.count,
            let m = UpscaleMode(rawValue: args[uIdx + 1]) {
             upscaleMode = m
@@ -468,7 +479,7 @@ public final class AppState {
         }
 
         do {
-            try await captureManager.startCapture(windowID: windowID, device: device)
+            try await captureManager.startCapture(windowID: windowID, device: device, captureRect: captureRegion)
             captureMethod = captureManager.activeMethod.rawValue
 
             overlayManager?.setPlacement(selectedOverlayPlacement)
@@ -509,7 +520,7 @@ public final class AppState {
                     let nowT = CFAbsoluteTimeGetCurrent()
                     if nowT - self.lastResizeCheck >= 0.5 {
                         self.lastResizeCheck = nowT
-                        if !self.isRestartingCapture, self.stablePoolWidth > 0,
+                        if !self.isRestartingCapture, self.captureRegion == nil, self.stablePoolWidth > 0,
                            let src = self.overlayManager?.sourcePixelSize {
                             let mismatch = abs(src.width - self.stablePoolWidth) > 8 || abs(src.height - self.stablePoolHeight) > 8
                             if mismatch {
@@ -539,8 +550,8 @@ public final class AppState {
             logger.info("Capture started: \(self.captureMethod) + \(self.trackingMethod)")
             DiagnosticLog.shared.log("Capture started: \(captureMethod) + \(trackingMethod) mode=\(selectedRenderMode.rawValue)")
 
-            // 미리 정한 소스 해상도 프리셋 적용 (추적/AX 준비 후)
-            if sourcePreset != 0 {
+            // 미리 정한 소스 해상도 프리셋 적용 (추적/AX 준비 후). 영역 캡처 시엔 무의미 → 스킵.
+            if sourcePreset != 0, captureRegion == nil {
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(500))
                     if isCapturing { resizeSourceToPreset(sourcePreset) }
@@ -609,7 +620,7 @@ public final class AppState {
         DiagnosticLog.shared.log("[CAPTURE] stream restart: \(reason)")
         await captureManager.stopCapture()
         do {
-            try await captureManager.startCapture(windowID: windowID, device: device)
+            try await captureManager.startCapture(windowID: windowID, device: device, captureRect: captureRegion)
             pendingShowReset = true
         } catch {
             DiagnosticLog.shared.log("[CAPTURE] stream restart FAILED: \(error) → 캡처 종료")

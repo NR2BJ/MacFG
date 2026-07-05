@@ -22,11 +22,11 @@ public final class CaptureManager: Sendable {
 
     /// 캡처 시작. SCK 우선, 실패 시 IOSurface 폴백.
     /// SCK는 frame status/fingerprint를 제공해 frame generation 타임라인이 더 안정적이다.
-    public func startCapture(windowID: CGWindowID, device: any MTLDevice) async throws {
-        // ScreenCaptureKit 먼저 시도
+    public func startCapture(windowID: CGWindowID, device: any MTLDevice, captureRect: CGRect? = nil) async throws {
+        // ScreenCaptureKit 먼저 시도 (영역 캡처는 SCK 전용)
         do {
             sckCapture.onStreamStopped = onStreamStopped
-            try await sckCapture.startCapture(windowID: windowID, device: device)
+            try await sckCapture.startCapture(windowID: windowID, device: device, captureRect: captureRect)
             activeSource = sckCapture
             _activeMethod = .screenCaptureKit
             logger.info("Using ScreenCaptureKit capture")
@@ -35,9 +35,9 @@ public final class CaptureManager: Sendable {
             logger.info("ScreenCaptureKit failed, falling back to IOSurface: \(error)")
         }
 
-        // IOSurface 폴백
+        // IOSurface 폴백 (영역 캡처 미지원 — 전체 창)
         do {
-            try await ioSurfaceCapture.startCapture(windowID: windowID, device: device)
+            try await ioSurfaceCapture.startCapture(windowID: windowID, device: device, captureRect: nil)
             activeSource = ioSurfaceCapture
             _activeMethod = .ioSurface
             logger.info("Using IOSurface capture")

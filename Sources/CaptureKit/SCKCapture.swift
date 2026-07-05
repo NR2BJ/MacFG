@@ -30,6 +30,10 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     private var capturing = false
     private let lock = NSLock()
 
+    /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
+    private var captureRect: CGRect?
+    private var captureScale: CGFloat = 2.0
+
     public var isAvailable: Bool { true }
 
     /// 대상 창 닫힘 등으로 스트림이 비정상 중단됐을 때 (즉시). 우리가 stopCapture하면 호출 안 됨.
@@ -37,8 +41,9 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
 
     public init() {}
 
-    public func startCapture(windowID: CGWindowID, device: any MTLDevice) async throws {
+    public func startCapture(windowID: CGWindowID, device: any MTLDevice, captureRect: CGRect? = nil) async throws {
         self.device = device
+        self.captureRect = captureRect
 
         // 캡처 가능한 창 목록에서 대상 찾기
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -50,10 +55,13 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
 
         // 대상 창이 있는 화면의 배율을 찾아서 적용 (외부 1x ↔ MacBook 2x)
         let scaleFactor = Self.findScaleFactor(for: window.frame)
-        let w = window.frame.width > 0 ? Int(window.frame.width * scaleFactor) : 1920
-        let h = window.frame.height > 0 ? Int(window.frame.height * scaleFactor) : 1080
-        let config = Self.makeConfig(width: w, height: h)
-        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) → config \(w)x\(h)")
+        self.captureScale = scaleFactor
+        // 영역 캡처: sourceRect로 크롭 + 출력은 영역 픽셀 크기. nil이면 창 전체.
+        let regionPt = captureRect ?? CGRect(origin: .zero, size: window.frame.size)
+        let w = regionPt.width > 0 ? Int(regionPt.width * scaleFactor) : 1920
+        let h = regionPt.height > 0 ? Int(regionPt.height * scaleFactor) : 1080
+        let config = Self.makeConfig(width: w, height: h, sourceRect: captureRect)
+        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) region=\(captureRect.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" } ?? "full") → config \(w)x\(h)")
 
         let handler = StreamOutputHandler(device: device) { [weak self] slot in
             guard let self else { return }
@@ -87,10 +95,12 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     }
 
     /// 공용 스트림 설정 — startCapture와 updateConfiguration이 공유
-    private static func makeConfig(width: Int, height: Int) -> SCStreamConfiguration {
+    private static func makeConfig(width: Int, height: Int, sourceRect: CGRect? = nil) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.width = max(width, 2)
         config.height = max(height, 2)
+        // 영역 캡처: 소스 창 좌상단 기준 크롭 (pt). 지정 시 영상 영역만 잘라 캡처.
+        if let sourceRect { config.sourceRect = sourceRect }
         config.captureResolution = .best
         config.pixelFormat = kCVPixelFormatType_32BGRA
         // 1/60 게이트는 콘텐츠 60fps와 위상이 어긋나면 맥놀이로 프레임을 걸러냄 (실측 57-58fps 구멍).
@@ -106,9 +116,10 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     /// 전체 stop→start 재시작이 유발하는 수 초 붕괴(프레임 갭 + 재워밍업)를 없앤다.
     public func updateConfiguration(width: Int, height: Int) async throws {
         guard let stream else { throw CaptureError.notCapturing }
-        try await stream.updateConfiguration(Self.makeConfig(width: width, height: height))
+        // 영역 캡처 중이면 sourceRect 유지 (창 리사이즈 재구성이 크롭을 날리지 않게)
+        try await stream.updateConfiguration(Self.makeConfig(width: width, height: height, sourceRect: captureRect))
         logger.info("SCK config updated → \(width)x\(height)")
-        DiagnosticLog.shared.log("[SCK-CFG] reconfigure → \(width)x\(height)")
+        DiagnosticLog.shared.log("[SCK-CFG] reconfigure → \(width)x\(height)\(captureRect != nil ? " (region)" : "")")
     }
 
     public func stopCapture() async {

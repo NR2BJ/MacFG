@@ -542,9 +542,12 @@ public final class AppState {
             overlayUserHidden = false
             overlayHiddenState = false
             isCapturing = true
-            // coverSource: 소스 앱을 최전면으로 → 오버레이 즉시 표시.
-            // (Capture 클릭 시점엔 MacFG가 최전면이므로 활성화해줘야 자동숨김 기준이 성립)
-            if selectedOverlayPlacement == .coverSource, sourceOwnerPID != 0 {
+            // 소스 앱을 최전면으로 활성화 — cover/viewer 공통.
+            // 첫 캡처는 보통 MacFG 창이 최전면인 상태(옵션 설정 후 핫키/버튼)라, 소스(브라우저)가
+            // 백그라운드로 밀려 렌더 품질이 떨어진다(브라우저 백그라운드 스로틀 — 첫 캡처만 저화질,
+            // 정지 후 브라우저가 최전면 복귀해 2번째부턴 정상이던 증상의 원인). 소스를 활성 앱으로
+            // 되돌리면 오버레이(floating/shielding 레벨)는 여전히 위에 뜨면서 소스는 풀품질 렌더.
+            if sourceOwnerPID != 0 {
                 NSRunningApplication(processIdentifier: sourceOwnerPID)?.activate()
             }
             logger.info("Capture started: \(self.captureMethod) + \(self.trackingMethod)")

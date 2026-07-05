@@ -227,6 +227,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         view.startRendering()
 
+        // 오클루전 상태 변화 로깅 (MacFG 뷰어가 덮었을 때 .visible 유지되는지 검증)
+        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak window] _ in
+            let vis = window?.occlusionState.contains(.visible) ?? false
+            NSLog("[TP-OCC] occlusionState.visible=\(vis)")
+        }
+        NSLog("[TP-OCC] initial visible=\(window.occlusionState.contains(.visible))")
+
         // 자체 검증용: N초 후 전체화면/최대화 전환 (보간 유지 테스트)
         if let i = args.firstIndex(of: "--fullscreen-after"), i + 1 < args.count, let sec = Double(args[i + 1]) {
             DispatchQueue.main.asyncAfter(deadline: .now() + sec) { [weak window] in

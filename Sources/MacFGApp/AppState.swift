@@ -785,10 +785,13 @@ public final class AppState {
     /// 최근 윈도 내 miss (staleDrop + 이미 기한 지난 도착)
     @ObservationIgnored nonisolated(unsafe) private var paceMissCount = 0
     @ObservationIgnored nonisolated(unsafe) private var paceCleanWindows = 0
+    /// work(캡처→타임라인 등재) 지연 p90 [ms] — 적응 지연의 실측 하한 근거
+    @ObservationIgnored nonisolated(unsafe) private var paceWorkP90: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPaceAdjustTick = 0
     /// 이 틱까지는 miss 무시 — 캡처 시작/리셋 직후 케이던스 락 과도기의 miss로
     /// 깨끗한 소스까지 +4 램프되는 것 방지 (무지터 소스 e2e 57→91ms 낭비 실측)
     @ObservationIgnored nonisolated(unsafe) private var paceWarmupUntilTick = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagStaleSampleCount = 0
 
     /// ~2초마다: miss ≥4면 지연 +1슬롯 (최대 4), 3윈도(~6s) 연속 0이면 -1슬롯 회수.
     nonisolated private func adaptPacing() {
@@ -800,6 +803,22 @@ public final class AppState {
         // (램프하면 저지연 오프셋을 도로 상쇄해 텍스트 드래그가 다시 밀림, 실측 lat=+3).
         if !mirrorInterpolationEnabled { extraLatencySlots = 0; return }
         guard diagTick >= paceWarmupUntilTick else { return }   // 과도기 miss 폐기
+        // 실측 work p90 기반 **하한** — 오프셋이 파이프라인 지연보다 얇으면 miss가 구조적으로
+        // 반복되고, AIMD가 램프↔감쇠(6s 무결 -1 → 재miss → +1)를 오가며 표시 타깃이 슬롯
+        // 단위로 출렁였다(톱니 = content wobble 기여, lat=+2→+3→+4 실측). 필요 슬롯을 직접
+        // 계산해 즉시 올리고, 감쇠는 이 하한 아래로 내려가지 못하게 앵커한다.
+        let refresh = max(mirrorRefreshRate, 60)
+        let slotMs = 1000.0 / refresh
+        let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
+        let baseMs = (interval * 1.25 + 0.004 + 0.5 / refresh) * 1000.0
+        let requiredExtra = paceWorkP90 > 0
+            ? min(4.0, max(0.0, ((paceWorkP90 + 2.0 - baseMs) / slotMs).rounded(.up)))
+            : 0.0
+        if extraLatencySlots < requiredExtra {
+            extraLatencySlots = requiredExtra
+            paceCleanWindows = 0
+            DiagnosticLog.shared.log("[PACE] work p90=\(String(format: "%.0f", paceWorkP90))ms → 지연 하한 \(Int(requiredExtra))슬롯")
+        }
         if paceMissCount >= 4 {
             paceCleanWindows = 0
             if extraLatencySlots < 4 {
@@ -808,10 +827,10 @@ public final class AppState {
             }
         } else if paceMissCount == 0 {
             paceCleanWindows += 1
-            if paceCleanWindows >= 3, extraLatencySlots > 0 {
+            if paceCleanWindows >= 3, extraLatencySlots > requiredExtra {
                 extraLatencySlots -= 1
                 paceCleanWindows = 0
-                DiagnosticLog.shared.log("[PACE] 6s 무결 → 지연 -1슬롯 (extra=\(Int(extraLatencySlots)))")
+                DiagnosticLog.shared.log("[PACE] 6s 무결 → 지연 -1슬롯 (extra=\(Int(extraLatencySlots)), 하한=\(Int(requiredExtra)))")
             }
         } else {
             paceCleanWindows = 0
@@ -994,11 +1013,18 @@ public final class AppState {
         let staleCutoff = target - interval * (timeline.count >= 6 + Int(extraLatencySlots) ? 1.2 : 2.5)
         let candidates = timeline.filter { $0.timestamp > lastPresentedTimestamp && $0.timestamp <= target + 0.002 }
         var pick = candidates.first
-        // 따라잡기는 틱당 최대 1장만 건너뜀 — 여러 장을 한 번에 버리면 눈에 보이는 점프
+        // 따라잡기는 틱당 최대 1장만 건너뜀 — 여러 장을 한 번에 버리면 눈에 보이는 점프.
+        // 주의: staleDrop을 paceMiss로 세지 않는다 — 이 드롭은 큐 잉여 트림이라 지연을 늘려도
+        // 안 사라지고(lat=+4에서도 지속 실측), miss로 세면 감쇠가 영영 막혀 e2e만 부푼다
+        // (73→101ms 실측). 지연 부족(지각 도착)은 drain의 lateBar가 따로 센다.
         if let current = pick, current.timestamp < staleCutoff, candidates.count > 1 {
             pick = candidates[1]
             diagStaleDropCount += 1
-            paceMissCount += 1
+            if diagStaleSampleCount < 4 {   // [진단] 드롭 원인 규명용 샘플
+                diagStaleSampleCount += 1
+                let ageMs = (target - current.timestamp) * 1000
+                DiagnosticLog.shared.log("[STALE] age=\(String(format: "%.1f", ageMs))ms cutoff=\(String(format: "%.1f", (target - staleCutoff) * 1000))ms tl=\(timeline.count) cand=\(candidates.count) interp=\(current.isInterpolated)")
+            }
         }
         if let pick {
             presentEntry(pick, at: targetTimestamp, drawable: drawable)
@@ -1106,7 +1132,19 @@ public final class AppState {
                         // 스냅도 개선 없음 실측 (소스 프레임이 소스 그리드에 있어 혼합 케이던스)
                         tValues = (1...count).map { Float($0) / Float(count + 1) }
                     }
+                } else if gap / displayInterval > 1.5,
+                          abs(gap / displayInterval - (gap / displayInterval).rounded()) < 0.12,
+                          (gap / displayInterval).rounded() <= 9 {
+                    // **정수 배율(스냅된 gap = 표시 슬롯의 정수배: 60→120=2, 30→120=4, 24→120=5)**
+                    // 은 소스 그리드 균등분할 — 원본(S)은 소스 케이던스 그리드, 보간(I)은 vsync
+                    // 그리드에 놓으면 두 클럭이 드리프트하며 표시 간격이 (슬롯±δ)로 교대해
+                    // content wobble ±4ms를 만든다(실측 ±3.7). 균등분할이면 S·I 모두 소스 그리드
+                    // 위 정확히 등간격 → 혼합 그리드 wobble 원천 소멸.
+                    let n = Int((gap / displayInterval).rounded())
+                    tValues = (1..<n).map { Float($0) / Float(n) }
                 } else if lastVsyncTarget > 0 {
+                    // 비정수 조합(60→144 = 쌍당 2.4슬롯 등)은 vsync 그리드 정렬 유지 —
+                    // 균등분할은 쌍마다 2/3장을 오가며 시간축이 출렁인다(과거 실측).
                     let gridRef = lastVsyncTarget - latencyOffset
                     let kStart = ((prev.timestamp - gridRef) / displayInterval + 1e-6).rounded(.up)
                     var slotTime = gridRef + kStart * displayInterval
@@ -1342,6 +1380,12 @@ public final class AppState {
         let workLats = mailbox.drainWorkLatencies()
         let avgWork = workLats.isEmpty ? 0 : workLats.reduce(0, +) / Double(workLats.count)
         let maxWork = workLats.max() ?? 0
+        // work p90 추적 (적응 지연 하한의 근거) — 상승은 즉시, 감쇠는 10%/2s (스파이크 견고)
+        if !workLats.isEmpty {
+            let sorted = workLats.sorted()
+            let p90 = sorted[min(sorted.count - 1, (sorted.count * 9) / 10)]
+            paceWorkP90 = max(p90, paceWorkP90 * 0.9)
+        }
         let cuts = mailbox.drainSceneCutCount()
 
         // presented 간격 통계 (실제 glass 시각 기반 — 스무스니스의 ground truth)
@@ -1387,7 +1431,7 @@ public final class AppState {
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
-        diagStaleDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0
+        diagStaleDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
 
         diagSourceCount = 0
         diagDupSkipCount = 0

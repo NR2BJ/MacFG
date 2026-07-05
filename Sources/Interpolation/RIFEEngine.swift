@@ -64,16 +64,19 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let flowBufs: [any MTLBuffer]       // 앵커별 4ch fp16 CHW (모델 출력 backing)
         let maskBufs: [any MTLBuffer]       // 앵커별 1ch fp16 (pre-sigmoid)
         let statsBuf: any MTLBuffer         // uint32 x64 루마 히스토그램 (A32+B32)
+        let confBuf: any MTLBuffer          // uint32 x3 — 워프 conf 실측 (sum255/count/flowSum8)
         let flowTexs: [any MTLTexture]      // 앵커별 rgba16Float 모델 크기
         let maskTexs: [any MTLTexture]      // 앵커별 r16Float 모델 크기
         let event: any MTLSharedEvent
         var useCount: UInt64 = 0
         var busy = false
         init(packBuf: any MTLBuffer, flowBufs: [any MTLBuffer], maskBufs: [any MTLBuffer],
-             statsBuf: any MTLBuffer, flowTexs: [any MTLTexture], maskTexs: [any MTLTexture],
+             statsBuf: any MTLBuffer, confBuf: any MTLBuffer,
+             flowTexs: [any MTLTexture], maskTexs: [any MTLTexture],
              event: any MTLSharedEvent) {
             self.packBuf = packBuf; self.flowBufs = flowBufs; self.maskBufs = maskBufs
-            self.statsBuf = statsBuf; self.flowTexs = flowTexs; self.maskTexs = maskTexs
+            self.statsBuf = statsBuf; self.confBuf = confBuf
+            self.flowTexs = flowTexs; self.maskTexs = maskTexs
             self.event = event
         }
     }
@@ -198,6 +201,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         for _ in 0..<3 {
             guard let packBuf = device.makeBuffer(length: planeBytes * 6, options: .storageModeShared),
                   let statsBuf = device.makeBuffer(length: 64 * 4, options: .storageModeShared),
+                  let confBuf = device.makeBuffer(length: 3 * 4, options: .storageModeShared),
                   let event = device.makeSharedEvent() else {
                 throw InterpolationError.textureAllocationFailed
             }
@@ -223,7 +227,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                 flowBufs.append(fb); maskBufs.append(mb); flowTexs.append(ft); maskTexs.append(mt)
             }
             slots.append(Slot(packBuf: packBuf, flowBufs: flowBufs, maskBufs: maskBufs,
-                              statsBuf: statsBuf, flowTexs: flowTexs, maskTexs: maskTexs, event: event))
+                              statsBuf: statsBuf, confBuf: confBuf,
+                              flowTexs: flowTexs, maskTexs: maskTexs, event: event))
         }
         return slots
     }
@@ -355,6 +360,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                 fill.fill(buffer: slot.maskBufs[i], range: 0..<slot.maskBufs[i].length, value: 0)
             }
             fill.fill(buffer: slot.statsBuf, range: 0..<(64 * 4), value: 0)
+            fill.fill(buffer: slot.confBuf, range: 0..<(3 * 4), value: 0)
             fill.endEncoding()
         }
         guard let packEnc = packCB.makeComputeCommandEncoder() else { releaseSlot(slot); return nil }
@@ -467,6 +473,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                 scale1: (1 - t) / (1 - anchor),
                 tPhase: t)
             enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)
+            enc.setBuffer(slot.confBuf, offset: 0, index: 1)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
             enc.endEncoding()
             frames.append((t, output))
@@ -485,6 +492,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             self?.releaseSlot(slot)
         }
 
+        if pairCount % 120 == 0 {
+            let confBufRef = slot.confBuf
+            let pc = pairCount
+            commandBuffer.addCompletedHandler { _ in
+                let p = confBufRef.contents().bindMemory(to: UInt32.self, capacity: 3)
+                let cnt = max(1.0, Double(p[1]))
+                let confAvg = Double(p[0]) / 255.0 / cnt
+                let flowAvg = Double(p[2]) / 8.0 / cnt
+                DiagnosticLog.shared.log("[RIFE-CONF] pair#\(pc) confAvg=\(String(format: "%.2f", confAvg)) |flow|avg=\(String(format: "%.1f", flowAvg))px (샘플 \(Int(cnt)))")
+            }
+        }
         pairCount += 1
         if pairCount <= 3 || pairCount % 600 == 0 || anchors.count > 1 {
             let medNow = predictMsMedian()
@@ -638,6 +656,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         texture2d<float, access::sample> maskTex [[texture(3)]],
         texture2d<float, access::write> outTex [[texture(4)]],
         constant WarpParams& p [[buffer(0)]],
+        device atomic_uint* confStats [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = outTex.get_width();
@@ -685,6 +704,13 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float conf = 1.0 - smoothstep(0.9, 1.6, ratio);
         float3 srcBlend = mix(a0, b0, p.tPhase);
         float3 outc = mix(srcBlend, warped, conf);
+        // conf/flow 실측 (16px 격자 스파스 — '보간이 실제로 얼마나 걸리는가' 계측)
+        if ((gid.x & 15u) == 0u && (gid.y & 15u) == 0u) {
+            atomic_fetch_add_explicit(&confStats[0], uint(conf * 255.0), memory_order_relaxed);
+            atomic_fetch_add_explicit(&confStats[1], 1u, memory_order_relaxed);
+            float fmag = (length(f0) + length(f1)) * 0.5;
+            atomic_fetch_add_explicit(&confStats[2], uint(clamp(fmag, 0.0, 500.0) * 8.0), memory_order_relaxed);
+        }
         outTex.write(float4(outc, 1.0), gid);
     }
     """

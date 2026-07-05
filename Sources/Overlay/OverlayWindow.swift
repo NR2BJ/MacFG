@@ -318,34 +318,18 @@ public final class OverlayWindow: NSObject {
 
     private let mouseEventSource = CGEventSource(stateID: .hidSystemState)
     private var mouseLogCount = 0
+    /// 호버 전달 — 전역 좌표 + 창 필드 없이 postToPid. 키 창(소스는 캡처 시작 때 활성화됨)
+    /// 라우팅으로 정확한 좌표로 도달(실측). ⚠️ f51(창번호)을 붙이면 오히려 locationInWindow가
+    /// (0,height)로 붕괴해 호버가 구석 좌표로 감 — 창 필드는 moved에 쓰지 말 것.
     fileprivate func forwardMouse(_ e: NSEvent, type: CGEventType, button: CGMouseButton = .left) {
         guard sourcePID != 0, let m = mapToSource(e.locationInWindow),
               let ev = CGEvent(mouseEventSource: mouseEventSource, mouseType: type,
                                mouseCursorPosition: m.global,
                                mouseButton: button) else { return }
-        // 수신 AppKit의 창 라우팅 고정 — 좌표 밑 최상단 창(우리 뷰어)이 아니라 소스 창으로.
-        // 필드51(타깃 windowNumber)을 박으면 location은 창-로컬(top-left)로 해석됨(실측:
-        // 전역 좌표를 주면 locationInWindow가 (0,height)로 붕괴) → m.local 사용.
-        if sourceWindowID != 0 {
-            ev.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(sourceWindowID))
-            ev.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(sourceWindowID))
-            if let f51 = CGEventField(rawValue: 51) {
-                ev.setIntegerValueField(f51, value: Int64(sourceWindowID))
-            }
-        }
-        // clickState=1 없으면 NSEvent.clickCount=0으로 도착해 일부 경로가 클릭으로 안 침
-        switch type {
-        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .leftMouseDragged:
-            ev.setIntegerValueField(.mouseEventClickState, value: 1)
-        default: break
-        }
-        if type == .leftMouseDown || type == .rightMouseDown {
-            NSRunningApplication(processIdentifier: sourcePID)?.activate()
-        }
         ev.postToPid(sourcePID)
-        if type != .mouseMoved || mouseLogCount < 3 {   // 클릭은 항상, 이동은 처음 몇 개만
+        if type != .mouseMoved || mouseLogCount < 3 {
             mouseLogCount += 1
-            DiagnosticLog.shared.log("[MOUSE] \(type.rawValue) viewer=(\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) → PID\(sourcePID) win\(sourceWindowID) local(\(Int(m.local.x)),\(Int(m.local.y))) global(\(Int(m.global.x)),\(Int(m.global.y)))")
+            DiagnosticLog.shared.log("[MOUSE] \(type.rawValue) viewer=(\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) → PID\(sourcePID) global(\(Int(m.global.x)),\(Int(m.global.y)))")
         }
     }
 
@@ -391,10 +375,8 @@ public final class OverlayWindow: NSObject {
         guard sourcePID != 0, let m = mapToSource(e.locationInWindow),
               let ev = CGEvent(scrollWheelEvent2Source: mouseEventSource, units: .pixel, wheelCount: 2,
                                wheel1: Int32(e.scrollingDeltaY), wheel2: Int32(e.scrollingDeltaX), wheel3: 0) else { return }
-        ev.location = sourceWindowID != 0 ? m.local : m.global
-        if sourceWindowID != 0, let f51 = CGEventField(rawValue: 51) {
-            ev.setIntegerValueField(f51, value: Int64(sourceWindowID))
-        }
+        // moved와 동일: 전역 좌표 + 창 필드 없이 (f51은 좌표 붕괴 유발 — 위 참조)
+        ev.location = m.global
         ev.postToPid(sourcePID)
     }
 

@@ -53,6 +53,7 @@ struct BenchConfig {
     var flowShort: Int? = nil       // RIFE flow 단변 (288/360/432)
     var rifeANE = false             // RIFE를 ANE로 (기본 GPU)
     var multiT = false              // 멀티-t 화질 벤치 (t별 PSNR — 24/30fps 경로 검증)
+    var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -71,6 +72,7 @@ struct BenchConfig {
             case "--flow-short": if let v = args.popFirst() { config.flowShort = Int(v) }
             case "--rife-ane": config.rifeANE = true
             case "--multi-t": config.multiT = true
+            case "--triplets": if let v = args.popFirst() { config.tripletsDir = v }
             default: break
             }
         }
@@ -353,6 +355,109 @@ func benchmarkMultiT(_ engine: any PairInterpolationEngine, key: String,
     print()
 }
 
+/// PNG → bgra8 MTLTexture (앱 덤프 프레임 로드)
+func loadTexture(path: String, device: any MTLDevice) -> (any MTLTexture)? {
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+          let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+    let w = img.width, h = img.height
+    var data = [UInt8](repeating: 0, count: w * h * 4)
+    let cs = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(data: &data, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    for i in stride(from: 0, to: data.count, by: 4) { data.swapAt(i, i + 2) }   // RGBA→BGRA
+    let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+    desc.usage = [.shaderRead]; desc.storageMode = .shared
+    guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+    tex.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
+    return tex
+}
+
+/// 전체 프레임 PSNR (그리드 서브샘플) — 실프레임 비교용
+func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: any MTLTexture, texB: any MTLTexture) -> Double {
+    func readAll(_ tex: any MTLTexture) -> [UInt8] {
+        let w = tex.width, h = tex.height
+        if tex.storageMode == .shared {
+            var b = [UInt8](repeating: 0, count: w * h * 4)
+            tex.getBytes(&b, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+            return b
+        }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.storageMode = .shared; desc.usage = [.shaderRead]
+        guard let shared = device.makeTexture(descriptor: desc), let cb = queue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else { return [] }
+        blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1), to: shared, destinationSlice: 0,
+                  destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        var b = [UInt8](repeating: 0, count: w * h * 4)
+        shared.getBytes(&b, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        return b
+    }
+    let w = min(texA.width, texB.width), h = min(texA.height, texB.height)
+    let a = readAll(texA), b = readAll(texB)
+    guard !a.isEmpty, !b.isEmpty else { return 0 }
+    let rowA = texA.width * 4, rowB = texB.width * 4
+    var mse = 0.0, count = 0.0
+    for y in stride(from: 0, to: h, by: 2) {
+        for x in stride(from: 0, to: w, by: 2) {
+            for c in 0..<3 {
+                let d = Double(a[y * rowA + x * 4 + c]) - Double(b[y * rowB + x * 4 + c])
+                mse += d * d; count += 1
+            }
+        }
+    }
+    guard count > 0, mse > 0 else { return 99 }
+    return 10 * log10(255 * 255 / (mse / count))
+}
+
+/// 실프레임 삼중항 모드 — frame_NNN.png 연속 3장 (A, GT, B)에서 encodePair(A,B,t=0.5) vs GT.
+func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, queue: any MTLCommandQueue) async {
+    let fm = FileManager.default
+    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
+    guard files.count >= 3 else { print("❌ 프레임 부족 (\(files.count)) — \(dir)"); return }
+    print("▶ 실프레임 삼중항: \(files.count)장 → \(files.count - 2) 삼중항  (\(dir))")
+    var frames: [any MTLTexture] = []
+    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
+    guard frames.count >= 3 else { print("❌ 로드 실패"); return }
+    print("  해상도 \(frames[0].width)x\(frames[0].height)")
+
+    var allEngines: [(String, any PairInterpolationEngine)] = [("metalflow", MetalFlowEngine())]
+    if AppleFIEngine.isSupported { allEngines.append(("applefi", AppleFIEngine())) }
+    if RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) { allEngines.append(("rife", RIFEEngine())) }
+    let sel = engineKeys.contains("all") ? allEngines : allEngines.filter { engineKeys.contains($0.0) }
+
+    let dumpDir = ProcessInfo.processInfo.environment["MACFG_DUMP"]
+    for (key, engine) in sel {
+        do { try await engine.prepare(device: device) } catch { print("  \(key): prepare 실패"); continue }
+        var psnrs: [Double] = []
+        var dt = 1.0 / 30.0
+        for i in 0..<(frames.count - 2) {
+            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
+            // 워밍업 겸 실행 — 시간적 prior 있는 엔진 위해 순서대로
+            guard let cb = queue.makeCommandBuffer() else { continue }
+            let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt, tsB: Double(i + 2) * dt, tValues: [0.5], into: cb)
+            cb.commit(); await cb.completed()
+            guard let interp = r?.frames.first?.texture else { continue }
+            let p = computePSNRFull(device: device, queue: queue, texA: interp, texB: gt)
+            psnrs.append(p)
+            if let dd = dumpDir, i == frames.count / 2 {
+                dumpPNG(interp, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_interp.png")
+                dumpPNG(gt, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_gt.png")
+                dumpPNG(a, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_A.png")
+            }
+        }
+        engine.shutdown()
+        let avg = psnrs.isEmpty ? 0 : psnrs.reduce(0, +) / Double(psnrs.count)
+        let mn = psnrs.min() ?? 0
+        let sorted = psnrs.sorted()
+        let med = sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+        print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  (n=\(psnrs.count))")
+    }
+    print("\n⏱  실프레임 = 합성보다 압축노이즈·반투명·대모션 모두 포함. 높을수록 정확.")
+}
+
 func benchmarkEngine(_ engine: any PairInterpolationEngine,
                      device: any MTLDevice,
                      commandQueue: any MTLCommandQueue,
@@ -472,6 +577,11 @@ func main() async {
         selectedEngines = allEngines
     } else {
         selectedEngines = allEngines.filter { config.engines.contains($0.0) }
+    }
+
+    if let td = config.tripletsDir {
+        await runTripletMode(dir: td, engineKeys: config.engines, device: device, queue: commandQueue)
+        return
     }
 
     if config.multiT {

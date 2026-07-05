@@ -9,6 +9,8 @@ import FramePacing
 import Interpolation
 import Monitoring
 import os
+import ImageIO
+import UniformTypeIdentifiers
 
 /// 보간 엔진 선택. appleFI(ANE 720p+마스크 합성) vs metalFlow(LSFG 방식 순수 GPU) 비교 가능.
 /// blend는 미지원 폴백/디버그용 (UI 미노출, `--auto-mode blend`).
@@ -496,6 +498,13 @@ public final class AppState {
                 selectedWindowName = target.displayName
                 DiagnosticLog.shared.log("[AUTO] capturing '\(target.displayName)' mode=\(selectedRenderMode.rawValue) placement=\(selectedOverlayPlacement.rawValue)")
                 await startCapture()
+                // 자체검증: MACFG_AUTODUMP 설정 시 캡처 안정화 후 프레임 덤프 자동 무장
+                if ProcessInfo.processInfo.environment["MACFG_AUTODUMP"] != nil {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(4))
+                        self.startFrameDump()
+                    }
+                }
                 return
             }
             try? await Task.sleep(for: .milliseconds(500))
@@ -723,6 +732,13 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var inFlightTextures: Set<ObjectIdentifier> = []
     /// timestamp = 스냅된 콘텐츠 시각 (타임라인/보간용), rawTimestamp = SCK 원본 시각 (연속성 검사용)
     @ObservationIgnored nonisolated(unsafe) private var prevStable: (texture: any MTLTexture, timestamp: CFTimeInterval, rawTimestamp: CFTimeInterval)?
+
+    // 실프레임 덤프 (⌃⌥⌘D) — 연속 고유 소스 프레임을 PNG로 저장. 오프라인 보간 화질 측정용
+    // (실콘텐츠 삼중항 A/GT/B → InterpBench --triplets). 합성-실전 갭 해소 도구.
+    @ObservationIgnored nonisolated(unsafe) private var frameDumpRemaining = 0
+    @ObservationIgnored nonisolated(unsafe) private var frameDumpIndex = 0
+    @ObservationIgnored nonisolated(unsafe) private var frameDumpDir: URL?
+    private let frameDumpFileQueue = DispatchQueue(label: "com.macfg.framedump", qos: .utility)
     @ObservationIgnored nonisolated(unsafe) private var lastAcceptedTimestamp: CFTimeInterval = 0
     @ObservationIgnored nonisolated(unsafe) private var lastAcceptedFingerprint: UInt64 = 0
     /// 케이던스 스냅 상태 — 캡처 ts는 디스플레이 vsync 그리드(144Hz 등)에 양자화되고
@@ -1089,6 +1105,17 @@ public final class AppState {
                 destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
             )
             blit.endEncoding()
+        }
+
+        // 실프레임 덤프 — 무장(⌃⌥⌘D)돼 있으면 이 고유 프레임을 PNG로. 같은 cb에 shared 복사
+        // 후 완료 핸들러에서 파일 쓰기(핫패스 논블로킹).
+        if frameDumpRemaining > 0, let dir = frameDumpDir {
+            dumpStableFrame(stable, cb: cb, dir: dir, index: frameDumpIndex)
+            frameDumpIndex += 1
+            frameDumpRemaining -= 1
+            if frameDumpRemaining == 0 {
+                DiagnosticLog.shared.log("[FRAMEDUMP] \(frameDumpIndex)장 완료 → \(dir.path)")
+            }
         }
 
         // 보간: 직전 소스와의 쌍. 갭이 크면(일시정지 후 재개) 스킵하고 연속성 리셋.
@@ -1668,6 +1695,11 @@ public final class AppState {
                 self?.toggleInterpolationHotkey()
             })
         }
+        // 실프레임 덤프 (개발 도구, 고정 ⌃⌥⌘D) — 실콘텐츠 삼중항 캡처
+        bindings.append(.init(id: 5, keyCode: UInt32(kVK_ANSI_D),
+                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+            self?.startFrameDump()
+        })
         HotKeyCenter.shared.register(bindings)
     }
 
@@ -1676,6 +1708,59 @@ public final class AppState {
         isInterpolationEnabled.toggle()
         updateInterpolationEnabled()
         DiagnosticLog.shared.log("[HOTKEY] 보간 \(isInterpolationEnabled ? "ON(동영상)" : "OFF(저지연)")")
+    }
+
+    /// 실프레임 덤프 무장 (⌃⌥⌘D) — 다음 N개 고유 소스 프레임을 PNG로 저장.
+    func startFrameDump(count: Int = 12) {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = fmt.string(from: Date())
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/MacFG/bench_frames/\(stamp)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        frameDumpDir = dir
+        frameDumpIndex = 0
+        frameDumpRemaining = count
+        DiagnosticLog.shared.log("[FRAMEDUMP] 무장 \(count)장 → \(dir.path)")
+        NSSound.beep()   // 시작 청각 피드백
+    }
+
+    /// stable(.private) → shared 복사(같은 cb) → 완료 시 PNG 파일 쓰기 (오프스레드)
+    nonisolated private func dumpStableFrame(_ stable: any MTLTexture, cb: any MTLCommandBuffer, dir: URL, index: Int) {
+        let w = stable.width, h = stable.height
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.storageMode = .shared
+        desc.usage = [.shaderRead]
+        guard let shared = device.makeTexture(descriptor: desc),
+              let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.copy(from: stable, sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1),
+                  to: shared, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        let path = dir.appendingPathComponent(String(format: "frame_%03d.png", index)).path
+        let queue = frameDumpFileQueue
+        cb.addCompletedHandler { _ in
+            queue.async { AppState.writeTexturePNG(shared, width: w, height: h, path: path) }
+        }
+    }
+
+    /// bgra8 shared 텍스처 → PNG (BGRA→RGBA)
+    nonisolated static func writeTexturePNG(_ tex: any MTLTexture, width w: Int, height h: Int, path: String) {
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        tex.getBytes(&bytes, bytesPerRow: w * 4,
+                     from: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                     size: MTLSize(width: w, height: h, depth: 1)), mipmapLevel: 0)
+        for i in stride(from: 0, to: bytes.count, by: 4) { bytes.swapAt(i, i + 2) }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let img = ctx.makeImage(),
+              let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL,
+                                                        UTType.png.identifier as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dst, img, nil)
+        CGImageDestinationFinalize(dst)
     }
 
     /// 단축키 변경 시: UserDefaults 저장 + 재등록

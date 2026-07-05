@@ -464,7 +464,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             var wp = WarpParams(
                 flowScale: SIMD2<Float>(Float(output.width) / Float(mW0), Float(output.height) / Float(mH0)),
                 scale0: t / anchor,
-                scale1: (1 - t) / (1 - anchor))
+                scale1: (1 - t) / (1 - anchor),
+                tPhase: t)
             enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
             enc.endEncoding()
@@ -524,6 +525,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         var flowScale: SIMD2<Float>
         var scale0: Float
         var scale1: Float
+        var tPhase: Float        // 표시 위상 t — flow 불신 시 원본 A/B 블렌드 가중
+        var pad: Float = 0
     }
 
     private func releaseSlot(_ slot: Slot) {
@@ -574,7 +577,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct WarpParams { float2 flowScale; float scale0; float scale1; };
+    struct WarpParams { float2 flowScale; float scale0; float scale1; float tPhase; float pad; };
     constant float3 kLuma = float3(0.2126, 0.7152, 0.0722);
 
     // stableA/B → 모델크기 fp16 CHW 6플레인 (RGB 0-1) + 루마 히스토그램 (장면 전환용)
@@ -649,15 +652,28 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float2 f1 = f.zw * p.flowScale * p.scale1;
         float3 a = imgA.sample(s, uv + f0 / sizeF).rgb;
         float3 b = imgB.sample(s, uv + f1 / sizeF).rgb;
+        const float3 kL = float3(0.299, 0.587, 0.114);
         float3 warped = a * m + b * (1.0 - m);
-        // 정적영역 보호 — A(p)≈B(p)인 픽셀(조준점/HUD/글자)은 워프 대신 원본.
-        // coarse flow(288/360 업샘플)가 정적 UI에 배경 모션을 번지게 하는 것 차단
-        // (실증상: 조준점이 이상한 위치로 번짐, 글자 번짐). 부드러운 전환(luma diff 0.02~0.08).
         float3 a0 = imgA.sample(s, uv).rgb;
         float3 b0 = imgB.sample(s, uv).rgb;
-        float diff = dot(abs(a0 - b0), float3(0.299, 0.587, 0.114));
-        float staticW = 1.0 - smoothstep(0.02, 0.08, diff);
-        float3 outc = mix(warped, (a0 + b0) * 0.5, staticW);
+        // ① 워프 일관성 폴백 — 워프된 A/B가 불일치하면 flow가 틀린 것(조준점 오염, 빠른 게임
+        //    모션의 오위치 고스트 = '왔다갔다'). 원본 t-블렌드로 강등: 틀린 위치의 또렷한 유령
+        //    대신 제자리 크로스페이드 (MetalFlow가 게임에서 강한 핵심 기법의 이식).
+        float errFlow = dot(abs(a - b), kL);
+        float conf = 1.0 - smoothstep(0.06, 0.20, errFlow);
+        float3 srcBlend = mix(a0, b0, p.tPhase);
+        float3 outc = mix(srcBlend, warped, conf);
+        // ② 정적영역 보호(노이즈 강건) — diff를 ±0.75px 4점 평균(미니 블러)으로 판정해
+        //    압축 노이즈/링잉이 조준점·글자의 보호를 풀던 것 차단.
+        float2 po = 0.75 / sizeF;
+        float dBlur = 0.0;
+        dBlur += dot(abs(imgA.sample(s, uv + float2( po.x,  po.y)).rgb - imgB.sample(s, uv + float2( po.x,  po.y)).rgb), kL);
+        dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x,  po.y)).rgb - imgB.sample(s, uv + float2(-po.x,  po.y)).rgb), kL);
+        dBlur += dot(abs(imgA.sample(s, uv + float2( po.x, -po.y)).rgb - imgB.sample(s, uv + float2( po.x, -po.y)).rgb), kL);
+        dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x, -po.y)).rgb - imgB.sample(s, uv + float2(-po.x, -po.y)).rgb), kL);
+        dBlur *= 0.25;
+        float staticW = 1.0 - smoothstep(0.025, 0.09, dBlur);
+        outc = mix(outc, mix(a0, b0, p.tPhase), staticW);
         outTex.write(float4(outc, 1.0), gid);
     }
     """

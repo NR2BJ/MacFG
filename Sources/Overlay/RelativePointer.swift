@@ -5,42 +5,56 @@ import Monitoring
 /// 상대커서 모드 — 진짜(네이티브) 커서를 그대로 포인터로 쓰고, 마우스 이벤트만 소스 좌표로
 /// 재타깃해 뷰어 아래 소스가 호버·스크롤·클릭·드래그를 받게 한다.
 ///
-/// 핵심 통찰(실측): CGEventTap에서 event.location을 바꿔도 **진짜 커서는 움직이지 않는다** —
-/// 배달 경로만 바뀐다. 따라서 진짜 커서는 늘 뷰어 위(가리키는 콘텐츠 위)에 있고, 그 위치를
-/// 소스로 매핑해 재타깃하면 커서가 있는 콘텐츠에 정확히 이벤트가 간다. 링·숨김·디커플 불필요.
+/// **CGEventTap은 전용 고우선순위 스레드에서 돌린다.** 액티브(동기) 탭은 윈도우서버가 핸들러
+/// 응답을 기다리는데, 메인 런루프에 붙이면 소스 활성화로 백그라운드가 된 MacFG의 메인 런루프가
+/// 부하/저우선순위로 늦게 서비스될 때 탭이 굶주려 — 특히 소스 앱의 드래그(모달 선택) 루프가
+/// 매 이벤트를 기다리다 수 초 멈춘다(실측 증상). 전용 스레드는 메인과 무관하게 즉시 서비스된다.
 ///
-/// 동작:
-/// - 커서가 뷰어 화면 안이면: 커서 위치(event.location)를 소스 좌표로 매핑해 재타깃, 통과.
-///   뷰어는 클릭투과라 재타깃 이벤트가 아래 소스로 도달. 레터박스 밖(블랙바)이면 소비.
-/// - 커서가 옆 모니터로 나가면: 무변조 통과(평범한 다중모니터 조작). 돌아오면 소스 재활성.
-/// - 클릭/드래그는 소스 프레임 8pt 안쪽 인셋(가장자리 리사이즈 존 회피), 드래그는 down 시점
-///   프레임을 up까지 고정(창이 제 드래그를 쫓는 폭주 방지).
-///
-/// 진짜 커서를 숨기거나 디커플하지 않으므로 크래시로도 마우스가 잠기지 않는다(안전).
+/// 탭 스레드는 AppKit을 만지지 않는다 — 필요한 지오메트리(창/레터박스/소스프레임/디스플레이)는
+/// 메인이 락 보호 스냅샷으로 밀어주고, 매핑 수학은 순수 함수로 탭 스레드에서 수행한다.
 final class RelativePointer {
-    /// 뷰어가 있는 디스플레이 ID (CG 전역좌표계 화면 판정 기준)
-    var viewerDisplayID: () -> CGDirectDisplayID = { CGMainDisplayID() }
-    /// 현재 소스 창 프레임(NS) — 드래그 시작 시 스냅샷용
-    var currentSourceFrameNS: () -> CGRect = { .zero }
-    /// 커서 전역 CG → 소스 전역 CG. frameOverride 있으면 그 프레임 기준(드래그 고정),
-    /// clickInset이면 리사이즈 존 회피 인셋. 레터박스 밖이면 nil.
-    var mapVirtualToSource: (CGPoint, CGRect?, Bool) -> CGPoint? = { _, _, _ in nil }
-    /// 옆 모니터에서 뷰어 화면으로 복귀 — 소스 재활성(호버 좌표 필수)
-    var onReturnedToViewer: () -> Void = {}
+    /// 지오메트리 스냅샷 (전부 값 타입 — 스레드 안전) — 메인이 push, 탭 스레드가 read.
+    struct Geometry: Sendable {
+        var displayID: CGDirectDisplayID = CGMainDisplayID()
+        var windowFrame: CGRect = .zero        // 뷰어 창 프레임 (NS)
+        var letterbox: CGRect = .zero          // 레터박스 (창 content 좌표, NS)
+        var sourceFrameNS: CGRect = .zero      // 소스 창 프레임 (NS)
+        var primaryHeight: CGFloat = 0         // 주 스크린 높이 (NS↔CG 반전용)
+        var sourcePID: pid_t = 0               // 복귀 시 재활성 대상 (Sendable — 스레드 넘김 안전)
+    }
+
+    private let geoLock = NSLock()
+    private var geo = Geometry()
+    func setGeometry(_ g: Geometry) { geoLock.lock(); geo = g; geoLock.unlock() }
 
     private(set) var active = false
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var wasOutside = false                   // 직전 이벤트가 옆 모니터였나
-    private var dragFrameNS: CGRect?                 // 버튼 다운 중 고정된 소스 프레임
+    private var thread: Thread?
+    private var threadRunLoop: CFRunLoop?
+    private let threadReady = DispatchSemaphore(value: 0)
+    private var wasOutside = false                   // 직전 이벤트가 옆 모니터였나 (탭 스레드 전용)
+    private var dragFrameNS: CGRect?                 // 버튼 다운 중 고정된 소스 프레임 (탭 스레드 전용)
 
     // MARK: - 진입/이탈
 
-    func enable(on screen: NSScreen?) {
+    func enable() {
         guard !active else { return }
         wasOutside = false
         dragFrameNS = nil
+        let t = Thread { [weak self] in self?.threadMain() }
+        t.name = "MacFG.RelPointerTap"
+        t.qualityOfService = .userInteractive
+        thread = t
+        t.start()
+        threadReady.wait()                            // 탭 생성 완료 대기
+        active = (tap != nil)
+        DiagnosticLog.shared.log("[RELPTR] enabled (dedicated thread, tap=\(tap != nil))")
+    }
 
+    private func threadMain() {
+        let rl = CFRunLoopGetCurrent()
+        threadRunLoop = rl
         let mask: CGEventMask =
             (1 << CGEventType.mouseMoved.rawValue) |
             (1 << CGEventType.leftMouseDragged.rawValue) |
@@ -53,45 +67,72 @@ final class RelativePointer {
             (1 << CGEventType.otherMouseDown.rawValue) |
             (1 << CGEventType.otherMouseUp.rawValue) |
             (1 << CGEventType.scrollWheel.rawValue)
-
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                           options: .defaultTap, eventsOfInterest: mask,
                                           callback: relativePointerTapCallback, userInfo: refcon) else {
             DiagnosticLog.shared.log("[RELPTR] tap create FAILED (accessibility 권한 필요)")
+            threadReady.signal()
             return
         }
         self.tap = tap
-        let rls = CFMachPortCreateRunLoopSource(nil, tap, 0)
-        self.runLoopSource = rls
-        CFRunLoopAddSource(CFRunLoopGetMain(), rls, .commonModes)
+        let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        self.runLoopSource = src
+        CFRunLoopAddSource(rl, src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        active = true
-        DiagnosticLog.shared.log("[RELPTR] enabled (native cursor, no ring)")
+        threadReady.signal()
+        CFRunLoopRun()                                // disable()의 CFRunLoopStop까지 실행
     }
 
     func disable() {
         guard active else { return }
         active = false
-        dragFrameNS = nil
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let rls = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), rls, .commonModes) }
-        tap = nil
-        runLoopSource = nil
+        guard let rl = threadRunLoop else { return }
+        let tapRef = tap, srcRef = runLoopSource
+        // 정리는 탭을 만든 그 스레드에서 (교차 스레드 레이스 방지) → 런루프 정지 → 스레드 종료
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) {
+            if let tapRef { CGEvent.tapEnable(tap: tapRef, enable: false) }
+            if let srcRef { CFRunLoopRemoveSource(rl, srcRef, .commonModes) }
+            CFRunLoopStop(rl)
+        }
+        CFRunLoopWakeUp(rl)
+        tap = nil; runLoopSource = nil; thread = nil; threadRunLoop = nil; dragFrameNS = nil
         DiagnosticLog.shared.log("[RELPTR] disabled")
     }
 
-    /// 탭 타임아웃/사용자입력으로 비활성화되면 재활성 (콜백에서 호출)
     fileprivate func reenableTap() {
-        guard let tap else { return }
-        CGEvent.tapEnable(tap: tap, enable: true)
+        if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
     }
 
-    // MARK: - 탭 처리
+    // MARK: - 매핑 (순수 함수, 탭 스레드에서 스냅샷으로)
+
+    /// 커서 전역 CG → 소스 전역 CG. frameOverride면 그 프레임 기준(드래그 고정), clickInset면
+    /// 소스 프레임 8pt 안쪽(리사이즈 존 회피). 레터박스 밖이면 nil.
+    private func mapToSource(_ p: CGPoint, frameOverride: CGRect?, clickInset: Bool, _ g: Geometry) -> CGPoint? {
+        let lb = g.letterbox
+        guard lb.width > 1, lb.height > 1 else { return nil }
+        // 전역 CG → 창 content NS
+        let winX = p.x - g.windowFrame.minX
+        let winY = (g.primaryHeight - p.y) - g.windowFrame.minY
+        let nx = (winX - lb.minX) / lb.width
+        let ny = (winY - lb.minY) / lb.height          // NS: 0=하단
+        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }
+        var frame = frameOverride ?? g.sourceFrameNS
+        guard frame.width > 1, frame.height > 1 else { return nil }
+        if clickInset, frame.width > 40, frame.height > 40 {
+            frame = frame.insetBy(dx: 8, dy: 8)
+        }
+        let sxNS = frame.minX + nx * frame.width
+        let syNS = frame.minY + ny * frame.height
+        return CGPoint(x: sxNS, y: g.primaryHeight - syNS)
+    }
+
+    // MARK: - 탭 처리 (탭 스레드)
 
     fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        let loc = event.location                      // 진짜 커서 위치 (비디커플)
-        let screen = CGDisplayBounds(viewerDisplayID())
+        geoLock.lock(); let g = geo; geoLock.unlock()
+        let loc = event.location
+        let screen = CGDisplayBounds(g.displayID)
 
         // 옆 모니터 — 손대지 않음 (평범한 다중모니터 조작)
         if !screen.contains(loc) {
@@ -99,16 +140,17 @@ final class RelativePointer {
             dragFrameNS = nil
             return Unmanaged.passUnretained(event)
         }
-        // 뷰어 화면으로 복귀 — 소스 재활성 (옆에서 다른 앱을 활성화했을 수 있음)
         if wasOutside {
             wasOutside = false
-            onReturnedToViewer()
+            let pid = g.sourcePID                       // 옆 모니터 복귀 — 소스 재활성 (메인에서)
+            if pid != 0 {
+                DispatchQueue.main.async { NSRunningApplication(processIdentifier: pid)?.activate() }
+            }
         }
 
-        // 드래그 매핑 고정 (down에서 스냅샷 → up까지 유지)
         switch type {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            dragFrameNS = currentSourceFrameNS()
+            dragFrameNS = g.sourceFrameNS               // 드래그 매핑 고정 (down 시점 프레임)
         default:
             break
         }
@@ -121,22 +163,21 @@ final class RelativePointer {
         default:
             clickLike = false
         }
-        let mapped = mapVirtualToSource(loc, dragFrameNS, clickLike)
+        let mapped = mapToSource(loc, frameOverride: dragFrameNS, clickInset: clickLike, g)
         switch type {
         case .leftMouseUp, .rightMouseUp, .otherMouseUp: dragFrameNS = nil
         default: break
         }
 
-        guard let mapped else { return nil }          // 레터박스 밖(블랙바) — 소비
-        event.location = mapped                        // 재타깃 (커서는 안 움직임 — 배달만)
-        // delta 제거 — 절대 location만 유효; 큰 delta는 윈도우서버가 중간 move를 합성해 다중 배달
+        guard let mapped else { return nil }            // 레터박스 밖(블랙바) — 소비
+        event.location = mapped
         event.setDoubleValueField(.mouseEventDeltaX, value: 0)
         event.setDoubleValueField(.mouseEventDeltaY, value: 0)
         return Unmanaged.passUnretained(event)
     }
 }
 
-/// CGEventTap C 콜백 — refcon으로 인스턴스 복원. 탭은 메인 런루프에 붙어 메인 스레드에서 발화.
+/// CGEventTap C 콜백 — refcon으로 인스턴스 복원. 전용 탭 스레드에서 발화.
 private func relativePointerTapCallback(proxy: CGEventTapProxy, type: CGEventType,
                                         event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     guard let refcon else { return Unmanaged.passUnretained(event) }

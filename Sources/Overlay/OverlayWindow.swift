@@ -179,7 +179,7 @@ public final class OverlayWindow: NSObject {
     /// 설정되면 뷰어의 호버/클릭/스크롤을 업스케일 배율로 역산해 소스로 전달(CGEventPostToPid).
     /// windowID는 이벤트의 windowUnderMousePointer 필드에 박는다 — 수신 AppKit이 좌표 밑 창을
     /// 윈도우서버에 물으면 우리 뷰어(다른 앱)가 나와 자기 창을 못 찾고 클릭을 버리는 것 우회.
-    public var sourceFrameNS: CGRect = .zero
+    public var sourceFrameNS: CGRect = .zero { didSet { pushPointerGeometry() } }
     public var sourcePID: pid_t = 0
     public var sourceWindowID: CGWindowID = 0
     private weak var interactionView: ViewerInteractionView?
@@ -291,7 +291,6 @@ public final class OverlayWindow: NSObject {
             window.delegate = self
             window.acceptsMouseMovedEvents = true
             interactionView?.owner = self
-            setupRelativePointer()
         }
 
         logger.info("OverlayWindow created (style=\(String(describing: style)))")
@@ -299,54 +298,25 @@ public final class OverlayWindow: NSObject {
 
     // MARK: - 상대커서 모드 (진짜 커서 위치를 소스로 재타깃 — 링·숨김 없음)
 
-    /// RelativePointer 클로저 배선 (지오메트리/매핑/복귀 콜백)
-    private func setupRelativePointer() {
-        relativePointer.viewerDisplayID = { [weak self] in
-            (self?.window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-                ?? CGMainDisplayID()
-        }
-        relativePointer.currentSourceFrameNS = { [weak self] in self?.sourceFrameNS ?? .zero }
-        relativePointer.mapVirtualToSource = { [weak self] cg, frozenFrame, clickInset in
-            self?.mapGlobalCGToSource(cg, frameOverride: frozenFrame, clickInset: clickInset)
-        }
-        relativePointer.onReturnedToViewer = { [weak self] in
-            // 옆 모니터에서 복귀 — 다른 앱을 활성화했을 수 있으니 소스 재활성 (호버 좌표 필수)
-            guard let self, self.sourcePID != 0 else { return }
-            NSRunningApplication(processIdentifier: self.sourcePID)?.activate()
-        }
-    }
-
-    // MARK: 좌표 변환 (전역 CG → 창 NS)
-
     private var primaryScreenHeight: CGFloat {
         NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
             ?? NSScreen.main?.frame.height ?? 0
     }
 
-    private func globalCGToWindowNS(_ p: CGPoint) -> CGPoint {
-        let f = window.frame
-        return CGPoint(x: p.x - f.minX, y: (primaryScreenHeight - p.y) - f.minY)
-    }
-
-    /// 진짜 커서 위치(전역 CG)를 소스 창 좌표(전역 CG)로. 레터박스 밖이면 nil.
-    /// - frameOverride: 드래그 중 고정 프레임 (창이 제 드래그를 쫓는 폭주 방지)
-    /// - clickInset: 클릭/드래그는 소스 프레임 8pt 안쪽으로 — 가장자리 리사이즈 존 회피
-    private func mapGlobalCGToSource(_ p: CGPoint, frameOverride: CGRect?, clickInset: Bool) -> CGPoint? {
-        guard style == .viewer else { return nil }
-        let winPt = globalCGToWindowNS(p)
-        let lb = metalLayer.frame
-        guard lb.width > 1, lb.height > 1 else { return nil }
-        let nx = (winPt.x - lb.minX) / lb.width
-        let ny = (winPt.y - lb.minY) / lb.height        // NS: 0=하단
-        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }
-        var frame = frameOverride ?? sourceFrameNS
-        guard frame.width > 1, frame.height > 1 else { return nil }
-        if clickInset, frame.width > 40, frame.height > 40 {
-            frame = frame.insetBy(dx: 8, dy: 8)
-        }
-        let sxNS = frame.minX + nx * frame.width
-        let syNS = frame.minY + ny * frame.height
-        return CGPoint(x: sxNS, y: primaryScreenHeight - syNS)
+    /// 탭 스레드용 지오메트리 스냅샷을 메인에서 계산해 push (전부 값 타입 → 스레드 안전).
+    /// sourceFrameNS 갱신(15Hz)·진입 시 호출 — 탭은 AppKit을 만지지 않고 이 스냅샷만 읽는다.
+    private func pushPointerGeometry() {
+        guard style == .viewer, relativePointer.active else { return }
+        let displayID = (window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            ?? CGMainDisplayID()
+        relativePointer.setGeometry(RelativePointer.Geometry(
+            displayID: displayID,
+            windowFrame: window.frame,
+            letterbox: metalLayer.frame,
+            sourceFrameNS: sourceFrameNS,
+            primaryHeight: primaryScreenHeight,
+            sourcePID: sourcePID
+        ))
     }
 
     /// 뷰어 표시 시작 시 상대커서 진입 — 뷰어를 클릭투과로 만들고 커서를 소스에 상주.
@@ -358,7 +328,8 @@ public final class OverlayWindow: NSObject {
         // 옛 postToPid 포워딩 경로 차단 — 진짜 커서가 뷰어 위(fullscreen)에 있어 ViewerInteractionView
         // 트래킹영역이 발화하면 이벤트가 한 번 더 매핑·전달(이중 배달, 실측). 탭이 전담하므로 무력화.
         interactionView?.owner = nil
-        relativePointer.enable(on: window.screen)
+        relativePointer.enable()
+        pushPointerGeometry()   // 초기 스냅샷 (이후 sourceFrameNS 갱신마다 push)
     }
 
     /// 뷰어 숨김/정지 시 상대커서 이탈 — 클릭투과 해제.

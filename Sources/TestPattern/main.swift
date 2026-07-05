@@ -20,6 +20,17 @@ final class PatternView: NSView {
     /// 고난도 콘텐츠 (회전/노이즈/밝기변화) — 보간 화질 검증용
     var complexMode: Bool = false
 
+    // 마우스 수신 로깅 — MacFG 뷰어 이벤트 포워딩(postToPid) 수신 검증용
+    override var acceptsFirstResponder: Bool { true }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .inVisibleRect], owner: self))
+    }
+    override func mouseMoved(with e: NSEvent)  { NSLog("[TP-MOUSE] moved (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
+    override func mouseDown(with e: NSEvent)   { NSLog("[TP-MOUSE] DOWN (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
+    override func mouseUp(with e: NSEvent)     { NSLog("[TP-MOUSE] UP (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -223,6 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.jitterMs = jitter
         view.complexMode = complexFlag
         window.contentView = view
+        window.acceptsMouseMovedEvents = true
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         view.startRendering()
@@ -233,6 +245,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("[TP-OCC] occlusionState.visible=\(vis)")
         }
         NSLog("[TP-OCC] initial visible=\(window.occlusionState.contains(.visible))")
+
+        // 앱 레벨 이벤트 모니터 — 주입된 클릭이 뷰 이전에 앱에 도달하는지 판별용
+        // + CGEvent 필드 덤프: 정상 클릭 vs 주입 클릭의 창-로컬 좌표 필드 규명용
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown]) { ev in
+            NSLog("[TP-APPEV] \(ev.type.rawValue) win=\(ev.windowNumber) loc=(\(Int(ev.locationInWindow.x)),\(Int(ev.locationInWindow.y))) clicks=\(ev.clickCount)")
+            if ev.type == .leftMouseDown, let cg = ev.cgEvent {
+                var dump = "[TP-FIELDS] loc=(\(Int(cg.location.x)),\(Int(cg.location.y)))"
+                for f in 0...200 {
+                    guard let field = CGEventField(rawValue: UInt32(f)) else { continue }
+                    let d = cg.getDoubleValueField(field)
+                    let i = cg.getIntegerValueField(field)
+                    if d != 0 && abs(d) < 1_000_000 { dump += " f\(f)=\(String(format: "%.1f", d))" }
+                    else if i != 0 && abs(i) < 1_000_000 { dump += " f\(f)I=\(i)" }
+                }
+                NSLog("%@", dump)
+            }
+            return ev
+        }
 
         // 자체 검증용: N초 후 전체화면/최대화 전환 (보간 유지 테스트)
         if let i = args.firstIndex(of: "--fullscreen-after"), i + 1 < args.count, let sec = Double(args[i + 1]) {

@@ -145,6 +145,7 @@ public final class OverlayManager {
         overlay.upscaleMode = upscaleMode
         overlay.sharpness = sharpness
         overlay.sourcePID = sourcePID
+        overlay.sourceWindowID = trackedWindowID ?? 0
         self.overlayWindow = overlay
 
         applyOcclusionPolicy()

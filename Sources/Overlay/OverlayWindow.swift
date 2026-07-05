@@ -175,10 +175,13 @@ public final class OverlayWindow: NSObject {
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
     public var onUserClose: (() -> Void)?
 
-    /// 마우스 역매핑 (뷰어→소스): 소스 창 NS 프레임 + 소유 앱 PID.
+    /// 마우스 역매핑 (뷰어→소스): 소스 창 NS 프레임 + 소유 앱 PID + 창 ID.
     /// 설정되면 뷰어의 호버/클릭/스크롤을 업스케일 배율로 역산해 소스로 전달(CGEventPostToPid).
+    /// windowID는 이벤트의 windowUnderMousePointer 필드에 박는다 — 수신 AppKit이 좌표 밑 창을
+    /// 윈도우서버에 물으면 우리 뷰어(다른 앱)가 나와 자기 창을 못 찾고 클릭을 버리는 것 우회.
     public var sourceFrameNS: CGRect = .zero
     public var sourcePID: pid_t = 0
+    public var sourceWindowID: CGWindowID = 0
     private weak var interactionView: ViewerInteractionView?
 
     public init(device: any MTLDevice, style: OverlayStyle, title: String = "MacFG Output") throws {
@@ -292,9 +295,10 @@ public final class OverlayWindow: NSObject {
 
     // MARK: - 마우스 역매핑 (뷰어 → 소스)
 
-    /// 뷰어 창 좌표(NS)의 마우스 위치를 소스 창 스크린 좌표(CG top-left)로 역산.
-    /// 뷰어 레터박스(metalLayer.frame)에서 정규화 → 소스 창 NS 프레임에 매핑 → CG 변환.
-    private func mapToSourceCG(_ locInWindow: CGPoint) -> CGPoint? {
+    /// 뷰어 창 좌표(NS)의 마우스 위치를 소스 좌표로 역산.
+    /// 반환: (global: 스크린 CG top-left, local: 소스 창 내부 top-left).
+    /// windowNumber(필드51)를 박은 이벤트는 location을 창-로컬로 해석하므로 local이 필요.
+    private func mapToSource(_ locInWindow: CGPoint) -> (global: CGPoint, local: CGPoint)? {
         guard style == .viewer, sourceFrameNS.width > 1, sourceFrameNS.height > 1 else { return nil }
         let lb = metalLayer.frame   // 레터박스 (contentView=window content 좌표, NS bottom-left)
         guard lb.width > 1, lb.height > 1 else { return nil }
@@ -307,30 +311,90 @@ public final class OverlayWindow: NSObject {
         // NS(bottom-left) → CG(top-left): 주 스크린 높이 기준 y 반전
         let primaryH = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
             ?? NSScreen.main?.frame.height ?? 0
-        return CGPoint(x: sxNS, y: primaryH - syNS)
+        let global = CGPoint(x: sxNS, y: primaryH - syNS)
+        let local = CGPoint(x: nx * sourceFrameNS.width, y: (1 - ny) * sourceFrameNS.height)
+        return (global, local)
     }
 
     private let mouseEventSource = CGEventSource(stateID: .hidSystemState)
     private var mouseLogCount = 0
     fileprivate func forwardMouse(_ e: NSEvent, type: CGEventType, button: CGMouseButton = .left) {
-        guard sourcePID != 0, let cg = mapToSourceCG(e.locationInWindow),
-              let ev = CGEvent(mouseEventSource: mouseEventSource, mouseType: type, mouseCursorPosition: cg, mouseButton: button) else { return }
-        // 클릭은 소스 앱을 활성화해야 확실히 처리됨 (가려진 백그라운드 앱은 입력 무시 가능)
+        guard sourcePID != 0, let m = mapToSource(e.locationInWindow),
+              let ev = CGEvent(mouseEventSource: mouseEventSource, mouseType: type,
+                               mouseCursorPosition: m.global,
+                               mouseButton: button) else { return }
+        // 수신 AppKit의 창 라우팅 고정 — 좌표 밑 최상단 창(우리 뷰어)이 아니라 소스 창으로.
+        // 필드51(타깃 windowNumber)을 박으면 location은 창-로컬(top-left)로 해석됨(실측:
+        // 전역 좌표를 주면 locationInWindow가 (0,height)로 붕괴) → m.local 사용.
+        if sourceWindowID != 0 {
+            ev.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(sourceWindowID))
+            ev.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(sourceWindowID))
+            if let f51 = CGEventField(rawValue: 51) {
+                ev.setIntegerValueField(f51, value: Int64(sourceWindowID))
+            }
+        }
+        // clickState=1 없으면 NSEvent.clickCount=0으로 도착해 일부 경로가 클릭으로 안 침
+        switch type {
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .leftMouseDragged:
+            ev.setIntegerValueField(.mouseEventClickState, value: 1)
+        default: break
+        }
         if type == .leftMouseDown || type == .rightMouseDown {
             NSRunningApplication(processIdentifier: sourcePID)?.activate()
         }
         ev.postToPid(sourcePID)
         if type != .mouseMoved || mouseLogCount < 3 {   // 클릭은 항상, 이동은 처음 몇 개만
             mouseLogCount += 1
-            DiagnosticLog.shared.log("[MOUSE] \(type.rawValue) viewer=(\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) lb=\(Int(metalLayer.frame.width))x\(Int(metalLayer.frame.height))@\(Int(metalLayer.frame.minX)),\(Int(metalLayer.frame.minY)) src=\(Int(sourceFrameNS.width))x\(Int(sourceFrameNS.height))@\(Int(sourceFrameNS.minX)),\(Int(sourceFrameNS.minY)) → PID\(sourcePID) CG(\(Int(cg.x)),\(Int(cg.y)))")
+            DiagnosticLog.shared.log("[MOUSE] \(type.rawValue) viewer=(\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) → PID\(sourcePID) win\(sourceWindowID) local(\(Int(m.local.x)),\(Int(m.local.y))) global(\(Int(m.global.x)),\(Int(m.global.y)))")
         }
     }
 
+    /// 클릭 패스스루 리플레이 — postToPid 클릭은 창-로컬 위치(윈도우서버가 라우팅 중 채우는
+    /// 내부 구조체)가 비어 수신 AppKit이 (0,height)로 해석·폐기함(실측). 대신:
+    /// 뷰어를 이벤트 투과로 전환 → 커서를 소스 위치로 워프 → 진짜 클릭(세션 탭, 정상 라우팅)
+    /// → 커서/투과 복구. 커서가 ~150ms 소스 위치로 깜빡이는 비용으로 100% 정상 배달.
+    private var passthroughActive = false
+    fileprivate func passthroughClick(_ e: NSEvent, button: CGMouseButton) {
+        // 재진입 가드 — ignoresMouseEvents 반영 전(윈도우서버 비동기)에 자기 클릭이 뷰어에
+        // 되튕겨 재귀 발화하던 것 차단 (실측: 30ms 내 재진입)
+        guard !passthroughActive, let m = mapToSource(e.locationInWindow) else { return }
+        passthroughActive = true
+        let returnPos = CGEvent(source: nil)?.location ?? m.global   // 현재 실제 커서(CG)
+        let target = m.global
+        window.ignoresMouseEvents = true
+        NSRunningApplication(processIdentifier: sourcePID)?.activate()
+        CGWarpMouseCursorPosition(target)
+        let downType: CGEventType = button == .right ? .rightMouseDown : .leftMouseDown
+        let upType: CGEventType = button == .right ? .rightMouseUp : .leftMouseUp
+        // ignore 전파 여유(80ms) 후 진짜 클릭 — 윈도우서버가 뷰어를 건너뛰고 소스로 정상 라우팅
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            if let d = CGEvent(mouseEventSource: self?.mouseEventSource, mouseType: downType, mouseCursorPosition: target, mouseButton: button) {
+                d.setIntegerValueField(.mouseEventClickState, value: 1)
+                d.post(tap: .cgSessionEventTap)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
+            if let u = CGEvent(mouseEventSource: self?.mouseEventSource, mouseType: upType, mouseCursorPosition: target, mouseButton: button) {
+                u.setIntegerValueField(.mouseEventClickState, value: 1)
+                u.post(tap: .cgSessionEventTap)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+            CGWarpMouseCursorPosition(returnPos)
+            self?.window.ignoresMouseEvents = false
+            self?.passthroughActive = false
+        }
+        DiagnosticLog.shared.log("[MOUSE] passthrough click at CG(\(Int(target.x)),\(Int(target.y))) → return(\(Int(returnPos.x)),\(Int(returnPos.y)))")
+    }
+
     fileprivate func forwardScroll(_ e: NSEvent) {
-        guard sourcePID != 0, let cg = mapToSourceCG(e.locationInWindow),
+        guard sourcePID != 0, let m = mapToSource(e.locationInWindow),
               let ev = CGEvent(scrollWheelEvent2Source: mouseEventSource, units: .pixel, wheelCount: 2,
                                wheel1: Int32(e.scrollingDeltaY), wheel2: Int32(e.scrollingDeltaX), wheel3: 0) else { return }
-        ev.location = cg
+        ev.location = sourceWindowID != 0 ? m.local : m.global
+        if sourceWindowID != 0, let f51 = CGEventField(rawValue: 51) {
+            ev.setIntegerValueField(f51, value: Int64(sourceWindowID))
+        }
         ev.postToPid(sourcePID)
     }
 
@@ -457,11 +521,12 @@ final class ViewerInteractionView: NSView {
         addTrackingArea(t); tracking = t
     }
 
+    // 호버 = postToPid moved(키 창 라우팅으로 정상 도달) · 클릭 = 패스스루 리플레이(진짜 이벤트)
     override func mouseMoved(with e: NSEvent)   { owner?.forwardMouse(e, type: .mouseMoved) }
-    override func mouseDown(with e: NSEvent)    { owner?.forwardMouse(e, type: .leftMouseDown) }
-    override func mouseUp(with e: NSEvent)      { owner?.forwardMouse(e, type: .leftMouseUp) }
-    override func mouseDragged(with e: NSEvent) { owner?.forwardMouse(e, type: .leftMouseDragged) }
-    override func rightMouseDown(with e: NSEvent) { owner?.forwardMouse(e, type: .rightMouseDown, button: .right) }
-    override func rightMouseUp(with e: NSEvent)   { owner?.forwardMouse(e, type: .rightMouseUp, button: .right) }
+    override func mouseDown(with e: NSEvent)    { owner?.passthroughClick(e, button: .left) }
+    override func mouseUp(with e: NSEvent)      { }   // 클릭은 down에서 down+up 시퀀스로 처리
+    override func mouseDragged(with e: NSEvent) { }
+    override func rightMouseDown(with e: NSEvent) { owner?.passthroughClick(e, button: .right) }
+    override func rightMouseUp(with e: NSEvent)   { }
     override func scrollWheel(with e: NSEvent)  { owner?.forwardScroll(e) }
 }

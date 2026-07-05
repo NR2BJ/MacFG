@@ -656,15 +656,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float3 warped = a * m + b * (1.0 - m);
         float3 a0 = imgA.sample(s, uv).rgb;
         float3 b0 = imgB.sample(s, uv).rgb;
-        // ① 워프 일관성 폴백 — 워프된 A/B가 불일치하면 flow가 틀린 것(조준점 오염, 빠른 게임
-        //    모션의 오위치 고스트 = '왔다갔다'). 원본 t-블렌드로 강등: 틀린 위치의 또렷한 유령
-        //    대신 제자리 크로스페이드 (MetalFlow가 게임에서 강한 핵심 기법의 이식).
-        float errFlow = dot(abs(a - b), kL);
-        float conf = 1.0 - smoothstep(0.06, 0.20, errFlow);
-        float3 srcBlend = mix(a0, b0, p.tPhase);
-        float3 outc = mix(srcBlend, warped, conf);
-        // ② 정적영역 보호(노이즈 강건) — diff를 ±0.75px 4점 평균(미니 블러)으로 판정해
-        //    압축 노이즈/링잉이 조준점·글자의 보호를 풀던 것 차단.
+        // ② 정적영역 보호용 소스 불일치(노이즈 강건) — ±0.75px 4점 평균(미니 블러)
         float2 po = 0.75 / sizeF;
         float dBlur = 0.0;
         dBlur += dot(abs(imgA.sample(s, uv + float2( po.x,  po.y)).rgb - imgB.sample(s, uv + float2( po.x,  po.y)).rgb), kL);
@@ -672,6 +664,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         dBlur += dot(abs(imgA.sample(s, uv + float2( po.x, -po.y)).rgb - imgB.sample(s, uv + float2( po.x, -po.y)).rgb), kL);
         dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x, -po.y)).rgb - imgB.sample(s, uv + float2(-po.x, -po.y)).rgb), kL);
         dBlur *= 0.25;
+        // ① 워프 일관성 폴백 (자기 정규화) — "워프 후 불일치 ÷ 워프 전 불일치" 비율로 판정.
+        //    절대 임계(0.06)는 압축 스트림의 코덱 노이즈가 상시 초과 → conf 전면 붕괴로 모든
+        //    보간이 크로스페이드가 됨('보간 없음' 증상, 실측). 비율은 노이즈가 분자·분모에 같이
+        //    들어 상쇄: flow가 맞으면 워프 후 불일치 << 소스 불일치(비율~0.1-0.3) → 워프 신뢰,
+        //    flow가 틀리면 비율 ~1 → 제자리 크로스페이드 강등.
+        float errFlow = dot(abs(a - b), kL);
+        float ratio = errFlow / (dBlur + 0.015);
+        float conf = 1.0 - smoothstep(0.75, 1.30, ratio);
+        float3 srcBlend = mix(a0, b0, p.tPhase);
+        float3 outc = mix(srcBlend, warped, conf);
+        // ③ 정적영역 보호 — 소스가 이미 일치하는 픽셀(조준점/HUD/글자)은 원본 고정
         float staticW = 1.0 - smoothstep(0.025, 0.09, dBlur);
         outc = mix(outc, mix(a0, b0, p.tPhase), staticW);
         outTex.write(float4(outc, 1.0), gid);

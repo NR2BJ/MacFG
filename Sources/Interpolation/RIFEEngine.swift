@@ -650,13 +650,15 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float m = 1.0 / (1.0 + exp(-maskTex.sample(s, uv).r));
         float2 f0 = f.xy * p.flowScale * p.scale0;
         float2 f1 = f.zw * p.flowScale * p.scale1;
-        float3 a = imgA.sample(s, uv + f0 / sizeF).rgb;
-        float3 b = imgB.sample(s, uv + f1 / sizeF).rgb;
         const float3 kL = float3(0.299, 0.587, 0.114);
+        float2 uvA = uv + f0 / sizeF;
+        float2 uvB = uv + f1 / sizeF;
+        float3 a = imgA.sample(s, uvA).rgb;
+        float3 b = imgB.sample(s, uvB).rgb;
         float3 warped = a * m + b * (1.0 - m);
         float3 a0 = imgA.sample(s, uv).rgb;
         float3 b0 = imgB.sample(s, uv).rgb;
-        // ② 정적영역 보호용 소스 불일치(노이즈 강건) — ±0.75px 4점 평균(미니 블러)
+        // 소스 불일치(±0.75px 4점 미니블러 — 코덱 노이즈 내성)
         float2 po = 0.75 / sizeF;
         float dBlur = 0.0;
         dBlur += dot(abs(imgA.sample(s, uv + float2( po.x,  po.y)).rgb - imgB.sample(s, uv + float2( po.x,  po.y)).rgb), kL);
@@ -664,19 +666,25 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         dBlur += dot(abs(imgA.sample(s, uv + float2( po.x, -po.y)).rgb - imgB.sample(s, uv + float2( po.x, -po.y)).rgb), kL);
         dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x, -po.y)).rgb - imgB.sample(s, uv + float2(-po.x, -po.y)).rgb), kL);
         dBlur *= 0.25;
-        // ① 워프 일관성 폴백 (자기 정규화) — "워프 후 불일치 ÷ 워프 전 불일치" 비율로 판정.
-        //    절대 임계(0.06)는 압축 스트림의 코덱 노이즈가 상시 초과 → conf 전면 붕괴로 모든
-        //    보간이 크로스페이드가 됨('보간 없음' 증상, 실측). 비율은 노이즈가 분자·분모에 같이
-        //    들어 상쇄: flow가 맞으면 워프 후 불일치 << 소스 불일치(비율~0.1-0.3) → 워프 신뢰,
-        //    flow가 틀리면 비율 ~1 → 제자리 크로스페이드 강등.
-        float errFlow = dot(abs(a - b), kL);
-        float ratio = errFlow / (dBlur + 0.015);
-        float conf = 1.0 - smoothstep(0.75, 1.30, ratio);
+        // 워프 후 불일치도 ±1.5px 미니블러 — coarse flow(288→풀해상도 6.7×)의 1~3px 양자화
+        //    어긋남은 정상인데, 단일점 비교는 텍스처에서 이를 오류로 오판해 conf를 깎아
+        //    절반 크로스페이드(부드러움 소실, 실측)를 만든다. 블러 비교는 소소한 어긋남을
+        //    용서하고 진짜 오정합(블러 반경 초과)만 벌점.
+        float2 pw = 1.5 / sizeF;
+        float errW = 0.0;
+        errW += dot(abs(imgA.sample(s, uvA + float2( pw.x,  pw.y)).rgb - imgB.sample(s, uvB + float2( pw.x,  pw.y)).rgb), kL);
+        errW += dot(abs(imgA.sample(s, uvA + float2(-pw.x,  pw.y)).rgb - imgB.sample(s, uvB + float2(-pw.x,  pw.y)).rgb), kL);
+        errW += dot(abs(imgA.sample(s, uvA + float2( pw.x, -pw.y)).rgb - imgB.sample(s, uvB + float2( pw.x, -pw.y)).rgb), kL);
+        errW += dot(abs(imgA.sample(s, uvA + float2(-pw.x, -pw.y)).rgb - imgB.sample(s, uvB + float2(-pw.x, -pw.y)).rgb), kL);
+        errW *= 0.25;
+        // 일관성 비율 판정 — flow 정확: errW << dBlur → 워프 신뢰(보간 부드러움).
+        // flow 오류(오위치 유령): errW ≥ dBlur → 제자리 크로스페이드 강등.
+        // 정적 UI(조준점/글자): dBlur≈0 + errW(배경 워프)큼 → 비율↑ → 원본 크로스페이드 = 고정.
+        // (별도 정적 마스크는 제거 — 느린 팬까지 얼려 60fps 계단을 만들었음, 실측 '부드러움 없음'.)
+        float ratio = errW / (dBlur + 0.01);
+        float conf = 1.0 - smoothstep(0.9, 1.6, ratio);
         float3 srcBlend = mix(a0, b0, p.tPhase);
         float3 outc = mix(srcBlend, warped, conf);
-        // ③ 정적영역 보호 — 소스가 이미 일치하는 픽셀(조준점/HUD/글자)은 원본 고정
-        float staticW = 1.0 - smoothstep(0.025, 0.09, dBlur);
-        outc = mix(outc, mix(a0, b0, p.tPhase), staticW);
         outTex.write(float4(outc, 1.0), gid);
     }
     """

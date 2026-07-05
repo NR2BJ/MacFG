@@ -33,6 +33,7 @@ final class RelativePointer {
     private var thread: Thread?
     private var threadRunLoop: CFRunLoop?
     private let threadReady = DispatchSemaphore(value: 0)
+    private let threadStopped = DispatchSemaphore(value: 0)
     private var wasOutside = false                   // 직전 이벤트가 옆 모니터였나 (탭 스레드 전용)
     private var dragFrameNS: CGRect?                 // 버튼 다운 중 고정된 소스 프레임 (탭 스레드 전용)
 
@@ -82,6 +83,7 @@ final class RelativePointer {
         CGEvent.tapEnable(tap: tap, enable: true)
         threadReady.signal()
         CFRunLoopRun()                                // disable()의 CFRunLoopStop까지 실행
+        threadStopped.signal()                        // 종료 확정 신호 (disable이 대기)
     }
 
     func disable() {
@@ -96,6 +98,10 @@ final class RelativePointer {
             CFRunLoopStop(rl)
         }
         CFRunLoopWakeUp(rl)
+        // **스레드 종료를 동기 대기** — 비동기로 두면 스레드가 아직 도는 중 소유자(OverlayWindow)가
+        // dealloc돼 refcon(passUnretained self)이 dangling → 힙 손상(동시 해제되는 다른 객체에서
+        // over-release로 표출). 종료 확정 후 정리한다(0.5s 타임아웃 — 최악에도 앱은 안 멈춤).
+        _ = threadStopped.wait(timeout: .now() + 0.5)
         tap = nil; runLoopSource = nil; thread = nil; threadRunLoop = nil; dragFrameNS = nil
         DiagnosticLog.shared.log("[RELPTR] disabled")
     }
@@ -117,13 +123,17 @@ final class RelativePointer {
         let nx = (winX - lb.minX) / lb.width
         let ny = (winY - lb.minY) / lb.height          // NS: 0=하단
         guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }
-        var frame = frameOverride ?? g.sourceFrameNS
+        let frame = frameOverride ?? g.sourceFrameNS
         guard frame.width > 1, frame.height > 1 else { return nil }
+        var sxNS = frame.minX + nx * frame.width
+        var syNS = frame.minY + ny * frame.height
+        // 프레임 전체를 인셋하면 매핑이 중심으로 압축돼 커서와 클릭 위치가 어긋난다(업스케일 배율만큼
+        // 증폭 — 오른쪽 클릭이 왼쪽으로 쏠림, 실측). 대신 **매핑된 위치만 가장자리 3pt 안으로 클램프** —
+        // 내부는 커서와 1:1 정확하고, 창 테두리(리사이즈 존)만 회피.
         if clickInset, frame.width > 40, frame.height > 40 {
-            frame = frame.insetBy(dx: 8, dy: 8)
+            sxNS = min(max(sxNS, frame.minX + 3), frame.maxX - 3)
+            syNS = min(max(syNS, frame.minY + 3), frame.maxY - 3)
         }
-        let sxNS = frame.minX + nx * frame.width
-        let syNS = frame.minY + ny * frame.height
         return CGPoint(x: sxNS, y: g.primaryHeight - syNS)
     }
 

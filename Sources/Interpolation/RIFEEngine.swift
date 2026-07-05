@@ -150,26 +150,29 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
     // MARK: - Prepare
 
-    public func prepare(device: any MTLDevice) async throws {
-        self.device = device
-        let short = Self.flowShortSide
-        guard let src = Self.modelSourceURL(short: short) else {
-            logger.error("rife\(short) model not found")
-            throw InterpolationError.notPrepared
-        }
-        let compiled = try await Self.compiledModelURL(source: src, short: short)
+    /// 모델 로드 (단변/유닛 지정) — prepare와 사다리 스위치가 공유
+    private static func loadModel(short: Int, gpu: Bool) async throws -> (MLModel, Int, Int) {
+        guard let src = modelSourceURL(short: short) else { throw InterpolationError.notPrepared }
+        let compiled = try await compiledModelURL(source: src, short: short)
         let config = MLModelConfiguration()
-        config.computeUnits = Self.useGPU ? .cpuAndGPU : .cpuAndNeuralEngine
+        config.computeUnits = gpu ? .cpuAndGPU : .cpuAndNeuralEngine
         let model = try await MLModel.load(contentsOf: compiled, configuration: config)
-        self.model = model
-
-        // 모델 입력 크기 추출 (x: [1,6,H,W])
         guard let xDesc = model.modelDescription.inputDescriptionsByName["x"],
               let shape = xDesc.multiArrayConstraint?.shape, shape.count == 4 else {
             throw InterpolationError.notPrepared
         }
-        modelH = shape[2].intValue
-        modelW = shape[3].intValue
+        return (model, shape[3].intValue, shape[2].intValue)
+    }
+
+    public func prepare(device: any MTLDevice) async throws {
+        self.device = device
+        let short = Self.flowShortSide
+        let (model, w, h) = try await Self.loadModel(short: short, gpu: Self.useGPU)
+        self.model = model
+        modelW = w
+        modelH = h
+        currentShort = short
+        currentGPU = Self.useGPU
 
         packQueue = device.makeCommandQueue()
         let library = try await device.makeLibrary(source: Self.shaderSource, options: nil)
@@ -181,8 +184,14 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         unpackPSO = try await pso("rifeUnpack")
         warpPSO = try await pso("rifeWarp")
 
-        // 슬롯 3개 × 앵커별 flow/mask 세트 (360 기준 슬롯당 ~11MB, 총 ~34MB)
-        slots = []
+        slots = try Self.buildSlots(device: device, modelW: modelW, modelH: modelH)
+        cancelled.withLock { $0 = false }
+        DiagnosticLog.shared.log("[RIFE] prepared: \(modelW)x\(modelH) flow (\(short)p), unit=\(Self.useGPU ? "GPU" : "ANE")")
+    }
+
+    /// 슬롯 3개 × 앵커별 flow/mask 세트 (360 기준 슬롯당 ~11MB, 총 ~34MB)
+    private static func buildSlots(device: any MTLDevice, modelW: Int, modelH: Int) throws -> [Slot] {
+        var slots: [Slot] = []
         let planeBytes = modelW * modelH * 2
         for _ in 0..<3 {
             guard let packBuf = device.makeBuffer(length: planeBytes * 6, options: .storageModeShared),
@@ -214,8 +223,78 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             slots.append(Slot(packBuf: packBuf, flowBufs: flowBufs, maskBufs: maskBufs,
                               statsBuf: statsBuf, flowTexs: flowTexs, maskTexs: maskTexs, event: event))
         }
-        cancelled.withLock { $0 = false }
-        DiagnosticLog.shared.log("[RIFE] prepared: \(modelW)x\(modelH) flow (\(short)p), unit=\(Self.useGPU ? "GPU" : "ANE")")
+        return slots
+    }
+
+    // MARK: - 적응 사다리 (GPU 과부하 → 288+ANE로 predict 이전, 여유 복귀 시 원복)
+
+    /// 현재 로드된 모델 단변/유닛
+    private var currentShort = 0
+    private var currentGPU = true
+    /// 전환 중 (encodePair는 nil 반환 — 소스만 표시, ~1s)
+    private let switching = OSAllocatedUnfairLock(initialState: false)
+    private var lastSwitchAt: CFTimeInterval = 0
+    private var ladderPairs = 0
+    private var ladderExhausts = 0
+    private var gapMsEMA: Double = 0
+
+    /// 과부하/여유 판정 → 필요 시 모델·유닛 핫스왑 킥. encodePair(렌더 스레드)에서 호출.
+    /// 판정: predict 중앙값이 쌍 간격의 90%↑(지속 불가) 또는 슬롯 고갈 5%↑ → (288, ANE)로
+    /// — predict를 ANE로 옮겨 GPU를 MetalFX 업스케일/표시에 돌려준다 (1080p60+4K뷰어에서
+    /// GPU 150%+ 포화 → tick 108Hz 붕괴 실측). 중앙값이 간격의 35%↓(예: 24fps 소스)면 원복.
+    private func maybeAdapt(gapS: Double, exhausted: Bool) {
+        ladderPairs += 1
+        if exhausted { ladderExhausts += 1 }
+        gapMsEMA = gapMsEMA == 0 ? gapS * 1000 : gapMsEMA * 0.9 + gapS * 1000 * 0.1
+        guard ladderPairs >= 180 else { return }   // ~3s @60fps 윈도
+        let exhaustRate = Double(ladderExhausts) / Double(ladderPairs)
+        ladderPairs = 0
+        ladderExhausts = 0
+        let med = predictMsMedian()
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastSwitchAt > 10, med > 0, gapMsEMA > 1 else { return }
+
+        let overloaded = med > gapMsEMA * 0.9 || exhaustRate > 0.05
+        let underloaded = med < gapMsEMA * 0.35
+        if overloaded, currentGPU, Self.modelAvailable(short: 288) {
+            kickSwitch(short: 288, gpu: false,
+                       reason: "과부하 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
+        } else if underloaded, !currentGPU {
+            kickSwitch(short: Self.flowShortSide, gpu: true,
+                       reason: "여유 복귀 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
+        }
+    }
+
+    private func kickSwitch(short: Int, gpu: Bool, reason: String) {
+        guard switching.withLock({ if $0 { return false }; $0 = true; return true }) else { return }
+        lastSwitchAt = CFAbsoluteTimeGetCurrent()
+        DiagnosticLog.shared.log("[RIFE] ladder → \(short)p/\(gpu ? "GPU" : "ANE") (\(reason))")
+        Task { [weak self] in
+            guard let self, let device = self.device else { return }
+            defer { self.switching.withLock { $0 = false } }
+            do {
+                let (newModel, w, h) = try await Self.loadModel(short: short, gpu: gpu)
+                // 인플라이트 predict/warp 완료 대기 (슬롯 전부 반납까지, 최대 2s)
+                for _ in 0..<40 {
+                    let allFree = self.slotLock.withLock { self.slots.allSatisfy { !$0.busy } }
+                    if allFree { break }
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                let newSlots = try Self.buildSlots(device: device, modelW: w, modelH: h)
+                self.slotLock.withLock {
+                    self.model = newModel
+                    self.modelW = w
+                    self.modelH = h
+                    self.slots = newSlots
+                    self.currentShort = short
+                    self.currentGPU = gpu
+                }
+                self.predictMsRing.withLock { $0 = [] }   // 새 속도 — 예산 재학습
+                DiagnosticLog.shared.log("[RIFE] ladder 전환 완료: \(w)x\(h) (\(short)p/\(gpu ? "GPU" : "ANE"))")
+            } catch {
+                DiagnosticLog.shared.log("[RIFE] ladder 전환 실패: \(error)")
+            }
+        }
     }
 
     // MARK: - Encode
@@ -228,15 +307,18 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         tValues: [Float],
         into commandBuffer: any MTLCommandBuffer
     ) -> PairEncodeResult? {
-        guard let model, let packQueue, let packPSO, let unpackPSO, let warpPSO,
+        guard let packQueue, let packPSO, let unpackPSO, let warpPSO,
               !tValues.isEmpty, tsB > tsA else { return nil }
+        if switching.withLock({ $0 }) { return nil }   // 사다리 전환 중 — 소스만 표시 (~1s)
 
-        // 슬롯 확보 — 모두 predict 중이면 이 쌍은 스킵 (자연 배압: 소스만 표시)
-        let slot: Slot? = slotLock.withLock {
-            if let s = slots.first(where: { !$0.busy }) { s.busy = true; s.useCount += 1; return s }
+        // 슬롯+모델 원자 스냅샷 — 사다리 스왑(모델·크기·슬롯 동시 교체)과 일관성 보장
+        let acquired: (Slot, MLModel, Int, Int)? = slotLock.withLock {
+            guard let m = model else { return nil }
+            if let s = slots.first(where: { !$0.busy }) { s.busy = true; s.useCount += 1; return (s, m, modelW, modelH) }
             return nil
         }
-        guard let slot else { return nil }
+        maybeAdapt(gapS: tsB - tsA, exhausted: acquired == nil)
+        guard let (slot, model, mW0, mH0) = acquired else { return nil }
         let signalValue = slot.useCount
 
         ensureOutputPool(width: stableB.width, height: stableB.height)
@@ -279,13 +361,13 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         packEnc.setTexture(stableB, index: 1)
         packEnc.setBuffer(slot.packBuf, offset: 0, index: 0)
         packEnc.setBuffer(slot.statsBuf, offset: 0, index: 1)
-        var packParams = SIMD2<UInt32>(UInt32(modelW), UInt32(modelH))
+        var packParams = SIMD2<UInt32>(UInt32(mW0), UInt32(mH0))
         packEnc.setBytes(&packParams, length: MemoryLayout<SIMD2<UInt32>>.size, index: 2)
-        dispatch(packEnc, width: modelW, height: modelH, pso: packPSO)
+        dispatch(packEnc, width: mW0, height: mH0, pso: packPSO)
         packEnc.endEncoding()
 
         // ── ② pack 완료 → 워커에서 predict → 어떤 경로든 event signal
-        let mW = modelW, mH = modelH
+        let mW = mW0, mH = mH0
         let workerRef = worker
         let cancelledRef = cancelled
         let ringRef = predictMsRing
@@ -357,7 +439,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             upEnc.setBuffer(slot.maskBufs[i], offset: 0, index: 1)
             upEnc.setTexture(slot.flowTexs[i], index: 0)
             upEnc.setTexture(slot.maskTexs[i], index: 1)
-            dispatch(upEnc, width: modelW, height: modelH, pso: unpackPSO)
+            dispatch(upEnc, width: mW0, height: mH0, pso: unpackPSO)
             upEnc.endEncoding()
         }
 
@@ -378,7 +460,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             enc.setTexture(slot.maskTexs[ai], index: 3)
             enc.setTexture(output, index: 4)
             var wp = WarpParams(
-                flowScale: SIMD2<Float>(Float(output.width) / Float(modelW), Float(output.height) / Float(modelH)),
+                flowScale: SIMD2<Float>(Float(output.width) / Float(mW0), Float(output.height) / Float(mH0)),
                 scale0: t / anchor,
                 scale1: (1 - t) / (1 - anchor))
             enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)

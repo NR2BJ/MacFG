@@ -184,9 +184,8 @@ public final class OverlayWindow: NSObject {
     public var sourceWindowID: CGWindowID = 0
     private weak var interactionView: ViewerInteractionView?
 
-    /// 상대커서 모드 — 진짜 커서를 소스에 상주(호버/스크롤/클릭/드래그 전부 진짜 이벤트)
+    /// 상대커서 모드 — 진짜 커서 위치를 소스로 재타깃 (호버/스크롤/클릭/드래그 전부 진짜 이벤트)
     private let relativePointer = RelativePointer()
-    private var cursorLayer: CAShapeLayer?
 
     public init(device: any MTLDevice, style: OverlayStyle, title: String = "MacFG Output") throws {
         self.device = device
@@ -298,31 +297,10 @@ public final class OverlayWindow: NSObject {
         logger.info("OverlayWindow created (style=\(String(describing: style)))")
     }
 
-    // MARK: - 상대커서 모드 (뷰어 → 소스, 진짜 커서 상주)
+    // MARK: - 상대커서 모드 (진짜 커서 위치를 소스로 재타깃 — 링·숨김 없음)
 
-    /// 합성 커서 레이어 생성 + RelativePointer 클로저 배선 (지오메트리/매핑/커서 제공)
+    /// RelativePointer 클로저 배선 (지오메트리/매핑/복귀 콜백)
     private func setupRelativePointer() {
-        // 합성 커서 — 링+중심점(방향 없는 심볼, 레터박스 위 최상단). 실제 커서는 숨김.
-        let ring = CAShapeLayer()
-        let r: CGFloat = 11
-        ring.path = CGPath(ellipseIn: CGRect(x: -r, y: -r, width: r * 2, height: r * 2), transform: nil)
-        ring.fillColor = NSColor.clear.cgColor
-        ring.strokeColor = NSColor.white.cgColor
-        ring.lineWidth = 2
-        ring.shadowColor = NSColor.black.cgColor
-        ring.shadowOpacity = 0.9
-        ring.shadowRadius = 2
-        ring.shadowOffset = .zero
-        let dot = CAShapeLayer()
-        let d: CGFloat = 2.2
-        dot.path = CGPath(ellipseIn: CGRect(x: -d, y: -d, width: d * 2, height: d * 2), transform: nil)
-        dot.fillColor = NSColor.white.cgColor
-        ring.addSublayer(dot)
-        ring.isHidden = true
-        ring.zPosition = 100
-        interactionView?.layer?.addSublayer(ring)
-        cursorLayer = ring
-
         relativePointer.viewerDisplayID = { [weak self] in
             (self?.window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
                 ?? CGMainDisplayID()
@@ -331,23 +309,14 @@ public final class OverlayWindow: NSObject {
         relativePointer.mapVirtualToSource = { [weak self] cg, frozenFrame, clickInset in
             self?.mapGlobalCGToSource(cg, frameOverride: frozenFrame, clickInset: clickInset)
         }
-        relativePointer.onSyntheticCursor = { [weak self] cg in
-            guard let self, let layer = self.cursorLayer else { return }
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            layer.position = self.globalCGToWindowNS(cg)   // non-flipped 뷰 → 레이어 좌표=창 NS
-            CATransaction.commit()
-        }
-        relativePointer.onSuspendChange = { [weak self] suspended in
-            guard let self else { return }
-            self.cursorLayer?.isHidden = suspended         // 탈출 중엔 링 숨김(진짜 커서가 대신)
-            if !suspended, self.sourcePID != 0 {
-                // 복귀 — 옆 모니터에서 다른 앱을 활성화했을 수 있으니 소스 재활성 (호버 좌표 필수)
-                NSRunningApplication(processIdentifier: self.sourcePID)?.activate()
-            }
+        relativePointer.onReturnedToViewer = { [weak self] in
+            // 옆 모니터에서 복귀 — 다른 앱을 활성화했을 수 있으니 소스 재활성 (호버 좌표 필수)
+            guard let self, self.sourcePID != 0 else { return }
+            NSRunningApplication(processIdentifier: self.sourcePID)?.activate()
         }
     }
 
-    // MARK: 좌표 변환 (전역 CG ↔ 창 NS)
+    // MARK: 좌표 변환 (전역 CG → 창 NS)
 
     private var primaryScreenHeight: CGFloat {
         NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
@@ -359,34 +328,7 @@ public final class OverlayWindow: NSObject {
         return CGPoint(x: p.x - f.minX, y: (primaryScreenHeight - p.y) - f.minY)
     }
 
-    private func windowNSToGlobalCG(_ p: CGPoint) -> CGPoint {
-        let f = window.frame
-        return CGPoint(x: p.x + f.minX, y: primaryScreenHeight - (p.y + f.minY))
-    }
-
-    /// 진짜 커서를 그대로 써도 되는가 — 소스 화면 rect와 뷰어 레터박스 rect가 거의 겹치면(네 모서리
-    /// 최대 발산 < 150px) 진짜 커서가 가리키는 위치와 사실상 일치하므로 링 대신 진짜 커서를 노출한다.
-    /// 발산이 크면(진짜 업스케일) 진짜 커서는 구석 작은 영역에 눌려 어긋나므로 링이 필요.
-    private func nativeCursorViable() -> Bool {
-        guard style == .viewer, sourceFrameNS.width > 1, sourceFrameNS.height > 1 else { return false }
-        let lb = metalLayer.frame
-        guard lb.width > 1, lb.height > 1 else { return false }
-        var maxD: CGFloat = 0
-        for nx: CGFloat in [0, 1] {
-            for ny: CGFloat in [0, 1] {
-                let ringCG = windowNSToGlobalCG(CGPoint(x: lb.minX + nx * lb.width, y: lb.minY + ny * lb.height))
-                let srcNS = CGPoint(x: sourceFrameNS.minX + nx * sourceFrameNS.width,
-                                    y: sourceFrameNS.minY + ny * sourceFrameNS.height)
-                let srcCG = CGPoint(x: srcNS.x, y: primaryScreenHeight - srcNS.y)
-                maxD = max(maxD, hypot(ringCG.x - srcCG.x, ringCG.y - srcCG.y))
-            }
-        }
-        // 임계 300px: 거의 풀스크린 창(코너 ~170px)은 native, 진짜 업스케일(반화면 800px+,
-        // 작은창 1000px+)은 링. 두 군집 사이 넓은 간격이라 안전. 사용자 실사용(최대화 창)은 ~12px.
-        return maxD < 300
-    }
-
-    /// 가상 커서(전역 CG)를 소스 창 좌표(전역 CG)로. 레터박스 밖이면 nil.
+    /// 진짜 커서 위치(전역 CG)를 소스 창 좌표(전역 CG)로. 레터박스 밖이면 nil.
     /// - frameOverride: 드래그 중 고정 프레임 (창이 제 드래그를 쫓는 폭주 방지)
     /// - clickInset: 클릭/드래그는 소스 프레임 8pt 안쪽으로 — 가장자리 리사이즈 존 회피
     private func mapGlobalCGToSource(_ p: CGPoint, frameOverride: CGRect?, clickInset: Bool) -> CGPoint? {
@@ -413,26 +355,16 @@ public final class OverlayWindow: NSObject {
         window.ignoresMouseEvents = true            // 재게시 이벤트가 뷰어 통과 → 소스 도달
         // 소스를 키 창으로 — 비활성 창은 mouseMoved 로컬좌표가 붕괴해 호버가 죽음(실측 재확인).
         if sourcePID != 0 { NSRunningApplication(processIdentifier: sourcePID)?.activate() }
-        // 옛 postToPid 포워딩 경로 차단 — 재타깃으로 커서가 뷰어 위(fullscreen)를 지나면
-        // ViewerInteractionView 트래킹영역이 발화해 이벤트를 한 번 더 매핑·전달(이중 배달, 실측).
-        // 상대커서 모드는 탭이 전담하므로 owner를 떼어 트래킹영역 mouseMoved를 무력화.
+        // 옛 postToPid 포워딩 경로 차단 — 진짜 커서가 뷰어 위(fullscreen)에 있어 ViewerInteractionView
+        // 트래킹영역이 발화하면 이벤트가 한 번 더 매핑·전달(이중 배달, 실측). 탭이 전담하므로 무력화.
         interactionView?.owner = nil
-        // 소스가 화면에서 거의 풀스크린(≈1:1)이면 진짜 커서가 가리키는 곳과 거의 겹치므로 링을 끄고
-        // 진짜(네이티브) 커서를 그대로 노출한다. 진짜 업스케일(작은 소스)이면 링 사용.
-        let native = nativeCursorViable()
-        cursorLayer?.isHidden = native
-        let lb = metalLayer.frame
-        let centerWin = lb.width > 1 ? CGPoint(x: lb.midX, y: lb.midY)
-                                     : CGPoint(x: window.frame.width / 2, y: window.frame.height / 2)
-        relativePointer.enable(initialGlobalCG: windowNSToGlobalCG(centerWin), on: window.screen,
-                               useNativeCursor: native)
+        relativePointer.enable(on: window.screen)
     }
 
-    /// 뷰어 숨김/정지 시 상대커서 이탈 — 커서 복구 + 클릭투과 해제.
+    /// 뷰어 숨김/정지 시 상대커서 이탈 — 클릭투과 해제.
     private func exitRelativePointer() {
         guard style == .viewer else { return }
         relativePointer.disable()
-        cursorLayer?.isHidden = true
         window.ignoresMouseEvents = false
         interactionView?.owner = self   // 옛 경로 복원 (폴백용)
     }

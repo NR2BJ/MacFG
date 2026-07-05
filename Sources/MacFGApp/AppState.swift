@@ -258,8 +258,13 @@ public final class AppState {
     }
 
     /// 설정을 UserDefaults에 저장 (재시작해도 유지 — 설정 우선 앱 특성)
-    /// UI 언어 적용 — AppLanguage.current 갱신 + 영속. 뷰가 uiLanguage를 관찰하므로 즉시 재구성됨.
-    func updateLanguage() { AppLanguage.apply(raw: uiLanguage) }
+    /// UI 언어 적용 — **AppLanguage.current를 먼저 갱신한 뒤** uiLanguage를 세팅.
+    /// onChange는 body 재평가 이후에 불려서 재구성이 옛 언어로 일어나던 버그(2026-07-05)를 회피:
+    /// 커스텀 바인딩 set에서 이 메서드를 부르면 current가 관찰 트리거보다 먼저 갱신돼 즉시 반영됨.
+    func setLanguage(_ raw: String) {
+        AppLanguage.apply(raw: raw)
+        uiLanguage = raw
+    }
 
     /// 개발자 로그 토글 — on이면 /tmp/MacFG_diag.log 기록, off면 삭제+기록 중단.
     func updateDevLogging() { DiagnosticLog.shared.setEnabled(devLoggingEnabled) }

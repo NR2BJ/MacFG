@@ -307,14 +307,16 @@ struct WindowPickerView: View {
                   detail: L("Overrides the auto-detected system language (default: System).",
                             "시스템 언어 자동 감지를 덮어씁니다 (기본: 시스템).",
                             "システム言語の自動検出を上書きします(既定: システム)。")) {
-                Picker("", selection: $appState.uiLanguage) {
+                Picker("", selection: Binding(
+                    get: { appState.uiLanguage },
+                    set: { appState.setLanguage($0) }   // current를 재구성 전에 갱신 → 즉시 반영
+                )) {
                     Text(L("System", "시스템", "システム")).tag("system")
                     Text("한국어").tag("ko")
                     Text("English").tag("en")
                     Text("日本語").tag("ja")
                 }
                 .labelsHidden().pickerStyle(.menu).fixedSize()
-                .onChange(of: appState.uiLanguage) { appState.updateLanguage() }
             }
 
             field(L("Hide from Dock", "Dock에서 숨기기", "Dockから隠す"),

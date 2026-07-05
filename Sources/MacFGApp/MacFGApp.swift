@@ -8,9 +8,10 @@ struct MacFGApp: App {
     @Environment(\.openWindow) private var openWindow
 
     init() {
-        // 번들 앱이 아닌 경우에도 Dock + 메뉴바에 표시되도록
-        NSApplication.shared.setActivationPolicy(.regular)
-        NSApplication.shared.activate(ignoringOtherApps: true)
+        // 저장된 설정에 따라 Dock 표시 여부 결정 (메뉴바 전용이면 .accessory)
+        let menuBarOnly = UserDefaults.standard.bool(forKey: "s.menubaronly")
+        NSApplication.shared.setActivationPolicy(menuBarOnly ? .accessory : .regular)
+        if !menuBarOnly { NSApplication.shared.activate(ignoringOtherApps: true) }
     }
 
     var body: some Scene {

@@ -124,6 +124,10 @@ public final class AppState {
     var availableWindows: [WindowInfo] = []
     var isInterpolationEnabled: Bool = true
     var interpolationEngine: String = "None"
+    // 앱 설정 (엔진 무관) — 각 update*가 자체 영속. UI 언어는 관찰되어 변경 시 뷰 재구성→L() 재평가.
+    var uiLanguage: String = UserDefaults.standard.string(forKey: "s.lang") ?? "system"
+    var devLoggingEnabled: Bool = UserDefaults.standard.bool(forKey: "s.devlog")
+    var menuBarOnly: Bool = UserDefaults.standard.bool(forKey: "s.menubaronly")
     // 기본 엔진 = Metal Flow: 24/30/60fps 전 매트릭스에서 우위 실측
     // (144Hz 기준 — 24fps: 144fps/σ0.8 vs AppleFI 48fps/σ9; 지터 강건성 동급 이상)
     var selectedRenderMode: RenderMode = .metalFlow
@@ -254,6 +258,19 @@ public final class AppState {
     }
 
     /// 설정을 UserDefaults에 저장 (재시작해도 유지 — 설정 우선 앱 특성)
+    /// UI 언어 적용 — AppLanguage.current 갱신 + 영속. 뷰가 uiLanguage를 관찰하므로 즉시 재구성됨.
+    func updateLanguage() { AppLanguage.apply(raw: uiLanguage) }
+
+    /// 개발자 로그 토글 — on이면 /tmp/MacFG_diag.log 기록, off면 삭제+기록 중단.
+    func updateDevLogging() { DiagnosticLog.shared.setEnabled(devLoggingEnabled) }
+
+    /// Dock 표시 여부 — on이면 메뉴바 전용(.accessory, Dock/⌘Tab 제거), off면 일반(.regular).
+    func updateMenuBarOnly() {
+        NSApplication.shared.setActivationPolicy(menuBarOnly ? .accessory : .regular)
+        if !menuBarOnly { NSApplication.shared.activate(ignoringOtherApps: true) }
+        UserDefaults.standard.set(menuBarOnly, forKey: "s.menubaronly")
+    }
+
     func persistSettings() {
         // 렌더 스레드 미러 동기화 (설정 변경은 전부 여길 지남)
         mirrorInterpolationEnabled = isInterpolationEnabled

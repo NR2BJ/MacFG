@@ -14,6 +14,7 @@ struct WindowPickerView: View {
                 upscalingSection
                 if appState.isCapturing { liveSection }
                 shortcutSection
+                appSection
             }
             .padding(18)
         }
@@ -293,6 +294,49 @@ struct WindowPickerView: View {
                 ShortcutRecorder(binding: $appState.hotCapture)
                     .frame(width: 96, height: 22)
                     .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
+            }
+        }
+    }
+
+    private var appSection: some View {
+        section(L("App", "앱", "アプリ")) {
+            field(L("Language", "언어", "言語"),
+                  hint: L("Applies immediately — no restart.",
+                          "즉시 적용 — 재시작 불필요.",
+                          "即時適用 — 再起動不要。"),
+                  detail: L("Overrides the auto-detected system language (default: System).",
+                            "시스템 언어 자동 감지를 덮어씁니다 (기본: 시스템).",
+                            "システム言語の自動検出を上書きします(既定: システム)。")) {
+                Picker("", selection: $appState.uiLanguage) {
+                    Text(L("System", "시스템", "システム")).tag("system")
+                    Text("한국어").tag("ko")
+                    Text("English").tag("en")
+                    Text("日本語").tag("ja")
+                }
+                .labelsHidden().pickerStyle(.menu).fixedSize()
+                .onChange(of: appState.uiLanguage) { appState.updateLanguage() }
+            }
+
+            field(L("Hide from Dock", "Dock에서 숨기기", "Dockから隠す"),
+                  hint: L("Menu-bar only — no Dock icon.",
+                          "메뉴바 전용 — Dock 아이콘 없음.",
+                          "メニューバーのみ — Dockアイコンなし。"),
+                  detail: L("The app lives in the menu bar; open this window from the menu-bar icon. ⌘Tab won't list it.",
+                            "앱은 메뉴바에 상주합니다. 이 창은 메뉴바 아이콘에서 엽니다. ⌘Tab 목록에도 안 뜹니다.",
+                            "アプリはメニューバーに常駐します。このウィンドウはメニューバーアイコンから開きます。⌘Tabにも表示されません。")) {
+                Toggle("", isOn: $appState.menuBarOnly).labelsHidden()
+                    .onChange(of: appState.menuBarOnly) { appState.updateMenuBarOnly() }
+            }
+
+            field(L("Developer logging", "개발자 로그", "開発者ログ"),
+                  hint: L("Off by default — records only when on.",
+                          "기본 꺼짐 — 켤 때만 기록.",
+                          "既定オフ — オン時のみ記録。"),
+                  detail: L("When on, writes /tmp/MacFG_diag.log for troubleshooting. Turning it off deletes the file and stops recording.",
+                            "켜면 문제 진단용 /tmp/MacFG_diag.log를 기록합니다. 끄면 파일을 삭제하고 기록을 멈춥니다.",
+                            "オンで /tmp/MacFG_diag.log を記録します。オフでファイルを削除し記録を停止します。")) {
+                Toggle("", isOn: $appState.devLoggingEnabled).labelsHidden()
+                    .onChange(of: appState.devLoggingEnabled) { appState.updateDevLogging() }
             }
         }
     }

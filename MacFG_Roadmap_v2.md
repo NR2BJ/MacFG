@@ -530,3 +530,30 @@ UI에서 세 엔진 전환 즉시 적용, M4 기준 1080p 60fps 출력 안정적
 ### 완료 기준
 
 1시간 이상 연속 크래시 없음. M4 기준 1080p CPU 10% 이하, GPU 30% 이하. Metal 네이티브 Optical Flow가 Apple Vision 대비 동등 이상 품질 + 낮은 레이턴시.
+
+---
+
+## 후속 개선 백로그 (2026-07-05 기록)
+
+이번 세션에서 전체화면 뷰어 마우스 조작(상대커서: 호버·클릭·스크롤·드래그) + 저지연 인터랙티브 모드를 완성했다. 사용 중 관찰된 다음 항목을 후속으로 남긴다.
+
+### B-1. 보간 페이싱 wobble 감소 + 신경망 엔진 튜닝 (우선순위 높음)
+
+- **증상**: present 타이밍은 완벽(glass σ≈0, 정확한 120Hz)인데 **콘텐츠 진행이 불균일**(content 8.3±3.7ms). 초당 프레임 수는 맞지만 모션이 살짝 흔들려 보임 — MetalFlow·AppleFI 공통.
+- **원인**: 보간 프레임의 시간축(t-value)이 vsync 그리드에 완전히 정렬되지 않아 콘텐츠 진행 간격이 출렁임. staleDrop 8~12/2s(보간 프레임 일부가 표시 시한을 놓쳐 드롭)도 기여.
+- **방향**:
+  1. 보간 t-value를 present 슬롯 시각에 정확히 배치해 콘텐츠 균등 진행(그리드 정렬 정밀화).
+  2. latencyOffset / 케이던스 락 재검토로 staleDrop(늦은 보간 프레임) 축소.
+  3. 신경망 엔진(RIFE/AppleFI) 자체 품질·페이싱 튜닝을 함께.
+- **참고**: 이번 세션 변경(격자 지문·추적율·마우스 탭)과 **무관** 확인 — 추적율 15↔6Hz 동일. 기존 보간 페이싱 고유 특성이다.
+
+### B-2. 관찰 중 — teardown 크래시
+
+- 스택: OverlayWindow dealloc → RenderSurface deinit → MetalFXUpscaler over-release.
+- 유력 수정: RelativePointer 전용 탭 스레드를 **동기 정지**(disable()이 threadStopped 세마포어 대기)로 refcon dangling 차단.
+- 드물어 무인 재현이 어려움 → 실사용 재발 여부 관찰 필요.
+
+### B-3. 정리 — RIFE 모델 미추적
+
+- `Models/rife540.mlpackage`, `rife720.mlpackage` 미추적 상태.
+- Neural 모드를 배포에 포함할지(커밋) vs MetalFlow만 배포(gitignore) 결정 필요.

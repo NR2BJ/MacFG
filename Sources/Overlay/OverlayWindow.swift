@@ -310,10 +310,15 @@ public final class OverlayWindow: NSObject {
         return CGPoint(x: sxNS, y: primaryH - syNS)
     }
 
+    private let mouseEventSource = CGEventSource(stateID: .hidSystemState)
     private var mouseLogCount = 0
     fileprivate func forwardMouse(_ e: NSEvent, type: CGEventType, button: CGMouseButton = .left) {
         guard sourcePID != 0, let cg = mapToSourceCG(e.locationInWindow),
-              let ev = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: cg, mouseButton: button) else { return }
+              let ev = CGEvent(mouseEventSource: mouseEventSource, mouseType: type, mouseCursorPosition: cg, mouseButton: button) else { return }
+        // 클릭은 소스 앱을 활성화해야 확실히 처리됨 (가려진 백그라운드 앱은 입력 무시 가능)
+        if type == .leftMouseDown || type == .rightMouseDown {
+            NSRunningApplication(processIdentifier: sourcePID)?.activate()
+        }
         ev.postToPid(sourcePID)
         if type != .mouseMoved || mouseLogCount < 3 {   // 클릭은 항상, 이동은 처음 몇 개만
             mouseLogCount += 1
@@ -323,7 +328,7 @@ public final class OverlayWindow: NSObject {
 
     fileprivate func forwardScroll(_ e: NSEvent) {
         guard sourcePID != 0, let cg = mapToSourceCG(e.locationInWindow),
-              let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+              let ev = CGEvent(scrollWheelEvent2Source: mouseEventSource, units: .pixel, wheelCount: 2,
                                wheel1: Int32(e.scrollingDeltaY), wheel2: Int32(e.scrollingDeltaX), wheel3: 0) else { return }
         ev.location = cg
         ev.postToPid(sourcePID)

@@ -41,7 +41,7 @@ public final class RenderSurface: @unchecked Sendable {
     private let lock = NSLock()
     private var params: Params
     private var _scaleStatus: String?
-    private var dbgFrames = 0   // TEMP 진단
+    private var dbgLastTexW = 0, dbgLastTexH = 0   // 캡처 소스 크기 변화 추적(진단)
 
     /// 업스케일/샤픈 실동작 상태 (UI 표시용)
     public var scaleStatus: String? {
@@ -143,9 +143,10 @@ public final class RenderSurface: @unchecked Sendable {
             if p.isViewer, p.upscaleMode != .off {
                 let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
-                if dbgFrames < 8 {
-                    dbgFrames += 1
-                    DiagnosticLog.shared.log("[UPSCALE-DBG] f\(dbgFrames) tex=\(texture.width)x\(texture.height) bounds=\(Int(p.contentBounds.width))x\(Int(p.contentBounds.height)) layerFrame=\(Int(metalLayer.frame.width))x\(Int(metalLayer.frame.height)) scale=\(p.contentsScale) target=\(targetW)x\(targetH) engage=\(targetW > texture.width || targetH > texture.height) mode=\(p.upscaleMode)")
+                // 캡처 소스 크기가 바뀔 때마다 로깅 — 첫 캡처의 저해상도 드롭 순간 포착용
+                if dbgLastTexW != texture.width || dbgLastTexH != texture.height {
+                    dbgLastTexW = texture.width; dbgLastTexH = texture.height
+                    DiagnosticLog.shared.log("[UPSCALE-DBG] source \(texture.width)x\(texture.height) → target \(targetW)x\(targetH) engage=\(targetW > texture.width || targetH > texture.height) mode=\(p.upscaleMode)")
                 }
                 if targetW > texture.width || targetH > texture.height {
                     var cur = source
@@ -165,9 +166,9 @@ public final class RenderSurface: @unchecked Sendable {
                 }
             }
             if chain.isEmpty { chain.append(p.isViewer ? "1:1" : "1:1 cover") }
-            if dbgFrames <= 8 { DiagnosticLog.shared.log("[UPSCALE-DBG]   → chain=\(chain.joined(separator: " · "))") }
             chain.append(p.sharpness > 0.01 ? String(format: "sharpen %.1f", p.sharpness) : "sharpen off")
-            let status = chain.joined(separator: " · ")
+            // 소스 해상도를 앞에 표시 — 첫 캡처 저해상도 드롭이 UI에 바로 보이도록
+            let status = "src \(texture.width)×\(texture.height) · " + chain.joined(separator: " · ")
             lock.lock(); _scaleStatus = status; lock.unlock()
         } else {
             lock.lock(); _scaleStatus = nil; lock.unlock()

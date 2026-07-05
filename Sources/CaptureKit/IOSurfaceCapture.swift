@@ -202,13 +202,18 @@ public final class IOSurfaceCapture: FrameSource, @unchecked Sendable {
         let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
 
         var hash: UInt64 = 0xcbf29ce484222325
-        let cols = 16
-        let rows = 9
+        // 균등 격자 ~8k점 — 성긴 샘플(16×9)은 작은 국소 변화(가로 텍스트 선택 몇 글자)를 놓쳐
+        // 프레임을 dup-skip → 화면 정지(실측: 가로 드래그 5초 멈춤). 격자로 전 영역 촘촘히 커버.
+        let target = 8000
+        let aspect = Double(width) / Double(max(height, 1))
+        let cols = min(max(Int((Double(target) * aspect).squareRoot()), 16), width)
+        let rows = min(max(target / max(cols, 1), 16), height)
         for row in 0..<rows {
-            let y = (height * (row * 2 + 1)) / (rows * 2)
+            let y = (row * height + height / 2) / rows
+            let rowBase = y * bytesPerRow
             for col in 0..<cols {
-                let x = (width * (col * 2 + 1)) / (cols * 2)
-                let offset = y * bytesPerRow + x * 4
+                let x = (col * width + width / 2) / cols
+                let offset = rowBase + x * 4
                 for i in 0..<3 {
                     hash ^= UInt64(ptr[offset + i] >> 2)
                     hash &*= 0x100000001b3

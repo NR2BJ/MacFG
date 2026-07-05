@@ -306,22 +306,26 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
         let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
 
         var hash: UInt64 = 0xcbf29ce484222325 // FNV-1a offset basis
-        var state: UInt64 = 0x9e3779b97f4a7c15 // 고정 시드 — 프레임 간 동일 좌표
-        for _ in 0..<384 {
-            // splitmix64 — 결정적 산포 좌표
-            state &+= 0x9e3779b97f4a7c15
-            var z = state
-            z = (z ^ (z >> 30)) &* 0xbf58476d1ce4e5b9
-            z = (z ^ (z >> 27)) &* 0x94d049bb133111eb
-            z ^= z >> 31
-            let x = Int(z % UInt64(width))
-            let y = Int((z >> 32) % UInt64(height))
-            let offset = y * bytesPerRow + x * 4
-            // B, G, R만 사용 (A는 항상 255)
-            for i in 0..<3 {
-                let quantized = ptr[offset + i] >> 2
-                hash ^= UInt64(quantized)
-                hash &*= 0x100000001b3 // FNV-1a prime
+        // 균등 격자 샘플 (~8k점). 랜덤 384점은 작은 국소 변화(가로 텍스트 선택 몇 글자,
+        // ~100×15px)를 확률적으로 놓쳐 프레임을 dup-skip → 화면 정지(실측: 가로 드래그 5초 멈춤,
+        // 세로는 줄 단위 큰 변화라 잡혀서 부드러움). 격자로 전 영역을 ~10-30px 간격 커버해
+        // 작은 변화도 반드시 샘플에 걸리게 한다.
+        let target = 8000
+        let aspect = Double(width) / Double(max(height, 1))
+        let cols = min(max(Int((Double(target) * aspect).squareRoot()), 16), width)
+        let rows = min(max(target / max(cols, 1), 16), height)
+        for row in 0..<rows {
+            let y = (row * height + height / 2) / rows
+            let rowBase = y * bytesPerRow
+            for col in 0..<cols {
+                let x = (col * width + width / 2) / cols
+                let offset = rowBase + x * 4
+                // B, G, R만 사용 (A는 항상 255)
+                for i in 0..<3 {
+                    let quantized = ptr[offset + i] >> 2
+                    hash ^= UInt64(quantized)
+                    hash &*= 0x100000001b3 // FNV-1a prime
+                }
             }
         }
         return hash

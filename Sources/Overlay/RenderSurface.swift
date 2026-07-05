@@ -146,7 +146,7 @@ public final class RenderSurface: @unchecked Sendable {
                 // 캡처 소스 크기가 바뀔 때마다 로깅 — 첫 캡처의 저해상도 드롭 순간 포착용
                 if dbgLastTexW != texture.width || dbgLastTexH != texture.height {
                     dbgLastTexW = texture.width; dbgLastTexH = texture.height
-                    DiagnosticLog.shared.log("[UPSCALE-DBG] source \(texture.width)x\(texture.height) → target \(targetW)x\(targetH) engage=\(targetW > texture.width || targetH > texture.height) mode=\(p.upscaleMode)")
+                    DiagnosticLog.shared.log("[UPSCALE-DBG] source \(texture.width)x\(texture.height) → target \(targetW)x\(targetH) drawable=\(drawable.texture.width)x\(drawable.texture.height) drawableSize=\(Int(metalLayer.drawableSize.width))x\(Int(metalLayer.drawableSize.height)) engage=\(targetW > texture.width || targetH > texture.height) mode=\(p.upscaleMode)")
                 }
                 if targetW > texture.width || targetH > texture.height {
                     var cur = source
@@ -220,11 +220,18 @@ public final class RenderSurface: @unchecked Sendable {
             width: fitW,
             height: fitH
         )
-        if metalLayer.frame != fit || metalLayer.contentsScale != scale {
+        // 드로어블 backing 해상도 = 레이어 표시 크기 × 배율. 첫 캡처에 창이 전체화면 되기 전
+        // stale bounds로 drawableSize가 작게(예: 960×540) 시딩되고 갱신 안 돼, 업스케일한
+        // 3840 콘텐츠가 540p 드로어블에 눌려 흐리게 출력되던 버그 수정 — frame과 별개로 검사.
+        let dw = max(fit.width * scale, 64.0)
+        let dh = max(fit.height * scale, 64.0)
+        let drawableWrong = abs(metalLayer.drawableSize.width - dw) > 1 || abs(metalLayer.drawableSize.height - dh) > 1
+        if metalLayer.frame != fit || metalLayer.contentsScale != scale || drawableWrong {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             metalLayer.frame = fit
             if metalLayer.contentsScale != scale { metalLayer.contentsScale = scale }
+            if drawableWrong { metalLayer.drawableSize = CGSize(width: dw, height: dh) }
             CATransaction.commit()
         }
     }

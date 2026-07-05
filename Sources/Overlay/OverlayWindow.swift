@@ -184,6 +184,10 @@ public final class OverlayWindow: NSObject {
     public var sourceWindowID: CGWindowID = 0
     private weak var interactionView: ViewerInteractionView?
 
+    /// 상대커서 모드 — 진짜 커서를 소스에 상주(호버/스크롤/클릭/드래그 전부 진짜 이벤트)
+    private let relativePointer = RelativePointer()
+    private var cursorLayer: CAShapeLayer?
+
     public init(device: any MTLDevice, style: OverlayStyle, title: String = "MacFG Output") throws {
         self.device = device
         self.style = style
@@ -288,12 +292,75 @@ public final class OverlayWindow: NSObject {
             window.delegate = self
             window.acceptsMouseMovedEvents = true
             interactionView?.owner = self
+            setupRelativePointer()
         }
 
         logger.info("OverlayWindow created (style=\(String(describing: style)))")
     }
 
-    // MARK: - 마우스 역매핑 (뷰어 → 소스)
+    // MARK: - 상대커서 모드 (뷰어 → 소스, 진짜 커서 상주)
+
+    /// 합성 커서 레이어 생성 + RelativePointer 클로저 배선 (지오메트리/매핑/커서 제공)
+    private func setupRelativePointer() {
+        // 합성 커서 — 링+중심점(방향 없는 심볼, 레터박스 위 최상단). 실제 커서는 숨김.
+        let ring = CAShapeLayer()
+        let r: CGFloat = 11
+        ring.path = CGPath(ellipseIn: CGRect(x: -r, y: -r, width: r * 2, height: r * 2), transform: nil)
+        ring.fillColor = NSColor.clear.cgColor
+        ring.strokeColor = NSColor.white.cgColor
+        ring.lineWidth = 2
+        ring.shadowColor = NSColor.black.cgColor
+        ring.shadowOpacity = 0.9
+        ring.shadowRadius = 2
+        ring.shadowOffset = .zero
+        let dot = CAShapeLayer()
+        let d: CGFloat = 2.2
+        dot.path = CGPath(ellipseIn: CGRect(x: -d, y: -d, width: d * 2, height: d * 2), transform: nil)
+        dot.fillColor = NSColor.white.cgColor
+        ring.addSublayer(dot)
+        ring.isHidden = true
+        ring.zPosition = 100
+        interactionView?.layer?.addSublayer(ring)
+        cursorLayer = ring
+
+        relativePointer.letterboxProvider = { [weak self] in self?.metalLayer.frame ?? .zero }
+        relativePointer.mapToSourceGlobal = { [weak self] p in self?.mapToSource(p)?.global }
+        relativePointer.onSyntheticCursor = { [weak self] p in
+            guard let layer = self?.cursorLayer else { return }
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            layer.position = p   // interactionView는 non-flipped(y up) → 레이어 좌표=NS 일치
+            CATransaction.commit()
+        }
+    }
+
+    /// 뷰어 표시 시작 시 상대커서 진입 — 뷰어를 클릭투과로 만들고 커서를 소스에 상주.
+    private func enterRelativePointer() {
+        guard style == .viewer, !relativePointer.active else { return }
+        window.ignoresMouseEvents = true            // 재게시 이벤트가 뷰어 통과 → 소스 도달
+        // 소스를 키 창으로 — 비활성 창은 mouseMoved 로컬좌표가 (0,h)로 붕괴해 호버가 죽음(실측).
+        // 뷰어는 non-activating shield라 소스가 그 아래서 키를 유지한다.
+        if sourcePID != 0 { NSRunningApplication(processIdentifier: sourcePID)?.activate() }
+        // 옛 postToPid 포워딩 경로 차단 — 재타깃으로 커서가 뷰어 위(fullscreen)를 지나면
+        // ViewerInteractionView 트래킹영역이 발화해 이벤트를 한 번 더 매핑·전달(이중 배달, 실측).
+        // 상대커서 모드는 탭이 전담하므로 owner를 떼어 트래킹영역 mouseMoved를 무력화.
+        interactionView?.owner = nil
+        cursorLayer?.isHidden = false
+        let lb = metalLayer.frame
+        let center = lb.width > 1 ? CGPoint(x: lb.midX, y: lb.midY)
+                                  : CGPoint(x: window.frame.width / 2, y: window.frame.height / 2)
+        relativePointer.enable(initialViewer: center, on: window.screen)
+    }
+
+    /// 뷰어 숨김/정지 시 상대커서 이탈 — 커서 복구 + 클릭투과 해제.
+    private func exitRelativePointer() {
+        guard style == .viewer else { return }
+        relativePointer.disable()
+        cursorLayer?.isHidden = true
+        window.ignoresMouseEvents = false
+        interactionView?.owner = self   // 옛 경로 복원 (폴백용)
+    }
+
+    // MARK: - 마우스 역매핑 (뷰어 → 소스) — 레거시 postToPid 경로(상대커서 모드에선 미사용)
 
     /// 뷰어 창 좌표(NS)의 마우스 위치를 소스 좌표로 역산.
     /// 반환: (global: 스크린 CG top-left, local: 소스 창 내부 top-left).
@@ -456,6 +523,7 @@ public final class OverlayWindow: NSObject {
     public func close() {
         // 프로그램적 정지 — 델리게이트를 먼저 떼어 windowWillClose→onUserClose→stopCapture
         // 재진입을 차단 (이건 사용자가 X로 닫은 게 아님).
+        exitRelativePointer()   // 커서 디커플/숨김 반드시 복구
         onUserClose = nil
         window.delegate = nil
         if window.styleMask.contains(.fullScreen) {
@@ -469,7 +537,15 @@ public final class OverlayWindow: NSObject {
     public func setVisible(_ visible: Bool) {
         if visible {
             window.orderFront(nil)
+            if style == .viewer {
+                // 첫 프레임 레이아웃(레터박스 확정) 후 진입 — 매핑 준비 완료 보장
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    guard let self, self.window.isVisible else { return }
+                    self.enterRelativePointer()
+                }
+            }
         } else {
+            exitRelativePointer()
             window.orderOut(nil)
         }
     }

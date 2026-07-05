@@ -30,6 +30,7 @@ final class PatternView: NSView {
     override func mouseMoved(with e: NSEvent)  { NSLog("[TP-MOUSE] moved (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
     override func mouseDown(with e: NSEvent)   { NSLog("[TP-MOUSE] DOWN (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
     override func mouseUp(with e: NSEvent)     { NSLog("[TP-MOUSE] UP (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
+    override func scrollWheel(with e: NSEvent) { NSLog("[TP-MOUSE] SCROLL (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) dy=\(Int(e.scrollingDeltaY))") }
 
     override init(frame: NSRect) {
         super.init(frame: frame)

@@ -5,8 +5,8 @@ import sys, numpy as np
 from PIL import Image, ImageDraw
 
 tdir, names, outp = sys.argv[1], sys.argv[2:-1], sys.argv[-1]
-COLS = [("gt", "GT (정답)"), ("blend", "Blend"), ("metalflow", "MetalFlow"),
-        ("applefi", "AppleFI"), ("rife_low", "RIFE-low(shippable)"), ("rife_full", "RIFE-full(천장)")]
+COLS = [("gt", "GT (정답)"), ("metalflow", "MetalFlow (M1 현행)"), ("applefi", "AppleFI (M1 현행)"),
+        ("rife_low288", "RIFE-low288 (M1 신경망)"), ("rife_low432", "RIFE-low432 (M4)"), ("rife_full", "RIFE-full(천장)")]
 CROP, TILE, LBL = 360, 320, 26
 
 def load(p): return np.asarray(Image.open(p).convert("RGB"))

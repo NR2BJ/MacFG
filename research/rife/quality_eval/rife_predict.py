@@ -83,7 +83,8 @@ if __name__ == '__main__':
     for name in subs:
         d = os.path.join(tdir, name)
         a, b = load(f"{d}/a.png"), load(f"{d}/b.png")
-        save(rife_full(net, a, b), f"{d}/pred_rife_full.png")
-        save(rife_low(net, a, b, short), f"{d}/pred_rife_low.png")
-        print(f"{name}: full+low({short}) 완료  ({a.shape[-1]}x{a.shape[-2]})")
+        if not os.path.exists(f"{d}/pred_rife_full.png"):
+            save(rife_full(net, a, b), f"{d}/pred_rife_full.png")
+        save(rife_low(net, a, b, short), f"{d}/pred_rife_low{short}.png")
+        print(f"{name}: low({short}) 완료  ({a.shape[-1]}x{a.shape[-2]})")
     print(f"\n✅ RIFE 예측 {len(subs)}개 → {tdir}/*/pred_rife_[full|low].png")

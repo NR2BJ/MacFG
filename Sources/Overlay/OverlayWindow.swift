@@ -2,6 +2,7 @@ import AppKit
 import Metal
 import MetalKit
 import QuartzCore
+import Monitoring
 import os
 
 /// 셰이더 캐시 — 앱 라이프타임 동안 1회 컴파일 후 재사용
@@ -174,6 +175,12 @@ public final class OverlayWindow: NSObject {
     /// 뷰어 창을 사용자가 닫았을 때 (X 버튼)
     public var onUserClose: (() -> Void)?
 
+    /// 마우스 역매핑 (뷰어→소스): 소스 창 NS 프레임 + 소유 앱 PID.
+    /// 설정되면 뷰어의 호버/클릭/스크롤을 업스케일 배율로 역산해 소스로 전달(CGEventPostToPid).
+    public var sourceFrameNS: CGRect = .zero
+    public var sourcePID: pid_t = 0
+    private weak var interactionView: ViewerInteractionView?
+
     public init(device: any MTLDevice, style: OverlayStyle, title: String = "MacFG Output") throws {
         self.device = device
         self.style = style
@@ -240,11 +247,14 @@ public final class OverlayWindow: NSObject {
             window.backgroundColor = .black
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-            if let contentView = window.contentView {
-                contentView.wantsLayer = true
-                contentView.layer?.backgroundColor = NSColor.black.cgColor
-                contentView.layer?.addSublayer(metalLayer)
-            }
+            // 마우스 이벤트를 소스로 포워딩하는 인터랙션 뷰 (호버/클릭/스크롤 역매핑)
+            let iview = ViewerInteractionView(frame: window.contentView?.bounds ?? .zero)
+            iview.wantsLayer = true
+            iview.layer?.backgroundColor = NSColor.black.cgColor
+            iview.layer?.addSublayer(metalLayer)
+            iview.autoresizingMask = [.width, .height]
+            window.contentView = iview
+            self.interactionView = iview
         }
 
         // .readOnly: 스크린샷/녹화에 출력이 보이도록 (검증 및 사용자 녹화용).
@@ -273,9 +283,50 @@ public final class OverlayWindow: NSObject {
 
         if style == .viewer {
             window.delegate = self
+            window.acceptsMouseMovedEvents = true
+            interactionView?.owner = self
         }
 
         logger.info("OverlayWindow created (style=\(String(describing: style)))")
+    }
+
+    // MARK: - 마우스 역매핑 (뷰어 → 소스)
+
+    /// 뷰어 창 좌표(NS)의 마우스 위치를 소스 창 스크린 좌표(CG top-left)로 역산.
+    /// 뷰어 레터박스(metalLayer.frame)에서 정규화 → 소스 창 NS 프레임에 매핑 → CG 변환.
+    private func mapToSourceCG(_ locInWindow: CGPoint) -> CGPoint? {
+        guard style == .viewer, sourceFrameNS.width > 1, sourceFrameNS.height > 1 else { return nil }
+        let lb = metalLayer.frame   // 레터박스 (contentView=window content 좌표, NS bottom-left)
+        guard lb.width > 1, lb.height > 1 else { return nil }
+        let nx = (locInWindow.x - lb.minX) / lb.width
+        let ny = (locInWindow.y - lb.minY) / lb.height        // NS: 0=하단
+        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }   // 레터박스 밖은 무시
+        // 소스 창 NS 스크린 좌표 (소스 로컬 → 스크린)
+        let sxNS = sourceFrameNS.minX + nx * sourceFrameNS.width
+        let syNS = sourceFrameNS.minY + ny * sourceFrameNS.height
+        // NS(bottom-left) → CG(top-left): 주 스크린 높이 기준 y 반전
+        let primaryH = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+            ?? NSScreen.main?.frame.height ?? 0
+        return CGPoint(x: sxNS, y: primaryH - syNS)
+    }
+
+    private var mouseLogCount = 0
+    fileprivate func forwardMouse(_ e: NSEvent, type: CGEventType, button: CGMouseButton = .left) {
+        guard sourcePID != 0, let cg = mapToSourceCG(e.locationInWindow),
+              let ev = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: cg, mouseButton: button) else { return }
+        ev.postToPid(sourcePID)
+        if type != .mouseMoved || mouseLogCount < 3 {   // 클릭은 항상, 이동은 처음 몇 개만
+            mouseLogCount += 1
+            DiagnosticLog.shared.log("[MOUSE] \(type.rawValue) viewer=(\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) lb=\(Int(metalLayer.frame.width))x\(Int(metalLayer.frame.height))@\(Int(metalLayer.frame.minX)),\(Int(metalLayer.frame.minY)) src=\(Int(sourceFrameNS.width))x\(Int(sourceFrameNS.height))@\(Int(sourceFrameNS.minX)),\(Int(sourceFrameNS.minY)) → PID\(sourcePID) CG(\(Int(cg.x)),\(Int(cg.y)))")
+        }
+    }
+
+    fileprivate func forwardScroll(_ e: NSEvent) {
+        guard sourcePID != 0, let cg = mapToSourceCG(e.locationInWindow),
+              let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+                               wheel1: Int32(e.scrollingDeltaY), wheel2: Int32(e.scrollingDeltaX), wheel3: 0) else { return }
+        ev.location = cg
+        ev.postToPid(sourcePID)
     }
 
     /// 색 처리 정책.
@@ -382,4 +433,30 @@ extension OverlayWindow: NSWindowDelegate {
     public func windowWillClose(_ notification: Notification) {
         onUserClose?()
     }
+}
+
+/// 뷰어 contentView — 호버/클릭/스크롤을 OverlayWindow가 소스로 역매핑·전달하게 넘긴다.
+/// 뷰어가 이벤트를 받아 먹기만 하던 것(조작 불가)을 소스로 포워딩. metalLayer는 서브레이어.
+final class ViewerInteractionView: NSView {
+    weak var owner: OverlayWindow?
+    private var tracking: NSTrackingArea?
+
+    override var isFlipped: Bool { false }   // NS bottom-left 유지 (매핑이 이 기준)
+    override var acceptsFirstResponder: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let t = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t); tracking = t
+    }
+
+    override func mouseMoved(with e: NSEvent)   { owner?.forwardMouse(e, type: .mouseMoved) }
+    override func mouseDown(with e: NSEvent)    { owner?.forwardMouse(e, type: .leftMouseDown) }
+    override func mouseUp(with e: NSEvent)      { owner?.forwardMouse(e, type: .leftMouseUp) }
+    override func mouseDragged(with e: NSEvent) { owner?.forwardMouse(e, type: .leftMouseDragged) }
+    override func rightMouseDown(with e: NSEvent) { owner?.forwardMouse(e, type: .rightMouseDown, button: .right) }
+    override func rightMouseUp(with e: NSEvent)   { owner?.forwardMouse(e, type: .rightMouseUp, button: .right) }
+    override func scrollWheel(with e: NSEvent)  { owner?.forwardScroll(e) }
 }

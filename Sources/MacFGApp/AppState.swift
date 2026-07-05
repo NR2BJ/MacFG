@@ -539,6 +539,7 @@ public final class AppState {
 
             // 자동 숨김 기준용 소스 PID + 초기 표시 상태
             sourceOwnerPID = ownerPID(of: windowID)
+            overlayManager?.sourcePID = sourceOwnerPID   // 뷰어 마우스 역매핑 대상
             overlayUserHidden = false
             overlayHiddenState = false
             isCapturing = true

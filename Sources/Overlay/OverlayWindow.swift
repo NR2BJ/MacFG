@@ -323,22 +323,73 @@ public final class OverlayWindow: NSObject {
         interactionView?.layer?.addSublayer(ring)
         cursorLayer = ring
 
-        relativePointer.letterboxProvider = { [weak self] in self?.metalLayer.frame ?? .zero }
-        relativePointer.mapToSourceGlobal = { [weak self] p in self?.mapToSource(p)?.global }
-        relativePointer.onSyntheticCursor = { [weak self] p in
-            guard let layer = self?.cursorLayer else { return }
+        relativePointer.viewerDisplayID = { [weak self] in
+            (self?.window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+                ?? CGMainDisplayID()
+        }
+        relativePointer.currentSourceFrameNS = { [weak self] in self?.sourceFrameNS ?? .zero }
+        relativePointer.mapVirtualToSource = { [weak self] cg, frozenFrame, clickInset in
+            self?.mapGlobalCGToSource(cg, frameOverride: frozenFrame, clickInset: clickInset)
+        }
+        relativePointer.onSyntheticCursor = { [weak self] cg in
+            guard let self, let layer = self.cursorLayer else { return }
             CATransaction.begin(); CATransaction.setDisableActions(true)
-            layer.position = p   // interactionView는 non-flipped(y up) → 레이어 좌표=NS 일치
+            layer.position = self.globalCGToWindowNS(cg)   // non-flipped 뷰 → 레이어 좌표=창 NS
             CATransaction.commit()
         }
+        relativePointer.onSuspendChange = { [weak self] suspended in
+            guard let self else { return }
+            self.cursorLayer?.isHidden = suspended         // 탈출 중엔 링 숨김(진짜 커서가 대신)
+            if !suspended, self.sourcePID != 0 {
+                // 복귀 — 옆 모니터에서 다른 앱을 활성화했을 수 있으니 소스 재활성 (호버 좌표 필수)
+                NSRunningApplication(processIdentifier: self.sourcePID)?.activate()
+            }
+        }
+    }
+
+    // MARK: 좌표 변환 (전역 CG ↔ 창 NS)
+
+    private var primaryScreenHeight: CGFloat {
+        NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+            ?? NSScreen.main?.frame.height ?? 0
+    }
+
+    private func globalCGToWindowNS(_ p: CGPoint) -> CGPoint {
+        let f = window.frame
+        return CGPoint(x: p.x - f.minX, y: (primaryScreenHeight - p.y) - f.minY)
+    }
+
+    private func windowNSToGlobalCG(_ p: CGPoint) -> CGPoint {
+        let f = window.frame
+        return CGPoint(x: p.x + f.minX, y: primaryScreenHeight - (p.y + f.minY))
+    }
+
+    /// 가상 커서(전역 CG)를 소스 창 좌표(전역 CG)로. 레터박스 밖이면 nil.
+    /// - frameOverride: 드래그 중 고정 프레임 (창이 제 드래그를 쫓는 폭주 방지)
+    /// - clickInset: 클릭/드래그는 소스 프레임 8pt 안쪽으로 — 가장자리 리사이즈 존 회피
+    private func mapGlobalCGToSource(_ p: CGPoint, frameOverride: CGRect?, clickInset: Bool) -> CGPoint? {
+        guard style == .viewer else { return nil }
+        let winPt = globalCGToWindowNS(p)
+        let lb = metalLayer.frame
+        guard lb.width > 1, lb.height > 1 else { return nil }
+        let nx = (winPt.x - lb.minX) / lb.width
+        let ny = (winPt.y - lb.minY) / lb.height        // NS: 0=하단
+        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }
+        var frame = frameOverride ?? sourceFrameNS
+        guard frame.width > 1, frame.height > 1 else { return nil }
+        if clickInset, frame.width > 40, frame.height > 40 {
+            frame = frame.insetBy(dx: 8, dy: 8)
+        }
+        let sxNS = frame.minX + nx * frame.width
+        let syNS = frame.minY + ny * frame.height
+        return CGPoint(x: sxNS, y: primaryScreenHeight - syNS)
     }
 
     /// 뷰어 표시 시작 시 상대커서 진입 — 뷰어를 클릭투과로 만들고 커서를 소스에 상주.
     private func enterRelativePointer() {
         guard style == .viewer, !relativePointer.active else { return }
         window.ignoresMouseEvents = true            // 재게시 이벤트가 뷰어 통과 → 소스 도달
-        // 소스를 키 창으로 — 비활성 창은 mouseMoved 로컬좌표가 (0,h)로 붕괴해 호버가 죽음(실측).
-        // 뷰어는 non-activating shield라 소스가 그 아래서 키를 유지한다.
+        // 소스를 키 창으로 — 비활성 창은 mouseMoved 로컬좌표가 붕괴해 호버가 죽음(실측 재확인).
         if sourcePID != 0 { NSRunningApplication(processIdentifier: sourcePID)?.activate() }
         // 옛 postToPid 포워딩 경로 차단 — 재타깃으로 커서가 뷰어 위(fullscreen)를 지나면
         // ViewerInteractionView 트래킹영역이 발화해 이벤트를 한 번 더 매핑·전달(이중 배달, 실측).
@@ -346,9 +397,9 @@ public final class OverlayWindow: NSObject {
         interactionView?.owner = nil
         cursorLayer?.isHidden = false
         let lb = metalLayer.frame
-        let center = lb.width > 1 ? CGPoint(x: lb.midX, y: lb.midY)
-                                  : CGPoint(x: window.frame.width / 2, y: window.frame.height / 2)
-        relativePointer.enable(initialViewer: center, on: window.screen)
+        let centerWin = lb.width > 1 ? CGPoint(x: lb.midX, y: lb.midY)
+                                     : CGPoint(x: window.frame.width / 2, y: window.frame.height / 2)
+        relativePointer.enable(initialGlobalCG: windowNSToGlobalCG(centerWin), on: window.screen)
     }
 
     /// 뷰어 숨김/정지 시 상대커서 이탈 — 커서 복구 + 클릭투과 해제.

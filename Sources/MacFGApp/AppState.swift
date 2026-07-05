@@ -531,9 +531,10 @@ public final class AppState {
 
             // 창 추적은 30Hz면 충분 — 틱(120Hz)마다 CGWindowList를 부르면 호출당 0.5-2ms로
             // vsync 틱을 놓쳐 출력 fps 천장이 ~110으로 내려앉는다 (실측).
-            // 뷰어 배치는 소스 창을 따라다닐 필요가 없어(리사이즈 감지/색 정책용) 2Hz로 —
-            // 메인 스레드 CGWindowList 경합을 더 줄여 표시 틱을 보호.
-            let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 2.0
+            // 뷰어 배치도 15Hz — 상대커서 매핑이 sourceFrameNS를 쓰므로, 드래그로 소스 창이
+            // 움직였을 때 다음 조작 좌표가 어긋나지 않게 신선도가 필요 (2Hz는 0.5s 지연으로
+            // 매핑이 헛돌았음). 렌더는 전용 스레드라 메인 CGWindowList 15Hz는 틱에 무해.
+            let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
             trackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / trackHz, repeats: true) { [weak self] _ in
                 Task { @MainActor in
                     guard let self else { return }

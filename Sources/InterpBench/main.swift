@@ -10,6 +10,33 @@
 import Metal
 import Interpolation
 import Foundation
+import ImageIO
+import CoreGraphics
+import UniformTypeIdentifiers
+
+/// MTLTexture(bgra8) → PNG (육안 검증용)
+func dumpPNG(_ tex: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue, path: String) {
+    let w = tex.width, h = tex.height
+    let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+    desc.storageMode = .shared; desc.usage = [.shaderRead]
+    guard let shared = device.makeTexture(descriptor: desc),
+          let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { return }
+    blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: .init(x: 0, y: 0, z: 0),
+              sourceSize: .init(width: w, height: h, depth: 1), to: shared,
+              destinationSlice: 0, destinationLevel: 0, destinationOrigin: .init(x: 0, y: 0, z: 0))
+    blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+    shared.getBytes(&bytes, bytesPerRow: w * 4, from: MTLRegion(origin: .init(x: 0, y: 0, z: 0), size: .init(width: w, height: h, depth: 1)), mipmapLevel: 0)
+    // BGRA → RGBA
+    for i in stride(from: 0, to: bytes.count, by: 4) { bytes.swapAt(i, i + 2) }
+    let cs = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+          let img = ctx.makeImage(),
+          let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+    CGImageDestinationAddImage(dst, img, nil)
+    CGImageDestinationFinalize(dst)
+}
 
 // MARK: - CLI Args
 
@@ -128,6 +155,22 @@ func createTestPattern(device: any MTLDevice, commandQueue: any MTLCommandQueue,
             c = mix(c, float3(0.95), line * word * 0.9);
         }
 
+        // ⑤ 반투명 패널 위 정적 텍스트 (실증상: 자막/채팅 오버레이 — 반투명 배경으로 움직이는
+        // 영상이 비쳐 픽셀값은 매 프레임 바뀌지만, 텍스트 글자 구조는 고정). 순수 |A-B| 정적판정이
+        // 실패하는 핵심 케이스. panelAlpha만큼 배경① 비침 → 픽셀 요동, 텍스트는 고정 위치.
+        if (px.x > sz.x * 0.55 && px.x < sz.x * 0.95 && px.y > sz.y * 0.68 && px.y < sz.y * 0.88) {
+            // 패널 밑: 고대비 이동 대각 스트라이프 (실제 영상/게임처럼 강한 flow 유발 —
+            // 이게 반투명 통해 텍스트를 끌어당김). shift에 선형 이동.
+            float stripe = step(0.5, fract(((px.x + px.y) - p.shift * 2.5) / 34.0));
+            c = mix(float3(0.10, 0.12, 0.18), float3(0.75, 0.80, 0.90), stripe);
+            float panelAlpha = 0.5;                         // 50% 배경 비침 (움직임 요동원)
+            c = mix(c, float3(0.06, 0.07, 0.10), panelAlpha);
+            // 정적 텍스트 — 얇은 세로획(4px 주기, 1.5px 폭)이라 base 해상도(0.5×)에선 sub-pixel로
+            // 움직이는 배경과 뭉개짐 = 실제 자막/채팅 텍스트 스케일. shift 무관 고정.
+            float glyph = step(0.62, fract(px.x / 4.0)) * step(0.28, fract(px.y / 8.0));
+            c = mix(c, float3(0.96, 0.96, 0.92), glyph * 0.95);
+        }
+
         out.write(float4(c, 1.0), gid);
     }
     """
@@ -169,11 +212,11 @@ func createTestPattern(device: any MTLDevice, commandQueue: any MTLCommandQueue,
     return tex
 }
 
-/// 간이 PSNR — 중앙 라인 최대 400px 샘플링 근사 (GPU→CPU readback)
+/// 간이 PSNR — 지정 행(기본 중앙) 최대 400px 샘플링 근사 (GPU→CPU readback)
 func computePSNR(device: any MTLDevice, commandQueue: any MTLCommandQueue,
-                 texA: any MTLTexture, texB: any MTLTexture) -> Double {
+                 texA: any MTLTexture, texB: any MTLTexture, sampleYFrac: Double = 0.5) -> Double {
     let w = min(texA.width, texB.width), h = min(texA.height, texB.height)
-    let sampleY = h / 2
+    let sampleY = min(h - 1, max(0, Int(Double(h) * sampleYFrac)))
 
     func readRow(_ tex: any MTLTexture) -> [UInt8] {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
@@ -292,10 +335,19 @@ func benchmarkMultiT(_ engine: any PairInterpolationEngine, key: String,
             guard let gt = createTestPattern(device: device, commandQueue: commandQueue,
                                              width: w, height: h, shift: 30 * f.t) else { continue }
             let p = computePSNR(device: device, commandQueue: commandQueue, texA: gt, texB: f.texture)
-            psnrParts.append(String(format: "t=%.2f: %.1fdB", f.t, p))
+            // 반투명 패널 행(0.75) — 정적 텍스트 선명도 (핵심 지표)
+            let pPanel = computePSNR(device: device, commandQueue: commandQueue, texA: gt, texB: f.texture, sampleYFrac: 0.75)
+            psnrParts.append(String(format: "t=%.2f: %.1f/패널%.1fdB", f.t, p, pPanel))
         }
         let budget = dt * 1000
         print("  \(label)  encode=\(String(format: "%.1f", avg))ms/pair (예산 \(String(format: "%.0f", budget))ms)  \(psnrParts.joined(separator: "  "))")
+        // 육안 덤프 (MACFG_DUMP=<dir>) — 60fps t=0.5 보간 + GT
+        if let dir = ProcessInfo.processInfo.environment["MACFG_DUMP"], label.hasPrefix("60fps"),
+           let mid = frames.first(where: { abs($0.t - 0.5) < 0.01 }),
+           let gt = createTestPattern(device: device, commandQueue: commandQueue, width: w, height: h, shift: 15) {
+            dumpPNG(mid.texture, device: device, queue: commandQueue, path: "\(dir)/\(key)_interp.png")
+            dumpPNG(gt, device: device, queue: commandQueue, path: "\(dir)/\(key)_gt.png")
+        }
     }
     engine.shutdown()
     print()

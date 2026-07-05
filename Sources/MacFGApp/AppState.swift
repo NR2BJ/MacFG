@@ -343,19 +343,47 @@ public final class AppState {
     }
 
     /// 렌더 드라이버를 현재 오버레이의 레이어에 부착 (배치 전환/화면 모드 변경 시 재호출)
-    private func attachRenderDriver() {
+    private func attachRenderDriver(watchDrawableGrowth: Bool = true) {
         guard let surface = overlayManager?.currentRenderSurface else {
             logger.warning("attachRenderDriver: no surface")
             return
         }
         renderSurface = surface
         mirrorRefreshRate = Double(overlayManager?.outputScreen?.maximumFramesPerSecond ?? 120)
+        let attachW = Int(surface.metalLayer.drawableSize.width)
         renderDriver.attach(layer: surface.metalLayer) { [weak self] tick in
             self?.onDisplayLinkTick(
                 timestamp: tick.timestamp,
                 targetTimestamp: tick.targetPresentTimestamp,
                 drawable: tick.drawable
             )
+        }
+        // CAMetalDisplayLink는 부착 시점의 drawableSize를 물어 그 크기의 드로어블을 vend한다.
+        // 뷰어는 초기 창(960×540)으로 부착되므로, 첫 프레임이 레터박스 타깃(예: 3115×2160)으로
+        // drawableSize를 키운 뒤에도 1-2초간 960×540 드로어블이 나와 고해상 업스케일 결과가
+        // 다운스케일→재확대되어 흐릿하다(텍스트에서 특히 뚜렷, 실측). drawableSize가 커지면
+        // 1회 재부착해 큰 드로어블을 즉시 vend하게 한다.
+        if watchDrawableGrowth, selectedOverlayPlacement == .viewerWindow {
+            scheduleDrawableReattach(afterWidth: attachW)
+        }
+    }
+
+    /// drawableSize가 부착 시점보다 커지는 순간을 감지해 디스플레이링크를 1회 재부착 (뷰어 첫 캡처 흐림 해소)
+    private func scheduleDrawableReattach(afterWidth: Int) {
+        var ticks = 0
+        Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] t in
+            guard let self, self.isCapturing,
+                  let surf = self.overlayManager?.currentRenderSurface else { t.invalidate(); return }
+            ticks += 1
+            let w = Int(surf.metalLayer.drawableSize.width)
+            if w > afterWidth + 8 {
+                t.invalidate()
+                DiagnosticLog.shared.log("[DRIVER] drawableSize \(afterWidth)→\(w) 성장 감지 → 링크 재부착 (드로어블 크기 동기화)")
+                self.attachRenderDriver(watchDrawableGrowth: false)
+                self.forceRepresentTicks = 8   // 정적 콘텐츠도 재부착 후 큰 드로어블로 다시 그리게
+            } else if ticks > 50 {   // ~3s 후 포기 (변화 없음)
+                t.invalidate()
+            }
         }
     }
 
@@ -696,6 +724,9 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagResyncCount = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTimestamp: CFTimeInterval = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTexture: (any MTLTexture)?
+    /// 링크 재부착 직후 남은 강제 재present 틱 수 — 정적 콘텐츠(새 프레임 없음)에서 흐린(작은
+    /// 드로어블) 프레임을 새 드로어블 크기로 교체. 드로어블 풀(3) 순환분 커버.
+    @ObservationIgnored nonisolated(unsafe) private var forceRepresentTicks = 0
     @ObservationIgnored nonisolated(unsafe) private var sourceIntervalEMA: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var hasReceivedFirstFrame: Bool = false
     /// 캡처 창 리사이즈 감지 (연속 감지 횟수 — 드래그 중 재시작 연발 방지, 메인 타이머 전용)
@@ -885,7 +916,19 @@ public final class AppState {
         if timeline.count > 12 {
             timeline.removeFirst(timeline.count - 12)
         }
+        let presentBefore = diagPresentCount
         presentDueEntry(targetTimestamp: targetTimestamp, drawable: drawable)
+        // 링크 재부착 직후 강제 재present — 정적 콘텐츠는 새 프레임이 없어 presentDueEntry가
+        // 아무것도 표시하지 않으므로, 재부착 전 그려둔 흐린(960×540 드로어블) 프레임이 남는다.
+        // 이번 틱에 새 present가 없었으면 최신 텍스처를 새(큰) 드로어블에 다시 그려 교체한다.
+        if forceRepresentTicks > 0 {
+            forceRepresentTicks -= 1
+            if diagPresentCount == presentBefore, let tex = lastPresentedTexture {
+                let e = TimelineEntry(timestamp: lastPresentedTimestamp, texture: tex,
+                                      isInterpolated: false, captureTimestamp: lastPresentedTimestamp)
+                presentEntry(e, at: targetTimestamp, drawable: drawable)
+            }
+        }
 
         // 3) 캡처 프레임 drain → work 인코딩 (무거움 — 표시 이후로).
         // 버스트 캡: 숨김 해제/스트림 재개 직후 한 틱에 8장까지 몰리면 인코딩 CPU가

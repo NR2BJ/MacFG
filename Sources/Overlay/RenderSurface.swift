@@ -1,6 +1,7 @@
 import AppKit
 import Metal
 import QuartzCore
+import Monitoring
 
 /// 스레드 무관 렌더 표면 — OverlayWindow(@MainActor)에서 분리한 출력 인코딩 경로.
 ///
@@ -40,6 +41,7 @@ public final class RenderSurface: @unchecked Sendable {
     private let lock = NSLock()
     private var params: Params
     private var _scaleStatus: String?
+    private var dbgFrames = 0   // TEMP 진단
 
     /// 업스케일/샤픈 실동작 상태 (UI 표시용)
     public var scaleStatus: String? {
@@ -141,6 +143,10 @@ public final class RenderSurface: @unchecked Sendable {
             if p.isViewer, p.upscaleMode != .off {
                 let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
+                if dbgFrames < 8 {
+                    dbgFrames += 1
+                    DiagnosticLog.shared.log("[UPSCALE-DBG] f\(dbgFrames) tex=\(texture.width)x\(texture.height) bounds=\(Int(p.contentBounds.width))x\(Int(p.contentBounds.height)) layerFrame=\(Int(metalLayer.frame.width))x\(Int(metalLayer.frame.height)) scale=\(p.contentsScale) target=\(targetW)x\(targetH) engage=\(targetW > texture.width || targetH > texture.height) mode=\(p.upscaleMode)")
+                }
                 if targetW > texture.width || targetH > texture.height {
                     var cur = source
                     if p.upscaleMode == .ane || p.upscaleMode == .aneMetalfx,
@@ -159,6 +165,7 @@ public final class RenderSurface: @unchecked Sendable {
                 }
             }
             if chain.isEmpty { chain.append(p.isViewer ? "1:1" : "1:1 cover") }
+            if dbgFrames <= 8 { DiagnosticLog.shared.log("[UPSCALE-DBG]   → chain=\(chain.joined(separator: " · "))") }
             chain.append(p.sharpness > 0.01 ? String(format: "sharpen %.1f", p.sharpness) : "sharpen off")
             let status = chain.joined(separator: " · ")
             lock.lock(); _scaleStatus = status; lock.unlock()

@@ -1,5 +1,6 @@
 import Metal
 import VideoToolbox
+import Monitoring
 import CoreVideo
 import CoreMedia
 import os
@@ -41,10 +42,16 @@ final class NeuralUpscaler {
     func upscale(_ bgra: any MTLTexture, into cb: any MTLCommandBuffer) -> (any MTLTexture)? {
         guard !unsupported, let toYUV, let toRGB else { return nil }
         let w = bgra.width, h = bgra.height
-        guard w >= 96, h >= 96, w <= Self.maxInput, h <= Self.maxInput else { return nil }
+        guard w >= 96, h >= 96, w <= Self.maxInput, h <= Self.maxInput else {
+            DiagnosticLog.shared.log("[UPSCALE-DBG] NeuralUpscaler skip (size \(w)x\(h) out of [96,\(Self.maxInput)])")
+            return nil
+        }
 
         if proc == nil || inW != w || inH != h {
-            guard rebuild(w, h) else { unsupported = true; return nil }
+            guard rebuild(w, h) else {
+                DiagnosticLog.shared.log("[UPSCALE-DBG] NeuralUpscaler rebuild FAILED \(w)x\(h) → unsupported=true (영구 비활성)")
+                unsupported = true; return nil
+            }
         }
         guard let srcLuma, let srcChroma, let dstLuma, let dstChroma,
               let outBGRA, let proc, let srcFrame, let dstFrame else { return nil }

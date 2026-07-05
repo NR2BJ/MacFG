@@ -26,7 +26,7 @@ let package = Package(
         ),
         .target(
             name: "Overlay",
-            dependencies: ["FramePacing"],
+            dependencies: ["FramePacing", "Monitoring"],
             path: "Sources/Overlay"
         ),
         .target(

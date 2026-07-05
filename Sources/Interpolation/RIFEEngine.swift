@@ -649,7 +649,16 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float2 f1 = f.zw * p.flowScale * p.scale1;
         float3 a = imgA.sample(s, uv + f0 / sizeF).rgb;
         float3 b = imgB.sample(s, uv + f1 / sizeF).rgb;
-        outTex.write(float4(a * m + b * (1.0 - m), 1.0), gid);
+        float3 warped = a * m + b * (1.0 - m);
+        // 정적영역 보호 — A(p)≈B(p)인 픽셀(조준점/HUD/글자)은 워프 대신 원본.
+        // coarse flow(288/360 업샘플)가 정적 UI에 배경 모션을 번지게 하는 것 차단
+        // (실증상: 조준점이 이상한 위치로 번짐, 글자 번짐). 부드러운 전환(luma diff 0.02~0.08).
+        float3 a0 = imgA.sample(s, uv).rgb;
+        float3 b0 = imgB.sample(s, uv).rgb;
+        float diff = dot(abs(a0 - b0), float3(0.299, 0.587, 0.114));
+        float staticW = 1.0 - smoothstep(0.02, 0.08, diff);
+        float3 outc = mix(warped, (a0 + b0) * 0.5, staticW);
+        outTex.write(float4(outc, 1.0), gid);
     }
     """
 }

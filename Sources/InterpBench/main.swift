@@ -113,6 +113,21 @@ func createTestPattern(device: any MTLDevice, commandQueue: any MTLCommandQueue,
             c = mix(float3(0.9, 0.35, 0.1), float3(0.7, 0.2, 0.05), band);
         }
 
+        // ④ 고정 오버레이 (shift 무관 — 게임 HUD/조준점/글자 모사).
+        // GT에도 같은 위치에 있으므로 보간이 이걸 흔들면 PSNR이 그대로 벌점.
+        float2 ctr = sz * 0.5;
+        float2 dc = abs(px - ctr);
+        // 조준점: 십자 (팔 길이 30, 두께 3, 중심 갭 6)
+        bool crossArm = (dc.x < 1.5 && dc.y > 6.0 && dc.y < 30.0) ||
+                        (dc.y < 1.5 && dc.x > 6.0 && dc.x < 30.0);
+        if (crossArm) c = float3(0.2, 1.0, 0.3);
+        // 글자 블록: 좌상단 미세 가로줄 텍스트 모사 (300×80, 4px 주기)
+        if (px.x > 40.0 && px.x < 340.0 && px.y > 40.0 && px.y < 120.0) {
+            float line = step(0.5, fract(px.y / 4.0));
+            float word = step(0.25, fract(px.x / 37.0));   // 단어 간격 모사
+            c = mix(c, float3(0.95), line * word * 0.9);
+        }
+
         out.write(float4(c, 1.0), gid);
     }
     """

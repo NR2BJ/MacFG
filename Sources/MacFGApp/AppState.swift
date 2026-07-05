@@ -1287,7 +1287,37 @@ public final class AppState {
             snappedLastTimestamp = raw
             return raw
         }
-        let interval = (snapTsRing.last! - snapTsRing.first!) / Double(snapTsRing.count - 1)
+        // 기본 주기(fundamental) 추정 — 시간폭/프레임수(평균 도착률)는 중복/드랍 갭(2×주기)이
+        // 섞이면 가짜 격자를 만든다(실측: 60fps+중복20% → 21ms 격자 → 스냅 위상 뒤죽박죽,
+        // 표시 패턴 IISS 뭉침 = "앞뒤로 왔다갔다"). 델타 중앙값에서 시작해 배수 접기(33.4→÷2)로
+        // 정련하면 VFR/중복 섞임에도 진짜 주기(16.7)에 락된다.
+        var deltas: [Double] = []
+        for i in 1..<snapTsRing.count {
+            let d = snapTsRing[i] - snapTsRing[i - 1]
+            if d > 0.002, d < 0.5 { deltas.append(d) }
+        }
+        guard deltas.count >= 3 else {
+            snappedLastTimestamp = max(raw, snappedLastTimestamp + 0.001)
+            return snappedLastTimestamp
+        }
+        func median(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
+        var candidate = median(deltas)
+        for _ in 0..<2 {   // 배수 접기 정련: 각 델타를 최근접 정수배로 나눠 기본 주기 후보로 환원
+            let folded = deltas.compactMap { d -> Double? in
+                let k = (d / candidate).rounded()
+                return k >= 1 ? d / k : nil
+            }
+            if folded.count >= 3 { candidate = median(folded) }
+        }
+        // 최종 = 시간폭 ÷ (접기로 센 슬롯 수) — 타이머 지터는 합산에서 상쇄(늦음-편향 중앙값의
+        // 과대추정 회피)되고, 중복/드랍 갭은 k=2+로 정규화. 깨끗한 소스에선 기존 시간폭-평균과 일치.
+        var slotCount = 0.0
+        var slotSpan = 0.0
+        for d in deltas {
+            let k = (d / candidate).rounded()
+            if k >= 1 { slotCount += k; slotSpan += d }
+        }
+        let interval = slotCount >= 3 ? slotSpan / slotCount : candidate
         guard interval > 0.002 else {
             snappedLastTimestamp = max(raw, snappedLastTimestamp + 0.001)
             return snappedLastTimestamp

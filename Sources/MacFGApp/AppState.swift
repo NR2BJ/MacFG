@@ -762,11 +762,17 @@ public final class AppState {
     /// miss(staleDrop/지각 도착)가 지속되면 표시 슬롯 단위로 여유를 늘려 흡수 — LS식
     /// "여유 지연을 두고 큐를 안정 소비". 영상 시청엔 +1-2프레임 지연이 구멍보다 낫다.
     nonisolated private var latencyOffset: Double {
+        let refresh = max(mirrorRefreshRate, 60)
+        // 저지연 모드(보간 OFF) — 보간 프레임 페이싱 버퍼가 불필요하므로 오프셋을 최소로.
+        // 인터랙티브(텍스트 드래그 등)에서 표시 지연을 확 줄인다(실측 56ms→~30ms). work(블릿+
+        // 업스케일 ~5-8ms)를 커버할 만큼(~1.5슬롯)만 두고 소스 프레임을 곧장 표시.
+        if !mirrorInterpolationEnabled {
+            return 1.5 / refresh + 0.004 + extraLatencySlots / refresh
+        }
         let interval = sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0
         // + 반 슬롯: SCK 배달이 소스 vsync에 양자화되어 최대 반 간격 늦게 오는데,
         // 그 마진이 없으면 늦은 쌍의 보간 프레임이 표시 시한을 놓쳐 stale-drop
         // (보간 188장 생성 → 113장 표시 실측 — present 110/s의 주범)
-        let refresh = max(mirrorRefreshRate, 60)
         let displayHalfSlot = 0.5 / refresh
         return min(max(interval, 1.0 / 120.0), 1.0 / 24.0) * 1.25 + 0.004 + displayHalfSlot
             + extraLatencySlots / refresh
@@ -790,6 +796,9 @@ public final class AppState {
         lastPaceAdjustTick = diagTick
         defer { paceMissCount = 0 }
         if adaptDisabled { extraLatencySlots = 0; return }      // A/B: 적응 지연 완전 차단
+        // 저지연 모드(보간 OFF, 인터랙티브) — 적응 지연 램프 차단. 스무딩보다 반응성 우선
+        // (램프하면 저지연 오프셋을 도로 상쇄해 텍스트 드래그가 다시 밀림, 실측 lat=+3).
+        if !mirrorInterpolationEnabled { extraLatencySlots = 0; return }
         guard diagTick >= paceWarmupUntilTick else { return }   // 과도기 miss 폐기
         if paceMissCount >= 4 {
             paceCleanWindows = 0

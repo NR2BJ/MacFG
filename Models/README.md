@@ -13,3 +13,8 @@ Full-resolution warp + sigmoid blend happen in the app's Metal kernel.
 
 Weights: [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) v4.25 (MIT).
 Export/repro: `research/rife/export_coreml.py`.
+
+## rife540/720 (미추적)
+
+로컬 실험용 — 화질(실영상 SSIM)이 432 대비 사실상 동일(미미)하고 predict가 실시간 예산을
+초과해 배포하지 않는다. 필요하면 research/rife/export_coreml.py로 재생성.

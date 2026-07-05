@@ -25,6 +25,7 @@ struct BenchConfig {
     var pairEngine: String = "metalflow"
     var flowShort: Int? = nil       // RIFE flow 단변 (288/360/432)
     var rifeANE = false             // RIFE를 ANE로 (기본 GPU)
+    var multiT = false              // 멀티-t 화질 벤치 (t별 PSNR — 24/30fps 경로 검증)
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -42,6 +43,7 @@ struct BenchConfig {
             case "--engine": if let v = args.popFirst() { config.pairEngine = v }
             case "--flow-short": if let v = args.popFirst() { config.flowShort = Int(v) }
             case "--rife-ane": config.rifeANE = true
+            case "--multi-t": config.multiT = true
             default: break
             }
         }
@@ -229,6 +231,61 @@ func encodeOne(_ engine: any PairInterpolationEngine,
     return result?.frames.first?.texture
 }
 
+/// 멀티-t 화질 벤치 — 24/30fps 소스의 복수 t 경로 검증.
+/// 패턴이 shift에 선형이라 임의 t의 GT를 정확 생성: GT(t) = pattern(shift = 30·t).
+/// t별 PSNR로 "t=0.5 predict + 선형 스케일 근사"와 "t별 exact predict"의 차이를 정량화.
+func benchmarkMultiT(_ engine: any PairInterpolationEngine, key: String,
+                     device: any MTLDevice, commandQueue: any MTLCommandQueue,
+                     config: BenchConfig) async {
+    do { try await engine.prepare(device: device) } catch {
+        print("  ❌ prepare failed: \(error)"); return
+    }
+    let w = config.width, h = config.height
+    guard let a = createTestPattern(device: device, commandQueue: commandQueue, width: w, height: h, shift: 0),
+          let b = createTestPattern(device: device, commandQueue: commandQueue, width: w, height: h, shift: 30) else {
+        print("  ❌ pattern failed"); return
+    }
+    // (라벨, t셋, 소스 fps 모사 dt)
+    let cases: [(String, [Float], Double)] = [
+        ("60fps(단일)", [0.5], 1.0 / 60.0),
+        ("30fps→120", [0.25, 0.5, 0.75], 1.0 / 30.0),
+        ("24fps→120", [0.2, 0.4, 0.6, 0.8], 1.0 / 24.0),
+    ]
+    print("▶ \(engine.name) (\(key)) — 멀티-t 화질")
+    var ts = 0.0
+    for (label, tset, dt) in cases {
+        // 워밍업 2회 (파이프/EMA)
+        for _ in 0..<2 {
+            guard let cb = commandQueue.makeCommandBuffer() else { break }
+            _ = engine.encodePair(stableA: a, stableB: b, tsA: ts, tsB: ts + dt, tValues: tset, into: cb)
+            cb.commit(); await cb.completed(); ts += dt
+        }
+        var encodeMs: [Double] = []
+        var frames: [(t: Float, texture: any MTLTexture)] = []
+        for i in 0..<8 {
+            guard let cb = commandQueue.makeCommandBuffer() else { break }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let result = engine.encodePair(stableA: a, stableB: b, tsA: ts, tsB: ts + dt, tValues: tset, into: cb)
+            cb.commit(); await cb.completed()
+            encodeMs.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            ts += dt
+            if i == 7, let result { frames = result.frames }
+        }
+        let avg = encodeMs.isEmpty ? 0 : encodeMs.reduce(0, +) / Double(encodeMs.count)
+        var psnrParts: [String] = []
+        for f in frames {
+            guard let gt = createTestPattern(device: device, commandQueue: commandQueue,
+                                             width: w, height: h, shift: 30 * f.t) else { continue }
+            let p = computePSNR(device: device, commandQueue: commandQueue, texA: gt, texB: f.texture)
+            psnrParts.append(String(format: "t=%.2f: %.1fdB", f.t, p))
+        }
+        let budget = dt * 1000
+        print("  \(label)  encode=\(String(format: "%.1f", avg))ms/pair (예산 \(String(format: "%.0f", budget))ms)  \(psnrParts.joined(separator: "  "))")
+    }
+    engine.shutdown()
+    print()
+}
+
 func benchmarkEngine(_ engine: any PairInterpolationEngine,
                      device: any MTLDevice,
                      commandQueue: any MTLCommandQueue,
@@ -348,6 +405,13 @@ func main() async {
         selectedEngines = allEngines
     } else {
         selectedEngines = allEngines.filter { config.engines.contains($0.0) }
+    }
+
+    if config.multiT {
+        for (key, engine) in selectedEngines {
+            await benchmarkMultiT(engine, key: key, device: device, commandQueue: commandQueue, config: config)
+        }
+        return
     }
 
     var results: [BenchResult] = []

@@ -22,8 +22,13 @@ import os
 ///   GPU는 이벤트를 논블로킹 대기 — 렌더 스레드/표시 경로는 영향 없음.
 ///   타임라인 등재가 predict만큼 늦어지는 것은 적응형 지연 슬롯이 흡수.
 ///
-/// 멀티 t: 단일 t는 정확 timestep으로 predict (arbitrary-t 활용 — vsync 그리드 정렬).
-/// 복수 t는 t=0.5 한 번 predict 후 선형 스케일 워프 (scale0=t/0.5, scale1=(1-t)/0.5).
+/// 멀티 t (앵커 방식): predict 예산(쌍 간격×0.8 ÷ predictEMA)이 허용하는 수만큼 **앵커 t를
+/// exact predict**하고, 각 요청 t는 최근접 앵커 flow를 선형 스케일해 워프한다.
+/// - 전부 감당되면 t별 전부 exact (arbitrary-t 풀활용).
+/// - 일부만 되면 연속 청크 중앙값 앵커 — 스케일 편차를 최소화 (기존 "0.5 하나서 ±60% 스케일"이
+///   극단 t 화질을 MetalFlow 이하로 떨어뜨리던 것(1080p 합성 t=0.25 23.8dB vs exact 26.8dB 실측)
+///   을 ±20~33% 스케일로 축소).
+/// - 예산 부족(EMA 미확립 포함)이면 앵커 1개(t=0.5) = 기존 근사와 동일.
 public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     public let name = "Neural (RIFE)"
 
@@ -48,22 +53,25 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     private var unpackPSO: (any MTLComputePipelineState)?
     private var warpPSO: (any MTLComputePipelineState)?
 
+    /// 앵커별 flow/mask 세트 최대 수 (예산이 넉넉하면 t별 전부 exact)
+    static let maxAnchors = 4
+
     /// predict 파이프라인 슬롯 — 3개 링 (pack/predict/warp 중첩 + 배압)
     private final class Slot: @unchecked Sendable {
-        let packBuf: any MTLBuffer      // 6ch fp16 CHW (모델 입력)
-        let flowBuf: any MTLBuffer      // 4ch fp16 CHW (모델 출력 backing)
-        let maskBuf: any MTLBuffer      // 1ch fp16 (pre-sigmoid)
-        let statsBuf: any MTLBuffer     // uint32 x64 루마 히스토그램 (A32+B32)
-        let flowTex: any MTLTexture     // rgba16Float 모델 크기
-        let maskTex: any MTLTexture     // r16Float 모델 크기
+        let packBuf: any MTLBuffer          // 6ch fp16 CHW (모델 입력 — 앵커 공유)
+        let flowBufs: [any MTLBuffer]       // 앵커별 4ch fp16 CHW (모델 출력 backing)
+        let maskBufs: [any MTLBuffer]       // 앵커별 1ch fp16 (pre-sigmoid)
+        let statsBuf: any MTLBuffer         // uint32 x64 루마 히스토그램 (A32+B32)
+        let flowTexs: [any MTLTexture]      // 앵커별 rgba16Float 모델 크기
+        let maskTexs: [any MTLTexture]      // 앵커별 r16Float 모델 크기
         let event: any MTLSharedEvent
         var useCount: UInt64 = 0
         var busy = false
-        init(packBuf: any MTLBuffer, flowBuf: any MTLBuffer, maskBuf: any MTLBuffer,
-             statsBuf: any MTLBuffer, flowTex: any MTLTexture, maskTex: any MTLTexture,
+        init(packBuf: any MTLBuffer, flowBufs: [any MTLBuffer], maskBufs: [any MTLBuffer],
+             statsBuf: any MTLBuffer, flowTexs: [any MTLTexture], maskTexs: [any MTLTexture],
              event: any MTLSharedEvent) {
-            self.packBuf = packBuf; self.flowBuf = flowBuf; self.maskBuf = maskBuf
-            self.statsBuf = statsBuf; self.flowTex = flowTex; self.maskTex = maskTex
+            self.packBuf = packBuf; self.flowBufs = flowBufs; self.maskBufs = maskBufs
+            self.statsBuf = statsBuf; self.flowTexs = flowTexs; self.maskTexs = maskTexs
             self.event = event
         }
     }
@@ -82,7 +90,16 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
     private let logger = Logger(subsystem: "com.macfg", category: "RIFE")
     private var pairCount = 0
-    private let predictMsEMA = OSAllocatedUnfairLock(initialState: 0.0)
+    /// 최근 predict 시간 링(≤15) — 앵커 예산은 **중앙값**으로 판단. EMA(α=0.05)는 콜드스타트
+    /// 60ms급 첫 predict에 오염돼 실제값(12ms) 복귀까지 수십 쌍 → 앵커가 영영 미발동했음(실측).
+    private let predictMsRing = OSAllocatedUnfairLock(initialState: [Double]())
+    private func predictMsMedian() -> Double {
+        predictMsRing.withLock { ring in
+            guard !ring.isEmpty else { return 0 }
+            let s = ring.sorted()
+            return s[s.count / 2]
+        }
+    }
 
     public init() {}
 
@@ -164,13 +181,11 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         unpackPSO = try await pso("rifeUnpack")
         warpPSO = try await pso("rifeWarp")
 
-        // 슬롯 3개
+        // 슬롯 3개 × 앵커별 flow/mask 세트 (360 기준 슬롯당 ~11MB, 총 ~34MB)
         slots = []
         let planeBytes = modelW * modelH * 2
         for _ in 0..<3 {
             guard let packBuf = device.makeBuffer(length: planeBytes * 6, options: .storageModeShared),
-                  let flowBuf = device.makeBuffer(length: planeBytes * 4, options: .storageModeShared),
-                  let maskBuf = device.makeBuffer(length: planeBytes, options: .storageModeShared),
                   let statsBuf = device.makeBuffer(length: 64 * 4, options: .storageModeShared),
                   let event = device.makeSharedEvent() else {
                 throw InterpolationError.textureAllocationFailed
@@ -183,12 +198,21 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                 pixelFormat: .r16Float, width: modelW, height: modelH, mipmapped: false)
             maskDesc.usage = [.shaderRead, .shaderWrite]
             maskDesc.storageMode = .private
-            guard let flowTex = device.makeTexture(descriptor: flowDesc),
-                  let maskTex = device.makeTexture(descriptor: maskDesc) else {
-                throw InterpolationError.textureAllocationFailed
+            var flowBufs: [any MTLBuffer] = []
+            var maskBufs: [any MTLBuffer] = []
+            var flowTexs: [any MTLTexture] = []
+            var maskTexs: [any MTLTexture] = []
+            for _ in 0..<Self.maxAnchors {
+                guard let fb = device.makeBuffer(length: planeBytes * 4, options: .storageModeShared),
+                      let mb = device.makeBuffer(length: planeBytes, options: .storageModeShared),
+                      let ft = device.makeTexture(descriptor: flowDesc),
+                      let mt = device.makeTexture(descriptor: maskDesc) else {
+                    throw InterpolationError.textureAllocationFailed
+                }
+                flowBufs.append(fb); maskBufs.append(mb); flowTexs.append(ft); maskTexs.append(mt)
             }
-            slots.append(Slot(packBuf: packBuf, flowBuf: flowBuf, maskBuf: maskBuf,
-                              statsBuf: statsBuf, flowTex: flowTex, maskTex: maskTex, event: event))
+            slots.append(Slot(packBuf: packBuf, flowBufs: flowBufs, maskBufs: maskBufs,
+                              statsBuf: statsBuf, flowTexs: flowTexs, maskTexs: maskTexs, event: event))
         }
         cancelled.withLock { $0 = false }
         DiagnosticLog.shared.log("[RIFE] prepared: \(modelW)x\(modelH) flow (\(short)p), unit=\(Self.useGPU ? "GPU" : "ANE")")
@@ -219,14 +243,33 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let ts = tValues.prefix(6).map { min(max($0, 0.01), 0.99) }
         guard outputPool.count >= ts.count else { releaseSlot(slot); return nil }
 
-        // predict timestep: 단일 t는 정확 위상, 복수 t는 0.5 기준 + 선형 스케일
-        let tPred: Float = ts.count == 1 ? min(max(ts[0], 0.05), 0.95) : 0.5
+        // ── 앵커 선택: predict 예산(쌍 간격×0.8 ÷ 중앙값) 내에서 최대한 exact
+        let med = predictMsMedian()
+        let budgetMs = (tsB - tsA) * 1000.0 * 0.8
+        let affordable = med > 0 ? max(1, Int(budgetMs / med)) : 1
+        let anchorCount = min(ts.count, affordable, Self.maxAnchors)
+        var anchors: [Float]
+        if anchorCount >= ts.count {
+            anchors = Array(ts)                             // 전부 exact (arbitrary-t 풀활용)
+        } else if anchorCount <= 1 {
+            anchors = [0.5]                                 // 예산 부족 — 기존 근사
+        } else {
+            // 연속 청크 중앙값 — 각 t의 최근접 앵커 스케일 편차 최소화
+            anchors = (0..<anchorCount).map { j in
+                let lo = j * ts.count / anchorCount
+                let hi = (j + 1) * ts.count / anchorCount - 1
+                return (ts[lo] + ts[hi]) / 2
+            }
+        }
+        anchors = anchors.map { min(max($0, 0.05), 0.95) }
 
         // ── ① pack: 자체 cb (flow/mask 0클리어 → 실패 시 50/50 블렌드 강등 보장)
         guard let packCB = packQueue.makeCommandBuffer() else { releaseSlot(slot); return nil }
         if let fill = packCB.makeBlitCommandEncoder() {
-            fill.fill(buffer: slot.flowBuf, range: 0..<slot.flowBuf.length, value: 0)
-            fill.fill(buffer: slot.maskBuf, range: 0..<slot.maskBuf.length, value: 0)
+            for i in 0..<anchors.count {
+                fill.fill(buffer: slot.flowBufs[i], range: 0..<slot.flowBufs[i].length, value: 0)
+                fill.fill(buffer: slot.maskBufs[i], range: 0..<slot.maskBufs[i].length, value: 0)
+            }
             fill.fill(buffer: slot.statsBuf, range: 0..<(64 * 4), value: 0)
             fill.endEncoding()
         }
@@ -245,85 +288,99 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let mW = modelW, mH = modelH
         let workerRef = worker
         let cancelledRef = cancelled
-        let emaRef = predictMsEMA
+        let ringRef = predictMsRing
         let loggerRef = logger
+        let anchorsRef = anchors
         packCB.addCompletedHandler { [weak model] _ in
             workerRef.async {
                 defer { slot.event.signaledValue = signalValue }
                 guard let model, !cancelledRef.withLock({ $0 }) else { return }
-                do {
-                    let t0 = CFAbsoluteTimeGetCurrent()
-                    let xArr = try MLMultiArray(
-                        dataPointer: slot.packBuf.contents(),
-                        shape: [1, 6, NSNumber(value: mH), NSNumber(value: mW)],
-                        dataType: .float16,
-                        strides: [NSNumber(value: 6 * mH * mW), NSNumber(value: mH * mW), NSNumber(value: mW), 1])
-                    let tArr = try MLMultiArray(shape: [1, 1, 1, 1], dataType: .float16)
-                    tArr[0] = NSNumber(value: tPred)
-                    let flowBack = try MLMultiArray(
-                        dataPointer: slot.flowBuf.contents(),
-                        shape: [1, 4, NSNumber(value: mH), NSNumber(value: mW)],
-                        dataType: .float16,
-                        strides: [NSNumber(value: 4 * mH * mW), NSNumber(value: mH * mW), NSNumber(value: mW), 1])
-                    let maskBack = try MLMultiArray(
-                        dataPointer: slot.maskBuf.contents(),
-                        shape: [1, 1, NSNumber(value: mH), NSNumber(value: mW)],
-                        dataType: .float16,
-                        strides: [NSNumber(value: mH * mW), NSNumber(value: mH * mW), NSNumber(value: mW), 1])
-                    let opts = MLPredictionOptions()
-                    opts.outputBackings = ["flow": flowBack, "mask": maskBack]
-                    let input = try MLDictionaryFeatureProvider(dictionary: ["x": xArr, "t": tArr])
-                    let result = try model.prediction(from: input, options: opts)
-                    // backing 미사용 폴백 — 반환 배열이 우리 버퍼가 아니면 복사
-                    if let f = result.featureValue(for: "flow")?.multiArrayValue,
-                       f.dataPointer != slot.flowBuf.contents() {
-                        f.withUnsafeBytes { raw in
-                            slot.flowBuf.contents().copyMemory(
-                                from: raw.baseAddress!, byteCount: min(raw.count, slot.flowBuf.length))
+                for (i, anchorT) in anchorsRef.enumerated() {
+                    if cancelledRef.withLock({ $0 }) { return }
+                    do {
+                        let t0 = CFAbsoluteTimeGetCurrent()
+                        let xArr = try MLMultiArray(
+                            dataPointer: slot.packBuf.contents(),
+                            shape: [1, 6, NSNumber(value: mH), NSNumber(value: mW)],
+                            dataType: .float16,
+                            strides: [NSNumber(value: 6 * mH * mW), NSNumber(value: mH * mW), NSNumber(value: mW), 1])
+                        let tArr = try MLMultiArray(shape: [1, 1, 1, 1], dataType: .float16)
+                        tArr[0] = NSNumber(value: anchorT)
+                        let flowBack = try MLMultiArray(
+                            dataPointer: slot.flowBufs[i].contents(),
+                            shape: [1, 4, NSNumber(value: mH), NSNumber(value: mW)],
+                            dataType: .float16,
+                            strides: [NSNumber(value: 4 * mH * mW), NSNumber(value: mH * mW), NSNumber(value: mW), 1])
+                        let maskBack = try MLMultiArray(
+                            dataPointer: slot.maskBufs[i].contents(),
+                            shape: [1, 1, NSNumber(value: mH), NSNumber(value: mW)],
+                            dataType: .float16,
+                            strides: [NSNumber(value: mH * mW), NSNumber(value: mH * mW), NSNumber(value: mW), 1])
+                        let opts = MLPredictionOptions()
+                        opts.outputBackings = ["flow": flowBack, "mask": maskBack]
+                        let input = try MLDictionaryFeatureProvider(dictionary: ["x": xArr, "t": tArr])
+                        let result = try model.prediction(from: input, options: opts)
+                        // backing 미사용 폴백 — 반환 배열이 우리 버퍼가 아니면 복사
+                        if let f = result.featureValue(for: "flow")?.multiArrayValue,
+                           f.dataPointer != slot.flowBufs[i].contents() {
+                            f.withUnsafeBytes { raw in
+                                slot.flowBufs[i].contents().copyMemory(
+                                    from: raw.baseAddress!, byteCount: min(raw.count, slot.flowBufs[i].length))
+                            }
                         }
-                    }
-                    if let m = result.featureValue(for: "mask")?.multiArrayValue,
-                       m.dataPointer != slot.maskBuf.contents() {
-                        m.withUnsafeBytes { raw in
-                            slot.maskBuf.contents().copyMemory(
-                                from: raw.baseAddress!, byteCount: min(raw.count, slot.maskBuf.length))
+                        if let m = result.featureValue(for: "mask")?.multiArrayValue,
+                           m.dataPointer != slot.maskBufs[i].contents() {
+                            m.withUnsafeBytes { raw in
+                                slot.maskBufs[i].contents().copyMemory(
+                                    from: raw.baseAddress!, byteCount: min(raw.count, slot.maskBufs[i].length))
+                            }
                         }
+                        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                        ringRef.withLock { ring in
+                            ring.append(ms)
+                            if ring.count > 15 { ring.removeFirst() }
+                        }
+                    } catch {
+                        loggerRef.error("predict failed (anchor \(anchorT)): \(error.localizedDescription)")
                     }
-                    let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-                    emaRef.withLock { $0 = $0 == 0 ? ms : $0 * 0.95 + ms * 0.05 }
-                } catch {
-                    loggerRef.error("predict failed: \(error.localizedDescription)")
                 }
             }
         }
         packCB.commit()
 
-        // ── ③ 호출자 cb: 이벤트 대기 → unpack → t별 워프
+        // ── ③ 호출자 cb: 이벤트 대기 → 앵커별 unpack → t별 최근접 앵커 워프
         commandBuffer.encodeWaitForEvent(slot.event, value: signalValue)
-        guard let upEnc = commandBuffer.makeComputeCommandEncoder() else { releaseSlot(slot); return nil }
-        upEnc.setComputePipelineState(unpackPSO)
-        upEnc.setBuffer(slot.flowBuf, offset: 0, index: 0)
-        upEnc.setBuffer(slot.maskBuf, offset: 0, index: 1)
-        upEnc.setTexture(slot.flowTex, index: 0)
-        upEnc.setTexture(slot.maskTex, index: 1)
-        dispatch(upEnc, width: modelW, height: modelH, pso: unpackPSO)
-        upEnc.endEncoding()
+        for i in 0..<anchors.count {
+            guard let upEnc = commandBuffer.makeComputeCommandEncoder() else { releaseSlot(slot); return nil }
+            upEnc.setComputePipelineState(unpackPSO)
+            upEnc.setBuffer(slot.flowBufs[i], offset: 0, index: 0)
+            upEnc.setBuffer(slot.maskBufs[i], offset: 0, index: 1)
+            upEnc.setTexture(slot.flowTexs[i], index: 0)
+            upEnc.setTexture(slot.maskTexs[i], index: 1)
+            dispatch(upEnc, width: modelW, height: modelH, pso: unpackPSO)
+            upEnc.endEncoding()
+        }
 
         var frames: [(t: Float, texture: any MTLTexture)] = []
         for t in ts {
+            // 최근접 앵커 (동률이면 아무쪽 — 스케일 편차 동일)
+            var ai = 0
+            var best = Float.greatestFiniteMagnitude
+            for (j, a) in anchors.enumerated() where abs(t - a) < best { best = abs(t - a); ai = j }
+            let anchor = anchors[ai]
             let output = outputPool[outputIndex]
             outputIndex = (outputIndex + 1) % outputPool.count
             guard let enc = commandBuffer.makeComputeCommandEncoder() else { break }
             enc.setComputePipelineState(warpPSO)
             enc.setTexture(stableA, index: 0)
             enc.setTexture(stableB, index: 1)
-            enc.setTexture(slot.flowTex, index: 2)
-            enc.setTexture(slot.maskTex, index: 3)
+            enc.setTexture(slot.flowTexs[ai], index: 2)
+            enc.setTexture(slot.maskTexs[ai], index: 3)
             enc.setTexture(output, index: 4)
             var wp = WarpParams(
                 flowScale: SIMD2<Float>(Float(output.width) / Float(modelW), Float(output.height) / Float(modelH)),
-                scale0: t / tPred,
-                scale1: (1 - t) / (1 - tPred))
+                scale0: t / anchor,
+                scale1: (1 - t) / (1 - anchor))
             enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
             enc.endEncoding()
@@ -335,7 +392,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         commandBuffer.addCompletedHandler { [weak self] _ in
             // 디버그: 패리티 진단용 버퍼 덤프 (MACFG_RIFE_DUMP=<dir>, 4번째 쌍 = 벤치 최종)
             if dumpPair == 3, let dir = ProcessInfo.processInfo.environment["MACFG_RIFE_DUMP"] {
-                for (nm, buf) in [("pack", slot.packBuf), ("flow", slot.flowBuf), ("mask", slot.maskBuf)] {
+                for (nm, buf) in [("pack", slot.packBuf), ("flow", slot.flowBufs[0]), ("mask", slot.maskBufs[0])] {
                     let data = Data(bytes: buf.contents(), count: buf.length)
                     try? data.write(to: URL(fileURLWithPath: "\(dir)/rife_\(nm).bin"))
                 }
@@ -344,9 +401,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         }
 
         pairCount += 1
-        if pairCount <= 3 || pairCount % 600 == 0 {
-            let ema = predictMsEMA.withLock { $0 }
-            DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) predictEMA=\(String(format: "%.1f", ema))ms")
+        if pairCount <= 3 || pairCount % 600 == 0 || anchors.count > 1 {
+            let medNow = predictMsMedian()
+            DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) anchors=\(anchors.count) predictMed=\(String(format: "%.1f", medNow))ms")
+            if ProcessInfo.processInfo.environment["MACFG_RIFE_VERBOSE"] != nil {
+                print("  [RIFE] pair#\(pairCount) anchors=\(anchors.map { String(format: "%.2f", $0) }.joined(separator: ",")) med=\(String(format: "%.1f", medNow))")
+            }
         }
 
         // 장면 전환: pack 히스토그램 교집합 (pack cb는 이 시점 완료가 보장됨 — 호출자 cb 완료 후 평가)

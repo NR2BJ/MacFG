@@ -184,6 +184,7 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
     private let logger = Logger(subsystem: "com.macfg", category: "StreamOutput")
     private var colorSpaceLogged = false
     private var statusLogged = false
+    private var detailFrameCount = 0   // 캡처당 리셋(핸들러 새로 생성) — 소스 디테일 진단
     /// 첫 프레임 어태치먼트에서 추출한 캡처 색공간 (이후 프레임에 재사용)
     private var cachedColorSpace: CGColorSpace?
 
@@ -219,6 +220,14 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
 
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        // 소스 디테일 진단: 첫 5프레임의 수평 그래디언트 평균(선명↑/흐림↓). 첫 캡처 소스가
+        // 실제 저품질(브라우저 저해상도 렌더)인지, MacFG 출력만 문제인지 판별용.
+        if detailFrameCount < 5 {
+            detailFrameCount += 1
+            let d = Self.detailMetric(pixelBuffer: pixelBuffer, width: width, height: height)
+            DiagnosticLog.shared.log("[DETAIL] frame#\(detailFrameCount) \(width)x\(height) grad=\(String(format: "%.2f", d))")
+        }
 
         // 색공간: 픽셀 버퍼 어태치먼트에서 CGColorSpace 생성 (1회, 캐시)
         if cachedColorSpace == nil {
@@ -259,6 +268,28 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
         let slot = FrameSlot(texture: texture, timestamp: timestamp, width: width, height: height, contentChanged: contentChanged, contentFingerprint: fingerprint, colorSpace: cachedColorSpace)
         onFrame(slot)
+    }
+
+    /// 소스 프레임 선명도 지표 — 중앙 영역 인접 픽셀(green) 그래디언트 평균. 높을수록 디테일↑.
+    /// 선명한 1080p 소스는 높고, 저해상도를 늘린 흐린 소스는 낮다.
+    private static func detailMetric(pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> Double {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer), width > 8, height > 8 else { return 0 }
+        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+        var sum: Double = 0, count = 0
+        var y = height / 4
+        while y < height * 3 / 4 {
+            let row = ptr + y * bpr
+            var x = width / 4
+            while x < width * 3 / 4 - 1 {
+                sum += Double(abs(Int(row[(x + 1) * 4 + 1]) - Int(row[x * 4 + 1])))   // BGRA green
+                count += 1; x += 2
+            }
+            y += max(1, height / 40)
+        }
+        return count > 0 ? sum / Double(count) : 0
     }
 
     /// CVPixelBuffer에서 384개 흩뿌린(pseudo-random 고정 좌표) 샘플을 읽어 해시 생성.

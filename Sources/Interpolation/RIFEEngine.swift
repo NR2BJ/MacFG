@@ -42,7 +42,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         modelSourceURL(short: short) != nil
     }
 
-    private let sceneCutIntersectionThreshold = 0.5
+    /// 0.25: 빠른 게임(오버워치 시점 회전/이펙트)이 히스토그램을 크게 흔들어 0.5에선 초당 수 회
+    /// 오검출 → 보간 폐기 → 25~50ms 구멍(실측 cut=1~9/2s). 진짜 하드컷은 교집합이 ~0이라 안전.
+    private let sceneCutIntersectionThreshold = 0.25
 
     private var device: (any MTLDevice)?
     private var model: MLModel?
@@ -496,14 +498,24 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let statsBuf = slot.statsBuf
         let evaluator: @Sendable () -> Bool = {
             let ptr = statsBuf.contents().bindMemory(to: UInt32.self, capacity: 64)
-            var totalA: UInt64 = 0
-            var intersect: UInt64 = 0
+            var hA = [Double](repeating: 0, count: 32)
+            var hB = [Double](repeating: 0, count: 32)
+            var totalA = 0.0, totalB = 0.0, sumA = 0.0, sumB = 0.0
             for i in 0..<32 {
-                let a = UInt64(ptr[i]); let b = UInt64(ptr[32 + i])
-                totalA += a; intersect += min(a, b)
+                hA[i] = Double(ptr[i]); hB[i] = Double(ptr[32 + i])
+                totalA += hA[i]; totalB += hB[i]
+                sumA += hA[i] * Double(i); sumB += hB[i] * Double(i)
             }
-            guard totalA > 1000 else { return false }
-            return Double(intersect) / Double(totalA) < threshold
+            guard totalA > 1000, totalB > 0 else { return false }
+            // 밝기 정렬 교집합 — 평균 bin 차이만큼 B를 시프트해 비교. 플래시/이펙트(균일 밝기
+            // 변화)는 정렬돼 통과하고, 진짜 컷(구조 변화)만 낮게 남는다 (게임 오검출 차단).
+            let shift = Int((sumB / totalB - sumA / totalA).rounded())
+            var intersect = 0.0
+            for i in 0..<32 {
+                let j = i + shift
+                if j >= 0, j < 32 { intersect += min(hA[i], hB[j]) }
+            }
+            return intersect / totalA < threshold
         }
         return frames.isEmpty ? nil : PairEncodeResult(frames: frames, sceneCutEvaluator: evaluator)
     }

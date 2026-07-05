@@ -59,6 +59,10 @@ final class RelativePointer {
 
     private(set) var active = false
     private var suspended = false                    // 옆 모니터로 탈출 중 (무변조 통과)
+    /// 진짜 커서 모드 — 소스가 화면에서 거의 풀스크린(≈1:1)이면 진짜 커서가 가리키는 위치와
+    /// 거의 겹치므로 링을 끄고 진짜(네이티브) 커서를 그대로 보여준다. 진짜 업스케일이면 false
+    /// (진짜 커서는 구석에 눌려 어긋나므로 숨기고 링을 그린다).
+    private var useNativeCursor = false
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var virtualCG: CGPoint = .zero           // 가상 커서 (전역 CG top-left)
@@ -68,11 +72,12 @@ final class RelativePointer {
 
     // MARK: - 진입/이탈
 
-    func enable(initialGlobalCG: CGPoint, on screen: NSScreen?) {
+    func enable(initialGlobalCG: CGPoint, on screen: NSScreen?, useNativeCursor: Bool) {
         guard !active else { return }
         virtualCG = initialGlobalCG
         suspended = false
         dragFrameNS = nil
+        self.useNativeCursor = useNativeCursor
         hiddenDisplay = screen.flatMap {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
         } ?? CGMainDisplayID()
@@ -103,12 +108,13 @@ final class RelativePointer {
         CFRunLoopAddSource(CFRunLoopGetMain(), rls, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
 
-        // 커서 숨김만. **디커플은 하지 않음** — 디커플하면 진짜 커서가 얼어붙어 그 위치의
-        // hover가 윈도우서버에서 별도 생성돼 소스로 새어든다(실측). 재타깃이 모든 move를
-        // 소스 좌표로 옮기므로 진짜 커서=재타깃 위치가 되어 충돌 후속이 없다.
+        // 링 모드에서만 진짜 커서를 숨긴다. 디커플은 안 함 — 재타깃이 진짜 커서를 소스 지점으로
+        // 실제 이동시키므로 충돌 후속이 없다(디커플하면 얼어붙은 위치의 hover가 새어듦, 실측).
         // 소스가 활성이라 MacFG는 백그라운드 → 백그라운드 커서 제어를 먼저 켜야 숨김이 먹힌다.
-        allowBackgroundCursorControl()
-        CGDisplayHideCursor(hiddenDisplay)
+        if !useNativeCursor {
+            allowBackgroundCursorControl()
+            CGDisplayHideCursor(hiddenDisplay)
+        }
 
         // 최후 안전망 — 앱 종료 시 확실히 복구. self 대신 display 값만 캡처(Sendable).
         let display = hiddenDisplay
@@ -120,8 +126,8 @@ final class RelativePointer {
         }
 
         active = true
-        onSyntheticCursor(virtualCG)
-        DiagnosticLog.shared.log("[RELPTR] enabled cg(\(Int(initialGlobalCG.x)),\(Int(initialGlobalCG.y))) display=\(hiddenDisplay)")
+        if !useNativeCursor { onSyntheticCursor(virtualCG) }
+        DiagnosticLog.shared.log("[RELPTR] enabled cg(\(Int(initialGlobalCG.x)),\(Int(initialGlobalCG.y))) display=\(hiddenDisplay) native=\(useNativeCursor)")
     }
 
     func disable() {
@@ -160,21 +166,24 @@ final class RelativePointer {
         return id
     }
 
-    private func suspendToNeighbor(at p: CGPoint) {
+    /// 탈출 — 진짜 커서 표시(링 모드)만. 커서 이동은 호출부가 event.location으로 처리(워프 없이
+    /// 연속). CGWarpMouseCursorPosition은 HID 재동기로 순간 입력 정지('턱')를 유발해 쓰지 않는다.
+    private func suspendToNeighbor() {
         suspended = true
         dragFrameNS = nil
-        CGWarpMouseCursorPosition(p)            // 진짜 커서를 탈출 지점에
-        CGDisplayShowCursor(hiddenDisplay)
+        if !useNativeCursor { CGDisplayShowCursor(hiddenDisplay) }
         onSuspendChange(true)
-        DiagnosticLog.shared.log("[RELPTR] → 옆 모니터로 탈출 cg(\(Int(p.x)),\(Int(p.y))) — 무변조 통과")
+        DiagnosticLog.shared.log("[RELPTR] → 옆 모니터로 탈출 — 무변조 통과")
     }
 
     private func resumeFromNeighbor(at p: CGPoint) {
         suspended = false
         virtualCG = p
-        CGDisplayHideCursor(hiddenDisplay)
-        onSuspendChange(false)                  // 링 표시 + 소스 재활성
-        onSyntheticCursor(virtualCG)
+        if !useNativeCursor {
+            CGDisplayHideCursor(hiddenDisplay)
+            onSyntheticCursor(virtualCG)
+        }
+        onSuspendChange(false)                  // 링 표시(링 모드) + 소스 재활성
         DiagnosticLog.shared.log("[RELPTR] ← 뷰어 화면 복귀 cg(\(Int(p.x)),\(Int(p.y))) — 재캡처")
     }
 
@@ -203,12 +212,15 @@ final class RelativePointer {
             let raw = CGPoint(x: virtualCG.x + dx, y: virtualCG.y + dy)
             if !screen.contains(raw), dragFrameNS == nil,
                let other = displayContaining(raw), other != viewerDisplayID() {
-                suspendToNeighbor(at: raw)      // 인접 모니터로 탈출 (드래그 중엔 유지)
-                return nil
+                // 인접 모니터로 탈출 (드래그 중엔 유지). 이벤트 자체로 커서를 탈출점에 옮겨
+                // 워프 스톨 없이 옆 화면으로 자연스럽게 이어지게 한다.
+                suspendToNeighbor()
+                event.location = raw
+                return Unmanaged.passUnretained(event)
             }
             virtualCG.x = min(max(raw.x, screen.minX), screen.maxX - 1)
             virtualCG.y = min(max(raw.y, screen.minY), screen.maxY - 1)
-            onSyntheticCursor(virtualCG)
+            if !useNativeCursor { onSyntheticCursor(virtualCG) }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             dragFrameNS = currentSourceFrameNS()   // 드래그 매핑 고정 (창 폭주 방지)
         default:

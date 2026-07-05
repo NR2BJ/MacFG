@@ -29,6 +29,14 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/.build/release/MacFGApp" "$APP/Contents/MacOS/MacFG"
 cp "$ICON_TMP/MacFG.icns" "$APP/Contents/Resources/"
 
+echo "── 신경망(RIFE) 모델 컴파일·번들"
+for m in 288 360 432; do
+  if [ -d "$ROOT/Models/rife$m.mlpackage" ]; then
+    xcrun coremlcompiler compile "$ROOT/Models/rife$m.mlpackage" "$APP/Contents/Resources/" > /dev/null
+    echo "   rife$m.mlmodelc"
+  fi
+done
+
 cat > "$APP/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

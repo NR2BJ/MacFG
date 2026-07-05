@@ -15,6 +15,7 @@ import os
 enum RenderMode: String, CaseIterable, Identifiable {
     case appleFI
     case metalFlow
+    case rife
     case blend
 
     var id: String { rawValue }
@@ -23,12 +24,19 @@ enum RenderMode: String, CaseIterable, Identifiable {
         switch self {
         case .appleFI: "Apple FI"
         case .metalFlow: "Metal Flow"
+        case .rife: "Neural"
         case .blend: "Blend 2x"
         }
     }
 
-    /// UI에 노출할 엔진들
-    static let userSelectable: [RenderMode] = [.appleFI, .metalFlow]
+    /// UI에 노출할 엔진들 — Neural은 모델 파일이 있을 때만
+    static var userSelectable: [RenderMode] {
+        var modes: [RenderMode] = [.appleFI, .metalFlow]
+        if RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) {
+            modes.append(.rife)
+        }
+        return modes
+    }
 }
 
 /// 출력 타임라인 항목 — 표시할 텍스처와 콘텐츠 시각
@@ -1511,6 +1519,13 @@ public final class AppState {
             }
         case .metalFlow:
             engine = MetalFlowEngine()
+        case .rife:
+            if RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) {
+                engine = RIFEEngine()
+            } else {
+                DiagnosticLog.shared.log("[ENGINE] RIFE model missing → MetalFlow fallback")
+                engine = MetalFlowEngine()
+            }
         case .blend:
             engine = LegacyPairEngine(BlendInterpolator())
         }

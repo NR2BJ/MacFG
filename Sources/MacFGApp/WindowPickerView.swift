@@ -98,12 +98,12 @@ struct WindowPickerView: View {
                 .onChange(of: appState.isInterpolationEnabled) { appState.updateInterpolationEnabled() }
 
             field(L("Engine", "엔진", "エンジン"),
-                  hint: L("Not sure? Try both and pick what looks better.",
-                          "잘 모르겠으면 둘 다 써보고 더 나은 걸 고르세요.",
-                          "迷ったら両方試して好みの方を。"),
-                  detail: L("Metal Flow — our GPU interpolator: any multiplier (×2–×5), keeps native sharpness, works on all Apple Silicon.\n\nApple FI — Apple's Neural Engine model: fixed 2× at 720p, sometimes handles complex motion more gently. Needs the display at fps × 2 (60→120, 24→144).",
-                            "Metal Flow — 자체 GPU 보간기: 임의 배율(×2–×5), 원본 선명도 유지, 모든 Apple Silicon에서 동작.\n\nApple FI — 애플 뉴럴 엔진 모델: 720p·2배 고정, 복잡한 모션을 더 부드럽게 처리할 때가 있음. 디스플레이를 fps×2로(60→120, 24→144).",
-                            "Metal Flow — 自作GPU補間: 任意倍率(×2–×5)、元の鮮明さを維持、全Apple Silicon対応。\n\nApple FI — AppleのNeural Engineモデル: 720p・2倍固定、複雑な動きをより滑らかに扱うことも。ディスプレイをfps×2に(60→120, 24→144)。")) {
+                  hint: L("Not sure? Try each and pick what looks better.",
+                          "잘 모르겠으면 하나씩 써보고 더 나은 걸 고르세요.",
+                          "迷ったら試して好みの方を。"),
+                  detail: L("Metal Flow — our GPU interpolator: any multiplier (×2–×5), keeps native sharpness, lightest.\n\nNeural — learned optical flow (RIFE): cleanest fast motion and object edges (great for anime/film), uses more GPU and adds a little latency.\n\nApple FI — Apple's ANE model: fixed 2× at 720p, gentle look. Needs the display at fps × 2 (60→120, 24→144).",
+                            "Metal Flow — 자체 GPU 보간기: 임의 배율(×2–×5), 원본 선명도 유지, 가장 가벼움.\n\nNeural — 학습된 옵티컬 플로우(RIFE): 빠른 모션·물체 경계가 가장 깨끗(애니/영화에 강함), GPU를 더 쓰고 지연이 약간 늘어남.\n\nApple FI — 애플 ANE 모델: 720p·2배 고정, 부드러운 느낌. 디스플레이를 fps×2로(60→120, 24→144).",
+                            "Metal Flow — 自作GPU補間: 任意倍率(×2–×5)、元の鮮明さを維持、最軽量。\n\nNeural — 学習オプティカルフロー(RIFE): 速い動きと物体の輪郭が最もきれい(アニメ/映画向き)、GPU使用量と遅延が少し増える。\n\nApple FI — AppleのANEモデル: 720p・2倍固定、柔らかい印象。ディスプレイをfps×2に(60→120, 24→144)。")) {
                 Picker("", selection: $appState.selectedRenderMode) {
                     ForEach(RenderMode.userSelectable) { Text($0.displayName).tag($0) }
                 }

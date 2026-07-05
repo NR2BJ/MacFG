@@ -295,6 +295,17 @@ struct WindowPickerView: View {
                     .frame(width: 96, height: 22)
                     .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
             }
+            HStack {
+                Text(L("Interpolation toggle", "보간 토글", "補間切替")).foregroundStyle(.secondary)
+                HelpButton(title: L("Interpolation toggle", "보간 토글", "補間切替"),
+                           text: L("Toggle frame interpolation on/off globally. Keep it ON for video; press to turn OFF for text/interactive apps (lower latency, no morphing).",
+                                   "프레임 보간 on/off 전역 토글. 동영상은 켠 채로, 텍스트/인터랙티브 앱은 눌러서 끄기(저지연, 뭉개짐 없음).",
+                                   "フレーム補間のオン/オフを全体切替。動画はオン、テキスト/操作系はオフ(低遅延)。"))
+                Spacer()
+                ShortcutRecorder(binding: $appState.hotInterp)
+                    .frame(width: 96, height: 22)
+                    .onChange(of: appState.hotInterp) { appState.updateHotKeys() }
+            }
         }
     }
 

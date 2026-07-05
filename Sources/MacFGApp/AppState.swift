@@ -154,8 +154,11 @@ public final class AppState {
     /// 소스 리사이즈 프리셋(짧은 변 px, 0=끔). 캡처 전 미리 설정 → 캡처 시작 시 소스 창을 이 크기로.
     var sourcePreset: Int = 0
 
-    // 사용자 지정 단축키 — 포커스 창 캡처 토글 하나로 통일 (init에서 UserDefaults 로드로 덮어씀)
+    // 사용자 지정 단축키 (init에서 UserDefaults 로드로 덮어씀)
     var hotCapture = HotKeyBinding(keyCode: UInt32(kVK_ANSI_U), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘U")
+    /// 보간 on/off 전역 토글 — 전체화면 뷰어 안에서 동영상(보간 on)↔텍스트/인터랙티브(보간 off,
+    /// 저지연)를 즉시 전환. 보간은 다음 프레임을 기다려 ~30ms 지연 + 텍스트 불연속 변화를 뭉갬.
+    var hotInterp = HotKeyBinding(keyCode: UInt32(kVK_ANSI_I), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘I")
 
     // MARK: - Components
     let device: any MTLDevice
@@ -445,6 +448,7 @@ public final class AppState {
             selectedOverlayPlacement = (v == "viewer" || v == "beside") ? .viewerWindow : .coverSource
         }
         if args.contains("--upscale") { upscaleMode = .aneMetalfx }
+        if args.contains("--no-interp") { isInterpolationEnabled = false }
         // 영역 캡처 테스트: --capture-rect x,y,w,h (소스 창 상대 pt)
         if let rIdx = args.firstIndex(of: "--capture-rect"), rIdx + 1 < args.count {
             let parts = args[rIdx + 1].split(separator: ",").compactMap { Double($0) }
@@ -1576,18 +1580,33 @@ public final class AppState {
                 self?.toggleCaptureFocused()
             })
         }
+        if hotInterp.keyCode != 0 {
+            bindings.append(.init(id: 4, keyCode: hotInterp.keyCode, modifiers: hotInterp.modifiers) { [weak self] in
+                self?.toggleInterpolationHotkey()
+            })
+        }
         HotKeyCenter.shared.register(bindings)
+    }
+
+    /// 보간 on/off 전역 토글 (라이브 반영) — 동영상↔텍스트 즉시 전환
+    func toggleInterpolationHotkey() {
+        isInterpolationEnabled.toggle()
+        updateInterpolationEnabled()
+        DiagnosticLog.shared.log("[HOTKEY] 보간 \(isInterpolationEnabled ? "ON(동영상)" : "OFF(저지연)")")
     }
 
     /// 단축키 변경 시: UserDefaults 저장 + 재등록
     func updateHotKeys() {
         if let data = try? JSONEncoder().encode(hotCapture) { UserDefaults.standard.set(data, forKey: "hk.capture") }
+        if let data = try? JSONEncoder().encode(hotInterp) { UserDefaults.standard.set(data, forKey: "hk.interp") }
         registerHotKeys()
     }
 
     private func loadHotKeys() {
         if let d = UserDefaults.standard.data(forKey: "hk.capture"),
            let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotCapture = b }
+        if let d = UserDefaults.standard.data(forKey: "hk.interp"),
+           let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotInterp = b }
     }
 
     private func configurePairEngine() async {

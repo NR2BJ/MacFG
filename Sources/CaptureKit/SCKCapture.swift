@@ -4,6 +4,7 @@ import ScreenCaptureKit
 import CoreMedia
 import QuartzCore
 import FramePacing
+import Monitoring
 import os
 
 /// SCK 스트림 비정상 중단(대상 창 닫힘 등) 감지용 델리게이트 — 즉시 콜백.
@@ -52,6 +53,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         let w = window.frame.width > 0 ? Int(window.frame.width * scaleFactor) : 1920
         let h = window.frame.height > 0 ? Int(window.frame.height * scaleFactor) : 1080
         let config = Self.makeConfig(width: w, height: h)
+        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) → config \(w)x\(h)")
 
         let handler = StreamOutputHandler(device: device) { [weak self] slot in
             guard let self else { return }
@@ -106,6 +108,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         guard let stream else { throw CaptureError.notCapturing }
         try await stream.updateConfiguration(Self.makeConfig(width: width, height: height))
         logger.info("SCK config updated → \(width)x\(height)")
+        DiagnosticLog.shared.log("[SCK-CFG] reconfigure → \(width)x\(height)")
     }
 
     public func stopCapture() async {

@@ -21,7 +21,7 @@ let package = Package(
         // MARK: - Modules
         .target(
             name: "CaptureKit",
-            dependencies: ["FramePacing"],
+            dependencies: ["FramePacing", "Monitoring"],
             path: "Sources/CaptureKit"
         ),
         .target(

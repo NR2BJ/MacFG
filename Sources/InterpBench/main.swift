@@ -23,6 +23,8 @@ struct BenchConfig {
     var smoothness: Float? = nil
     var pairDir: String? = nil      // 품질 A/B: 삼중항 디렉터리
     var pairEngine: String = "metalflow"
+    var flowShort: Int? = nil       // RIFE flow 단변 (288/360/432)
+    var rifeANE = false             // RIFE를 ANE로 (기본 GPU)
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -38,6 +40,8 @@ struct BenchConfig {
             case "--smoothness": if let v = args.popFirst() { config.smoothness = Float(v) }
             case "--pair-dir": if let v = args.popFirst() { config.pairDir = v }
             case "--engine": if let v = args.popFirst() { config.pairEngine = v }
+            case "--flow-short": if let v = args.popFirst() { config.flowShort = Int(v) }
+            case "--rife-ane": config.rifeANE = true
             default: break
             }
         }
@@ -308,6 +312,8 @@ func main() async {
     }
 
     // 품질 A/B 페어모드: 삼중항 디렉터리 처리 후 종료
+    if let fs = config.flowShort { RIFEEngine.flowShortSide = fs }
+    if config.rifeANE { RIFEEngine.useGPU = false }
     if let pairDir = config.pairDir {
         if let sm = config.smoothness { MetalFlowEngine.motionSmoothness = sm }
         await runPairMode(engineKey: config.pairEngine, dir: pairDir, device: device, queue: commandQueue)
@@ -331,6 +337,9 @@ func main() async {
         allEngines.append(("applefi", AppleFIEngine()))
     } else {
         print("ℹ️  AppleFI unsupported on this system — skipped")
+    }
+    if RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) {
+        allEngines.append(("rife", RIFEEngine()))
     }
     allEngines.append(("blend", LegacyPairEngine(BlendInterpolator())))
 

@@ -8,7 +8,7 @@ import numpy as np
 import torch, torch.nn.functional as F
 from PIL import Image
 
-ENGINES = ["metalflow", "applefi", "rife_nowarp432", "rife_low288", "rife_low432", "rife_full"]
+ENGINES = ["blend", "metalflow", "applefi", "rife", "rife_full"]
 
 def load(p):
     return torch.from_numpy(np.asarray(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)

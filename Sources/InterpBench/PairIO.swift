@@ -22,13 +22,15 @@ func loadPNGTexture(path: String, device: any MTLDevice) -> (any MTLTexture)? {
     let w = img.width, h = img.height
     let bpr = w * 4
     var data = [UInt8](repeating: 0, count: bpr * h)
-    let cs = CGColorSpaceCreateDeviceRGB()
+    // 이미지 자신의 컬러스페이스로 그리기 (색변환 배제)
+    let cs = img.colorSpace ?? CGColorSpaceCreateDeviceRGB()
     let bmp = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
     guard let ctx = CGContext(data: &data, width: w, height: h, bitsPerComponent: 8,
                               bytesPerRow: bpr, space: cs, bitmapInfo: bmp) else { return nil }
-    // Y-flip: 결과 버퍼 row 0 = 이미지 상단 (top-down)
-    ctx.translateBy(x: 0, y: CGFloat(h))
-    ctx.scaleBy(x: 1, y: -1)
+    // 주의: CGBitmapContext에 draw(image:)는 이미 row0=이미지 상단(top-down) — 플립 변환을
+    // 넣으면 오히려 bottom-up이 된다. (플립 관용구는 텍스트 등 드로잉 프리미티브용.)
+    // 이전에 로더 플립+라이터 행플립이 서로 상쇄돼 등변 엔진(blend 등)은 통과했지만,
+    // RIFE는 학습 모델이라 뒤집힌 입력에서 flow 품질이 달라져 패리티가 깨졌었다.
     ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
 
     let desc = MTLTextureDescriptor.texture2DDescriptor(
@@ -62,15 +64,10 @@ func writePNGTexture(_ tex: any MTLTexture, path: String,
     var data = [UInt8](repeating: 0, count: bpr * h)
     shared.getBytes(&data, bytesPerRow: bpr,
                     from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
-    // CGContext(로드) y-up 규약 vs 직접 CGImage(쓰기) top-down 규약 불일치 → 행 뒤집어 교정
-    // (실측: 미교정 시 출력이 입력 대비 수직 플립됨)
-    var flipped = [UInt8](); flipped.reserveCapacity(bpr * h)
-    for y in stride(from: h - 1, through: 0, by: -1) {
-        flipped.append(contentsOf: data[y * bpr ..< (y + 1) * bpr])
-    }
+    // 텍스처는 top-down, CGImage도 row0=상단 — 그대로 쓴다 (플립 불필요)
     let cs = CGColorSpaceCreateDeviceRGB()
     let bmp = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-    guard let provider = CGDataProvider(data: Data(flipped) as CFData),
+    guard let provider = CGDataProvider(data: Data(data) as CFData),
           let cg = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
                            bytesPerRow: bpr, space: cs, bitmapInfo: CGBitmapInfo(rawValue: bmp),
                            provider: provider, decode: nil, shouldInterpolate: false,
@@ -91,6 +88,11 @@ func runPairMode(engineKey: String, dir: String,
         guard AppleFIEngine.isSupported else { print("applefi 미지원 — 스킵"); return }
         engine = AppleFIEngine()
     case "blend": engine = LegacyPairEngine(BlendInterpolator())
+    case "rife":
+        guard RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) else {
+            print("rife\(RIFEEngine.flowShortSide) 모델 없음 — 스킵"); return
+        }
+        engine = RIFEEngine()
     default: print("알 수 없는 엔진 \(engineKey)"); return
     }
     do { try await engine.prepare(device: device) }

@@ -2,6 +2,26 @@ import AppKit
 import CoreGraphics
 import Monitoring
 
+/// 백그라운드 앱의 커서 숨김 허용 — CGDisplayHideCursor는 호출 앱이 활성일 때만 먹히는데,
+/// 상대커서 모드는 소스 앱을 활성화하므로 MacFG는 백그라운드다. 비공개 SkyLight/CGS의
+/// "SetsCursorInBackground" 연결 속성을 켜면 백그라운드에서도 숨김이 적용된다(BetterTouchTool 등
+/// 표준 우회). 심볼을 dlsym으로 찾아 없으면 무해하게 건너뛴다.
+private func allowBackgroundCursorControl() {
+    typealias MainConnFn = @convention(c) () -> UInt32
+    typealias SetPropFn = @convention(c) (UInt32, UInt32, CFString, CFTypeRef) -> Int32
+    guard let handle = dlopen(nil, RTLD_LAZY) else { return }
+    defer { dlclose(handle) }
+    guard let mc = dlsym(handle, "CGSMainConnectionID"),
+          let sp = dlsym(handle, "CGSSetConnectionProperty") else {
+        DiagnosticLog.shared.log("[RELPTR] CGS 심볼 없음 — 백그라운드 커서 숨김 불가")
+        return
+    }
+    let mainConn = unsafeBitCast(mc, to: MainConnFn.self)
+    let setProp = unsafeBitCast(sp, to: SetPropFn.self)
+    let cid = mainConn()
+    _ = setProp(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+}
+
 /// 상대커서 모드 — 진짜 커서를 소스 창 안에 상주시켜 호버·스크롤·클릭·드래그를 전부 "진짜"
 /// 이벤트로 동작시킨다. (Lossless Scaling이 게임에서 쓰는 상대입력의 영상판.)
 ///
@@ -77,6 +97,8 @@ final class RelativePointer {
         // hover가 윈도우서버에서 별도 생성돼 소스로 새어든다(실측: 정타깃 뒤 물리커서 위치로 2차 move).
         // 탭이 모든 move의 location을 소스 좌표로 재타깃하므로 진짜 커서가 소스 지점으로 실제 이동,
         // 물리 위치=재타깃 위치가 되어 충돌 후속이 없다.
+        // 소스가 활성이라 MacFG는 백그라운드 → 백그라운드 커서 제어를 먼저 켜야 숨김이 먹힌다.
+        allowBackgroundCursorControl()
         CGDisplayHideCursor(hiddenDisplay)
 
         // 최후 안전망 — 앱 종료 시 확실히 복구 (프로세스 종료 자동복원과 별개로 명시).

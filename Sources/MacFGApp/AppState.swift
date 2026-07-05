@@ -192,6 +192,7 @@ public final class AppState {
     // MARK: - Stats Timer
     private var statsTimer: Timer?
     private var trackingTimer: Timer?
+    private var drawableReattachTimer: Timer?
 
     // MARK: - Overlay Auto-Hide (단일 모니터: 소스 벗어나면 오버레이 양보)
     /// 캡처 대상 창을 소유한 앱의 PID (0 = 미확인 → 자동 숨김 비활성, 항상 표시)
@@ -370,8 +371,9 @@ public final class AppState {
 
     /// drawableSize가 부착 시점보다 커지는 순간을 감지해 디스플레이링크를 1회 재부착 (뷰어 첫 캡처 흐림 해소)
     private func scheduleDrawableReattach(afterWidth: Int) {
+        drawableReattachTimer?.invalidate()
         var ticks = 0
-        Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] t in
+        drawableReattachTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] t in
             guard let self, self.isCapturing,
                   let surf = self.overlayManager?.currentRenderSurface else { t.invalidate(); return }
             ticks += 1
@@ -611,6 +613,9 @@ public final class AppState {
         statsTimer = nil
         trackingTimer?.invalidate()
         trackingTimer = nil
+        drawableReattachTimer?.invalidate()   // 정지 후 재부착 방지 (detach된 링크 재생성 차단)
+        drawableReattachTimer = nil
+        forceRepresentTicks = 0
 
         isCapturing = false
         captureMethod = "None"
@@ -914,8 +919,10 @@ public final class AppState {
         // 다음 vsync 콜백이 스킵 → 틱 레이트가 117Hz로 새며 120 고정 실패 (실사용 로그 확증).
         // 이 틱에 캡처된 프레임은 어차피 GPU 완료 후 다음 틱에나 표시 가능하므로 손해 없음.
         timeline.removeAll { $0.timestamp <= lastPresentedTimestamp }
+        // 방어적 클램프 — 재부착/리셋 타이밍 경합으로 count가 줄어도 "remove more than it has"
+        // 크래시가 나지 않게 현재 count로 상한 (v1.1.0 크래시 실측 후 봉쇄).
         if timeline.count > 12 {
-            timeline.removeFirst(timeline.count - 12)
+            timeline.removeFirst(min(timeline.count - 12, timeline.count))
         }
         let presentBefore = diagPresentCount
         presentDueEntry(targetTimestamp: targetTimestamp, drawable: drawable)
@@ -945,7 +952,7 @@ public final class AppState {
                 depth += 1
                 ingest(slot)
             }
-            pendingIngest.removeFirst(ingestNow)
+            pendingIngest.removeFirst(min(ingestNow, pendingIngest.count))
             diagDrainDepthSum += depth
             diagDrainSamples += 1
             if depth > diagDrainDepthMax { diagDrainDepthMax = depth }

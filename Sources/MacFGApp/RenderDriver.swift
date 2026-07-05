@@ -56,6 +56,13 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
         logger.info("Render thread started")
     }
 
+    /// 렌더 스레드에서 블록 동기 실행 — 스케줄러 상태 리셋을 틱과 직렬화하는 데 사용.
+    /// 틱(metalDisplayLink 콜백)과 이 블록은 같은 렌더 스레드 런루프에서 순차 실행되므로
+    /// 절대 겹치지 않는다 → timeline 등 렌더 상태를 메인에서 직접 비우던 레이스(크래시) 제거.
+    func perform(_ block: @escaping @Sendable () -> Void) {
+        performSync(block)
+    }
+
     /// 렌더 스레드에서 블록 실행 (완료 대기)
     private func performSync(_ block: @escaping () -> Void) {
         lock.lock(); let rl = runLoop; lock.unlock()

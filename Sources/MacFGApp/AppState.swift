@@ -552,7 +552,10 @@ public final class AppState {
         sourceOwnerPID = 0
         overlayUserHidden = false
         overlayHiddenState = false
-        resetScheduler()
+        // 스케줄러 리셋은 렌더 스레드에서 — detach로 틱이 멈췄어도, 메인에서 timeline을 직접
+        // 비우면 마지막 in-flight 틱의 removeFirst(count-12)와 겹쳐 크래시났다(v1.1.0 실측:
+        // "Can't remove more items than it has"). perform으로 렌더 런루프에 태워 직렬화.
+        renderDriver.perform { [weak self] in self?.resetScheduler() }
         logger.info("Capture stopped")
         DiagnosticLog.shared.log("Capture stopped")
     }

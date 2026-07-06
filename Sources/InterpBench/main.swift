@@ -355,6 +355,43 @@ func benchmarkMultiT(_ engine: any PairInterpolationEngine, key: String,
     print()
 }
 
+/// 두 bgra8 텍스처의 증폭 차이(|a-b|*amp)를 PNG로 — 텍스트 뭉개짐 유무 결정적 판정
+func dumpDiffPNG(_ a: any MTLTexture, _ b: any MTLTexture, amp: Int, device: any MTLDevice, queue: any MTLCommandQueue, path: String) {
+    func readAll(_ tex: any MTLTexture) -> [UInt8] {
+        let w = tex.width, h = tex.height
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.storageMode = .shared; desc.usage = [.shaderRead]
+        guard let sh = device.makeTexture(descriptor: desc), let cb = queue.makeCommandBuffer(),
+              let bl = cb.makeBlitCommandEncoder() else { return [] }
+        bl.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: w, height: h, depth: 1), to: sh, destinationSlice: 0,
+                destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        bl.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        var d = [UInt8](repeating: 0, count: w * h * 4)
+        sh.getBytes(&d, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        return d
+    }
+    let w = min(a.width, b.width), h = min(a.height, b.height)
+    let ra = readAll(a), rb = readAll(b)
+    guard !ra.isEmpty, !rb.isEmpty else { return }
+    let rowA = a.width * 4, rowB = b.width * 4
+    var out = [UInt8](repeating: 255, count: w * h * 4)
+    for y in 0..<h { for x in 0..<w {
+        for c in 0..<3 {
+            let dv = abs(Int(ra[y * rowA + x * 4 + c]) - Int(rb[y * rowB + x * 4 + c])) * amp
+            out[(y * w + x) * 4 + c] = UInt8(min(255, dv))
+        }
+    }}
+    let cs = CGColorSpaceCreateDeviceRGB()
+    out.withUnsafeMutableBytes { raw in
+        guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let img = ctx.makeImage(),
+              let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dst, img, nil); CGImageDestinationFinalize(dst)
+    }
+}
+
 /// PNG → bgra8 MTLTexture (앱 덤프 프레임 로드)
 func loadTexture(path: String, device: any MTLDevice) -> (any MTLTexture)? {
     guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
@@ -446,6 +483,10 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
                 dumpPNG(interp, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_interp.png")
                 dumpPNG(gt, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_gt.png")
                 dumpPNG(a, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_A.png")
+                // 증폭 diff — interp vs GT (엔진 오차, 정적 텍스트 뭉개짐이면 여기 드러남)
+                dumpDiffPNG(interp, gt, amp: 6, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_diff.png")
+                // interp vs 소스A — 정적요소는 A와 동일해야(=검정), 다르면 정적요소 흔들림
+                dumpDiffPNG(interp, a, amp: 6, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_diffA.png")
             }
         }
         engine.shutdown()

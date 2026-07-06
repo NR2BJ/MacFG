@@ -105,6 +105,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             return s[s.count / 2]
         }
     }
+    /// predict 분포 (p50, p90, max) — 딜리버리 진단(예산 오버런 스파이크 포착)
+    private func predictMsStats() -> (p50: Double, p90: Double, max: Double) {
+        predictMsRing.withLock { ring in
+            guard !ring.isEmpty else { return (0, 0, 0) }
+            let s = ring.sorted()
+            return (s[s.count / 2], s[min(s.count - 1, (s.count * 9) / 10)], s.last!)
+        }
+    }
+    /// 딜리버리 진단: 슬롯 고갈(전 슬롯 predict 중 = 못 따라감) 카운트
+    private var diagDelivPairs = 0
+    private var diagDelivExhaust = 0
 
     public init() {}
 
@@ -325,6 +336,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             return nil
         }
         maybeAdapt(gapS: tsB - tsA, exhausted: acquired == nil)
+        // 딜리버리 진단 — 슬롯 고갈률(못 따라감) + predict 분포/모드를 ~3s마다 로그
+        diagDelivPairs += 1
+        if acquired == nil { diagDelivExhaust += 1 }
+        if diagDelivPairs >= 180 {
+            let (p50, p90, pmax) = predictMsStats()
+            let budgetMs = (tsB - tsA) * 1000.0
+            let exh = 100.0 * Double(diagDelivExhaust) / Double(diagDelivPairs)
+            let over = p90 > budgetMs ? " ⚠️p90>budget" : ""
+            DiagnosticLog.shared.log("[RIFE-DELIV] mode=\(currentShort)p/\(currentGPU ? "GPU" : "ANE") predict p50/p90/max=\(String(format: "%.1f/%.1f/%.1f", p50, p90, pmax))ms budget=\(String(format: "%.1f", budgetMs))ms exhaust=\(String(format: "%.0f", exh))%\(over)")
+            diagDelivPairs = 0; diagDelivExhaust = 0
+        }
         guard let (slot, model, mW0, mH0) = acquired else { return nil }
         let signalValue = slot.useCount
 

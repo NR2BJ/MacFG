@@ -34,8 +34,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
     /// flow 콘텐츠 단변 — 288/360/432 (Models/rife{N}.mlpackage 필요)
     public nonisolated(unsafe) static var flowShortSide: Int = 360
-    /// CoreML 유닛 — true=GPU(전 사이즈 최속), false=ANE(느리지만 GPU를 비움)
+    /// CoreML 유닛 — true=GPU(전 사이즈 최속), false=ANE(느리지만 GPU를 비움) — 벤치 전용 노브
     public nonisolated(unsafe) static var useGPU: Bool = true
+    /// 앱 적응 사다리(288↔360 ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
+    public nonisolated(unsafe) static var adaptiveLadder: Bool = true
 
     /// 모델 파일 존재 여부 (엔진 등록 가드용)
     public static func modelAvailable(short: Int) -> Bool {
@@ -182,13 +184,19 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
     public func prepare(device: any MTLDevice) async throws {
         self.device = device
-        let short = Self.flowShortSide
-        let (model, w, h) = try await Self.loadModel(short: short, gpu: Self.useGPU)
+        // 앱(adaptiveLadder): 시작 = (288, ANE) — GPU-free + 60fps 예산 내(13.9ms)로 안전.
+        // 소스가 30fps 이하로 판명되면 사다리가 360/ANE로 승격(화질↑, 여전히 GPU-free).
+        // GPU predict는 업스케일/표시와 경쟁해 부들부들을 만들어(실측) 앱 경로에서 배제.
+        // 벤치(adaptiveLadder=false): flowShortSide/useGPU 그대로 (고정 조건 비교).
+        let ladder = Self.adaptiveLadder && Self.modelAvailable(short: 288)
+        let short = ladder ? min(288, Self.flowShortSide) : Self.flowShortSide
+        let startGPU = ladder ? false : Self.useGPU
+        let (model, w, h) = try await Self.loadModel(short: short, gpu: startGPU)
         self.model = model
         modelW = w
         modelH = h
         currentShort = short
-        currentGPU = Self.useGPU
+        currentGPU = startGPU
 
         packQueue = device.makeCommandQueue()
         let library = try await device.makeLibrary(source: Self.shaderSource, options: nil)
@@ -202,7 +210,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
         slots = try Self.buildSlots(device: device, modelW: modelW, modelH: modelH)
         cancelled.withLock { $0 = false }
-        DiagnosticLog.shared.log("[RIFE] prepared: \(modelW)x\(modelH) flow (\(short)p), unit=\(Self.useGPU ? "GPU" : "ANE")")
+        DiagnosticLog.shared.log("[RIFE] prepared: \(modelW)x\(modelH) flow (\(short)p), unit=\(startGPU ? "GPU" : "ANE"), ladder=\(ladder)")
     }
 
     /// 슬롯 3개 × 앵커별 flow/mask 세트 (360 기준 슬롯당 ~11MB, 총 ~34MB)
@@ -261,6 +269,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// — predict를 ANE로 옮겨 GPU를 MetalFX 업스케일/표시에 돌려준다 (1080p60+4K뷰어에서
     /// GPU 150%+ 포화 → tick 108Hz 붕괴 실측). 중앙값이 간격의 35%↓(예: 24fps 소스)면 원복.
     private func maybeAdapt(gapS: Double, exhausted: Bool) {
+        guard Self.adaptiveLadder else { return }
         ladderPairs += 1
         if exhausted { ladderExhausts += 1 }
         gapMsEMA = gapMsEMA == 0 ? gapS * 1000 : gapMsEMA * 0.9 + gapS * 1000 * 0.1
@@ -272,14 +281,24 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastSwitchAt > 10, med > 0, gapMsEMA > 1 else { return }
 
+        // ANE-only 사다리 — 원칙: predict는 항상 ANE(GPU-free). GPU predict는 업스케일/표시와
+        // 경쟁해 present 타이밍을 흔든다(30fps 소스 360/GPU에서 glass σ 2.3~7.4ms 부들부들 실측;
+        // ANE 엔진(AppleFI)이 전 HW에서 매끄러운 이유). 해상도만 예산에 맞춰 288↔360 조절:
+        //   288/ANE=13.9ms(60fps 예산 내 유일) ↔ 360/ANE=20.8ms(30fps 이하 여유).
         let overloaded = med > gapMsEMA * 0.9 || exhaustRate > 0.05
-        let underloaded = med < gapMsEMA * 0.35
-        if overloaded, currentGPU, Self.modelAvailable(short: 288) {
+        if currentGPU, Self.modelAvailable(short: currentShort) {
+            // GPU 모드는 과도기 유산 — 어떤 상황이든 ANE로 이전 (과부하면 288, 아니면 동해상도)
+            let target = overloaded ? 288 : currentShort
+            kickSwitch(short: target, gpu: false,
+                       reason: "GPU-free 이전 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
+        } else if overloaded, currentShort > 288, Self.modelAvailable(short: 288) {
             kickSwitch(short: 288, gpu: false,
-                       reason: "과부하 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
-        } else if underloaded, !currentGPU {
-            kickSwitch(short: Self.flowShortSide, gpu: true,
-                       reason: "여유 복귀 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
+                       reason: "과부하 강등 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
+        } else if !overloaded, currentShort < Self.flowShortSide, Self.modelAvailable(short: Self.flowShortSide),
+                  med * 1.6 < gapMsEMA * 0.75 {
+            // 승격: 360 비용 ≈ 288×(360/288)² ≈ ×1.56 — 여유(30fps 이하 소스)면 화질 상향
+            kickSwitch(short: Self.flowShortSide, gpu: false,
+                       reason: "여유 승격 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
         }
     }
 

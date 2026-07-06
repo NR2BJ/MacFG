@@ -15,15 +15,25 @@ import torch
 import torch.nn.functional as F
 import coremltools as ct
 
-# ── 추적 가능한 실제 warp (grid_sample; trace 시 고정 크기라 meshgrid는 상수화됨)
+# ── ANE 친화 warp — 채널 슬라이스 제거 + 정규화 상수 융합.
+# v = flow·(2/(D-1)) + norm_grid_const → mul+add+permute+resample (기존: slice×2+mul×2+sub×2+cat+…).
+# 실측(2026-07-06, rife360): 속도 21.3→20.8ms(미미), 패리티는 개선(flow err 0.95→0.70px,
+# mask err 0.22→0.16). slice류는 추정비용(21%)과 달리 실제 병목 아님 — ANE 21ms의 본질은
+# resample×16(연산 자체가 ANE에 비쌈; conv-only 8.5ms vs full 20.8ms, bench425 실측).
+_WARP_CONSTS = {}
 def warp(img, flow):
-    B, _, H, W = flow.shape
-    yy, xx = torch.meshgrid(torch.arange(H, dtype=img.dtype), torch.arange(W, dtype=img.dtype), indexing='ij')
-    grid = torch.stack((xx, yy), 0).unsqueeze(0)
-    vgrid = grid + flow
-    vx = 2.0 * vgrid[:, 0:1] / max(W - 1, 1) - 1.0
-    vy = 2.0 * vgrid[:, 1:2] / max(H - 1, 1) - 1.0
-    g = torch.cat((vx, vy), 1).permute(0, 2, 3, 1)
+    _, _, H, W = flow.shape
+    key = (H, W)
+    if key not in _WARP_CONSTS:
+        yy, xx = torch.meshgrid(torch.arange(H, dtype=torch.float32),
+                                torch.arange(W, dtype=torch.float32), indexing='ij')
+        ng = torch.stack((2.0 * xx / max(W - 1, 1) - 1.0,
+                          2.0 * yy / max(H - 1, 1) - 1.0), 0).unsqueeze(0)   # [1,2,H,W] 상수
+        sc = torch.tensor([2.0 / max(W - 1, 1), 2.0 / max(H - 1, 1)],
+                          dtype=torch.float32).view(1, 2, 1, 1)
+        _WARP_CONSTS[key] = (ng, sc)
+    ng, sc = _WARP_CONSTS[key]
+    g = (flow * sc + ng).permute(0, 2, 3, 1)   # 슬라이스 0개
     return F.grid_sample(img, g, mode='bilinear', padding_mode='border', align_corners=True)
 
 pkg = types.ModuleType('model'); pkg.__path__ = []

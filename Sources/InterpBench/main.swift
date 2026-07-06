@@ -584,6 +584,7 @@ func main() async {
     // 품질 A/B 페어모드: 삼중항 디렉터리 처리 후 종료
     if let fs = config.flowShort { RIFEEngine.flowShortSide = fs }
     if config.rifeANE { RIFEEngine.useGPU = false }
+    RIFEEngine.adaptiveLadder = false   // 벤치 = 고정 조건 (flowShortSide/useGPU 존중)
     if let pairDir = config.pairDir {
         if let sm = config.smoothness { MetalFlowEngine.motionSmoothness = sm }
         await runPairMode(engineKey: config.pairEngine, dir: pairDir, device: device, queue: commandQueue)

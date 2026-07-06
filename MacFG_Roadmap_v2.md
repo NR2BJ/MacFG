@@ -580,3 +580,24 @@ UI에서 세 엔진 전환 즉시 적용, M4 기준 1080p 60fps 출력 안정적
 - 미채택 대안(원하면 재개): 사용자 지정 보호영역(HUD 사각형 항상 소스=보간 안 함, 그 안 이동콘텐츠는 60fps judder 트레이드).
 
 **상시 인프라 확보**: 실프레임 캡처(앱 ⌃⌥⌘D → bench_frames/frame_NNN.png) + InterpBench --triplets(A/GT/B 오프라인 PSNR) + dumpDiffPNG(증폭 diff). 합성-실전 갭 종식 — 앞으로 화질 논의는 실프레임으로.
+
+### N3 [정정 2026-07-06]. Neural 게임 약점 = per-frame 아님, **실시간 전달**
+
+**앞선 "flow 모델 천장"(B-4/초기 N3) 결론은 틀렸다.** 사용자가 "벤치 뭘로 돌렸냐"고 물어 원래 벤치 파이프라인(select_triplets cut필터 + runPairMode 실 Swift엔진 + metrics.py PSNR/SSIM)을 **사용자 실게임 24삼중항**에 재실행한 결과:
+
+| 엔진 | PSNR | SSIM | HIGH모션 SSIM |
+|---|---|---|---|
+| RIFE | 21.73 | **0.838** | **0.829** |
+| AppleFI | 21.91 | 0.832 | 0.823 |
+| MetalFlow | 20.86 | 0.801 | 0.789 |
+
+**RIFE per-frame이 게임에서도 MetalFlow를 이긴다**(SSIM 0.84 vs 0.80, 시각 확인: 메크 엣지 선명·고스팅 적음). 원래 벤치가 옳았음. 앞선 "RIFE≈MetalFlow"는 레이저 심한 단일 세션 PSNR-only의 성급한 측정 오류.
+
+**결정적**: RIFE ≈ AppleFI per-frame인데 사용자 체감은 AppleFI=완성형/RIFE=못쓸 → **정반대**. 즉 게임 약점은 화질(per-frame)이 아니라 **실시간 전달**. RIFE는 앱에서 288/ANE(predict 13~17ms ≈ 60fps 예산 경계)라 간헐 지각/드롭 → per-frame 지표 밖 judder. AppleFI는 Apple 최적 ANE라 같은 화질을 매끄럽게 전달.
+
+**N3 재조준 (모델 재학습 불필요 — 엔지니어링)**:
+1. **ANE 효율 재수출**(최우선): resample 병목 제거로 RIFE predict를 AppleFI급 속도(<8ms)로 → 예산 여유 → 드롭 소멸. research/rife/export_coreml.py + opt_warp_ane.py 개조.
+2. 실시간 페이싱/사다리 정교화(ANE 빨라지면 360/ANE 상시 가능).
+3. (해도 되고 안해도) 게임 도메인 파인튜닝은 화질 이미 충분해 후순위로 강등.
+
+재검증 도구: 실프레임 캡처(⌃⌥⌘D) + select_triplets + InterpBench --pair-dir + metrics.py(PSNR/SSIM) = 원래 벤치를 실콘텐츠로 재현하는 표준 경로.

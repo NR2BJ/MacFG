@@ -99,6 +99,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// predict 전용 직렬 워커 — 렌더/메인과 완전 분리
     private let worker = DispatchQueue(label: "com.macfg.rife.predict", qos: .userInitiated)
     private let cancelled = OSAllocatedUnfairLock(initialState: false)
+    /// 입력(stable) 준비 이벤트 — 호출자의 blit cb가 signal, pack cb가 GPU-wait (크로스큐 레이스 차단)
+    private let inputReady = OSAllocatedUnfairLock<(event: any MTLSharedEvent, value: UInt64)?>(initialState: nil)
+
+    public func noteInputReady(event: any MTLSharedEvent, value: UInt64) {
+        inputReady.withLock { $0 = (event, value) }
+    }
 
     private let logger = Logger(subsystem: "com.macfg", category: "RIFE")
     private var pairCount = 0
@@ -403,6 +409,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
         // ── ① pack: 자체 cb (flow/mask 0클리어 → 실패 시 50/50 블렌드 강등 보장)
         guard let packCB = packQueue.makeCommandBuffer() else { releaseSlot(slot); return nil }
+        // 입력 준비 대기 — 호출자 blit(별도 큐)이 stableA/B를 다 쓴 뒤에 pack이 읽게
+        if let ready = inputReady.withLock({ $0 }) {
+            packCB.encodeWaitForEvent(ready.event, value: ready.value)
+        }
         if let fill = packCB.makeBlitCommandEncoder() {
             for i in 0..<anchors.count {
                 fill.fill(buffer: slot.flowBufs[i], range: 0..<slot.flowBufs[i].length, value: 0)
@@ -504,7 +514,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             }
             return (tempFlowPrev!, tempMaskPrev!, tempPrevValid)
         } ?? (slot.flowTexs[0], slot.maskTexs[0], false)
-        var temporalW: Float = (anchors.count == 1 && prevValid) ? 0.5 : 0.0
+        var temporalW: Float = (anchors.count == 1 && prevValid
+            && ProcessInfo.processInfo.environment["MACFG_NO_TEMPORAL"] == nil) ? 0.5 : 0.0
         for i in 0..<anchors.count {
             guard let upEnc = commandBuffer.makeComputeCommandEncoder() else { releaseSlot(slot); return nil }
             upEnc.setComputePipelineState(unpackPSO)
@@ -647,7 +658,11 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
         desc.usage = [.shaderRead, .shaderWrite]
         desc.storageMode = .private
-        for _ in 0..<8 {
+        // 16장 — 표시 대기(타임라인 ≤12 + 지연슬롯) 중 재사용 오버런 방지. 8장이면 VFR/멀티-t
+        // (쌍당 3~4장 소모)에서 2~3쌍 만에 한 바퀴 → **표시 전 I프레임을 후속 워프가 덮어씀**
+        // (표시된 I가 미래 내용 = 'B 위치의 깨끗한 프레임', 등속팬 변위 4/0 실측 — 인앱 부들부들의
+        // 최종 근원). TODO(4K 메모리): presented 기반 수명관리로 교체.
+        for _ in 0..<16 {
             if let tex = device.makeTexture(descriptor: desc) { outputPool.append(tex) }
         }
         DiagnosticLog.shared.log("[RIFE] output pool \(width)x\(height) x\(outputPool.count)")

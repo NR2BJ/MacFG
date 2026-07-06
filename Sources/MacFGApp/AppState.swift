@@ -57,10 +57,10 @@ private final class RenderMailbox: @unchecked Sendable {
     private var releasedTextures: [ObjectIdentifier] = []
     private var presentedRecords: [(presentedAt: CFTimeInterval, captureTs: CFTimeInterval, isInterp: Bool)] = []
 
-    func postCompleted(entries newEntries: [TimelineEntry], released: ObjectIdentifier, workLatencyMs: Double, sceneCut: Bool) {
+    func postCompleted(entries newEntries: [TimelineEntry], released: ObjectIdentifier?, workLatencyMs: Double, sceneCut: Bool) {
         lock.lock()
         entries.append(contentsOf: newEntries)
-        releasedTextures.append(released)
+        if let released { releasedTextures.append(released) }
         workLatencies.append(workLatencyMs)
         if workLatencies.count > 480 { workLatencies.removeFirst(240) }
         if sceneCut { sceneCutCount += 1 }
@@ -505,6 +505,12 @@ public final class AppState {
                         self.startFrameDump()
                     }
                 }
+                if ProcessInfo.processInfo.environment["MACFG_AUTOOUTDUMP"] != nil {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .seconds(6))
+                        self.startOutputDump()
+                    }
+                }
                 return
             }
             try? await Task.sleep(for: .milliseconds(500))
@@ -730,6 +736,10 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var stablePoolWidth = 0
     @ObservationIgnored nonisolated(unsafe) private var stablePoolHeight = 0
     @ObservationIgnored nonisolated(unsafe) private var inFlightTextures: Set<ObjectIdentifier> = []
+    // stable 준비 이벤트 — blit(cb1) 완료를 GPU 이벤트로 알림. RIFE pack(별도 큐)이 이걸
+    // 기다려 '아직 안 쓰인 stableB를 읽는' 크로스큐 레이스를 차단 (인앱 flow 폭주의 원인).
+    @ObservationIgnored nonisolated(unsafe) private var stableReadyEvent: (any MTLSharedEvent)?
+    @ObservationIgnored nonisolated(unsafe) private var stableReadyCounter: UInt64 = 0
     /// timestamp = 스냅된 콘텐츠 시각 (타임라인/보간용), rawTimestamp = SCK 원본 시각 (연속성 검사용)
     @ObservationIgnored nonisolated(unsafe) private var prevStable: (texture: any MTLTexture, timestamp: CFTimeInterval, rawTimestamp: CFTimeInterval)?
 
@@ -738,6 +748,11 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var frameDumpRemaining = 0
     @ObservationIgnored nonisolated(unsafe) private var frameDumpIndex = 0
     @ObservationIgnored nonisolated(unsafe) private var frameDumpDir: URL?
+    // 표시 프레임 덤프 (⌃⌥⌘O) — 실제 표시된 시퀀스(S/I 순서·시각 포함)를 저장, 변위 분석으로
+    // '눈이 보는 부들거림'을 수치화 (프레임별 모션 변위의 균일성)
+    @ObservationIgnored nonisolated(unsafe) private var outDumpRemaining = 0
+    @ObservationIgnored nonisolated(unsafe) private var outDumpIndex = 0
+    @ObservationIgnored nonisolated(unsafe) private var outDumpDir: URL?
     private let frameDumpFileQueue = DispatchQueue(label: "com.macfg.framedump", qos: .utility)
     @ObservationIgnored nonisolated(unsafe) private var lastAcceptedTimestamp: CFTimeInterval = 0
     @ObservationIgnored nonisolated(unsafe) private var lastAcceptedFingerprint: UInt64 = 0
@@ -1095,7 +1110,10 @@ public final class AppState {
             return
         }
 
-        // 안정 복사 (SCK IOSurface 재활용에서 분리)
+        // 안정 복사 (SCK IOSurface 재활용에서 분리) — **별도 cb로 즉시 커밋 + ready signal**.
+        // 이전엔 blit이 큰 cb(마지막 커밋)에 있어, RIFE pack(자체 큐, 즉시 커밋)이 blit보다
+        // 먼저 실행되며 '아직 안 쓰인 stableB(옛 풀 내용)'를 읽음 → 쌍이 (A, 수 프레임 전)이
+        // 되어 flow 폭주(등속 팬에서 |flow| 1.6↔24.9px 요동, I프레임 위치 랜덤 = 부들부들 실측).
         if let blit = cb.makeBlitCommandEncoder() {
             blit.copy(
                 from: sourceTexture, sourceSlice: 0, sourceLevel: 0,
@@ -1107,8 +1125,7 @@ public final class AppState {
             blit.endEncoding()
         }
 
-        // 실프레임 덤프 — 무장(⌃⌥⌘D)돼 있으면 이 고유 프레임을 PNG로. 같은 cb에 shared 복사
-        // 후 완료 핸들러에서 파일 쓰기(핫패스 논블로킹).
+        // 실프레임 덤프 — 무장(⌃⌥⌘D)돼 있으면 이 고유 프레임을 PNG로. blit과 같은 cb1(순서 보장).
         if frameDumpRemaining > 0, let dir = frameDumpDir {
             dumpStableFrame(stable, cb: cb, dir: dir, index: frameDumpIndex)
             frameDumpIndex += 1
@@ -1117,6 +1134,24 @@ public final class AppState {
                 DiagnosticLog.shared.log("[FRAMEDUMP] \(frameDumpIndex)장 완료 → \(dir.path)")
             }
         }
+
+        // cb1 커밋: blit 완료를 이벤트로 알리고, 보간 인코딩은 새 cb2로 (같은 큐라 순서 보장)
+        if stableReadyEvent == nil { stableReadyEvent = device.makeSharedEvent() }
+        stableReadyCounter += 1
+        let readyValue = stableReadyCounter
+        if let ev = stableReadyEvent {
+            cb.encodeSignalEvent(ev, value: readyValue)
+        }
+        cb.commit()
+        guard let cb2 = workQueue.makeCommandBuffer() else {
+            lastAcceptedTimestamp = previousAcceptedTs
+            resetSnapState()
+            return
+        }
+        if let ev = stableReadyEvent {
+            (pairEngine as? RIFEEngine)?.noteInputReady(event: ev, value: readyValue)
+        }
+        // 이하 보간/핸들러는 cb2에 인코딩
 
         // 보간: 직전 소스와의 쌍. 갭이 크면(일시정지 후 재개) 스킵하고 연속성 리셋.
         // 갭 적응 다중 t: 소스 프레임이 드랍되어 갭이 디스플레이 슬롯 여러 개를 덮으면
@@ -1211,7 +1246,7 @@ public final class AppState {
                     stableA: prev.texture, stableB: stable,
                     tsA: prev.timestamp, tsB: snappedTs,
                     tValues: tValues,
-                    into: cb
+                    into: cb2
                 )
                 pairStartTs = prev.timestamp
                 pairGap = gap
@@ -1232,6 +1267,10 @@ public final class AppState {
             }
         }
 
+        // 반납은 '직전' 텍스처 — stable(이번)의 마지막 GPU 리더는 **다음 쌍의 pack**(A로 읽음)
+        // 이라 지금 반납하면 풀 재사용 blit이 pack과 레이스. prev의 마지막 리더(이번 pack/보간)는
+        // 이 cb2가 기다리므로 cb2 완료 시 반납이 안전.
+        let releasePrevID = prevStable.map { ObjectIdentifier($0.texture) }
         prevStable = (stable, snappedTs, slot.timestamp)
         inFlightTextures.insert(ObjectIdentifier(stable))
 
@@ -1242,7 +1281,7 @@ public final class AppState {
         let cutEvaluator = interpResult?.sceneCutEvaluator
         let startTs = pairStartTs
         let gapRef = pairGap
-        cb.addCompletedHandler { _ in
+        cb2.addCompletedHandler { _ in
             // 장면 전환이면 보간 프레임 폐기 — 무관한 두 샷 사이의 모핑 프레임 방지
             let isSceneCut = cutEvaluator?() ?? false
             var entries: [TimelineEntry] = []
@@ -1255,9 +1294,9 @@ public final class AppState {
             entries.append(TimelineEntry(timestamp: entryTs, texture: stableRef, isInterpolated: false, captureTimestamp: entryTs))
             // 캡처 시각 → 타임라인 등재까지의 파이프라인 지연 (스케줄러 offset 튜닝 지표)
             let workLatency = (CACurrentMediaTime() - entryTs) * 1000.0
-            mailboxRef.postCompleted(entries: entries, released: ObjectIdentifier(stableRef), workLatencyMs: workLatency, sceneCut: isSceneCut)
+            mailboxRef.postCompleted(entries: entries, released: releasePrevID, workLatencyMs: workLatency, sceneCut: isSceneCut)
         }
-        cb.commit()
+        cb2.commit()
     }
 
     nonisolated private func presentEntry(_ entry: TimelineEntry, at targetTimestamp: CFTimeInterval, drawable: any CAMetalDrawable) {
@@ -1265,6 +1304,35 @@ public final class AppState {
 
         guard let presentQueue, let cb = presentQueue.makeCommandBuffer() else { return }
         guard let surface = renderSurface else { cb.commit(); return }
+        // 표시 프레임 덤프 — 무장 시 이 표시분을 PNG로 (S/I·콘텐츠 ts를 파일명에)
+        if outDumpRemaining > 0, let dir = outDumpDir {
+            outDumpRemaining -= 1
+            let idx = outDumpIndex
+            outDumpIndex += 1
+            let kind = entry.isInterpolated ? "I" : "S"
+            let tsMs = Int((entry.timestamp.truncatingRemainder(dividingBy: 100)) * 1000)
+            let path = dir.appendingPathComponent(String(format: "out_%03d_%@_%06d.png", idx, kind, tsMs)).path
+            let tex = entry.texture
+            let w = tex.width, h = tex.height
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+            desc.storageMode = .shared
+            desc.usage = [.shaderRead]
+            if let shared = device.makeTexture(descriptor: desc), let blit = cb.makeBlitCommandEncoder() {
+                blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: w, height: h, depth: 1),
+                          to: shared, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+                let queue = frameDumpFileQueue
+                cb.addCompletedHandler { _ in
+                    queue.async { AppState.writeTexturePNG(shared, width: w, height: h, path: path) }
+                }
+            }
+            if outDumpRemaining == 0 {
+                DiagnosticLog.shared.log("[OUTDUMP] \(outDumpIndex)장 완료 → \(dir.path)")
+            }
+        }
         // CAMetalDisplayLink가 배달한 드로어블에 직접 인코딩 — nextDrawable 없음
         surface.encode(texture: entry.texture, into: cb, drawable: drawable)
 
@@ -1700,6 +1768,11 @@ public final class AppState {
                               modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
             self?.startFrameDump()
         })
+        // 표시 프레임 덤프 (개발 도구, 고정 ⌃⌥⌘O) — 표시 시퀀스 변위 분석용
+        bindings.append(.init(id: 6, keyCode: UInt32(kVK_ANSI_O),
+                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+            self?.startOutputDump()
+        })
         HotKeyCenter.shared.register(bindings)
     }
 
@@ -1708,6 +1781,21 @@ public final class AppState {
         isInterpolationEnabled.toggle()
         updateInterpolationEnabled()
         DiagnosticLog.shared.log("[HOTKEY] 보간 \(isInterpolationEnabled ? "ON(동영상)" : "OFF(저지연)")")
+    }
+
+    /// 표시 프레임 덤프 무장 (⌃⌥⌘O) — 다음 N개 '표시된' 프레임(S/I 순서 그대로)을 PNG로.
+    func startOutputDump(count: Int = 36) {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = fmt.string(from: Date())
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/MacFG/bench_frames/out_\(stamp)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        outDumpDir = dir
+        outDumpIndex = 0
+        outDumpRemaining = count
+        DiagnosticLog.shared.log("[OUTDUMP] 무장 \(count)장 → \(dir.path)")
+        NSSound.beep()
     }
 
     /// 실프레임 덤프 무장 (⌃⌥⌘D) — 다음 N개 고유 소스 프레임을 PNG로 저장.

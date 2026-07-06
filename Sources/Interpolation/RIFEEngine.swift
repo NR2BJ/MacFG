@@ -709,6 +709,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float conf = 1.0 - smoothstep(1.0, 1.8, ratio);
         float3 srcBlend = mix(a0, b0, p.tPhase);
         float3 outc = mix(srcBlend, warped, conf);
+        // 하드 정적 마스크 (MetalFlow와 동일 문턱 0.008~0.04) — 소스가 안 변한 픽셀(dBlur≈0)은
+        // flow가 *일관되게* 끌어도(비율 판정은 errW 작아 안 걸림) 무조건 소스 고정. RIFE엔 이게
+        // 없어 정적 UI(채팅/HUD)가 flow에 끌려 다중 고스트로 찢겼다(실프레임 diff 확인). MetalFlow가
+        // 게임에서 UI 안정적인 핵심. 문턱이 슬로우팬(|A-B|>0.008)은 안 얼려 60fps 스텝 회피.
+        float staticW = 1.0 - smoothstep(0.008, 0.04, dBlur);
+        outc = mix(outc, srcBlend, staticW);
         // conf/flow 실측 (16px 격자 스파스 — '보간이 실제로 얼마나 걸리는가' 계측)
         if ((gid.x & 15u) == 0u && (gid.y & 15u) == 0u) {
             atomic_fetch_add_explicit(&confStats[0], uint(conf * 255.0), memory_order_relaxed);

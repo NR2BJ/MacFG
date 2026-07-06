@@ -161,6 +161,12 @@ public final class AppState {
     /// 보간 on/off 전역 토글 — 전체화면 뷰어 안에서 동영상(보간 on)↔텍스트/인터랙티브(보간 off,
     /// 저지연)를 즉시 전환. 보간은 다음 프레임을 기다려 ~30ms 지연 + 텍스트 불연속 변화를 뭉갬.
     var hotInterp = HotKeyBinding(keyCode: UInt32(kVK_ANSI_I), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘I")
+    /// 정보 오버레이 토글 — 뷰어 좌상단에 소스/보간/업스케일 정보 표시.
+    var hotInfo = HotKeyBinding(keyCode: UInt32(kVK_ANSI_K), modifiers: UInt32(controlKey | optionKey | cmdKey), label: "⌃⌥⌘K")
+    /// 정보 오버레이 표시 상태 (세션 상태 — 비영속)
+    @ObservationIgnored nonisolated(unsafe) var infoOverlayVisible = false
+    /// 메뉴바 팝오버 열림 여부 (MenuBarExtra 콘텐츠 onAppear/onDisappear) — stats 갱신 게이트
+    @ObservationIgnored nonisolated(unsafe) var popoverVisible = false
 
     // MARK: - Components
     let device: any MTLDevice
@@ -276,13 +282,33 @@ public final class AppState {
     }
 
     /// 개발자 로그 토글 — on이면 /tmp/MacFG_diag.log 기록, off면 삭제+기록 중단.
-    func updateDevLogging() { DiagnosticLog.shared.setEnabled(devLoggingEnabled) }
+    func updateDevLogging() {
+        DiagnosticLog.shared.setEnabled(devLoggingEnabled)
+        registerHotKeys()   // 개발 덤프 단축키(⌃⌥⌘D/O)를 devLogging 상태에 맞춰 등록/해제
+    }
 
     /// Dock 표시 여부 — on이면 메뉴바 전용(.accessory, Dock/⌘Tab 제거), off면 일반(.regular).
     func updateMenuBarOnly() {
         NSApplication.shared.setActivationPolicy(menuBarOnly ? .accessory : .regular)
         if !menuBarOnly { NSApplication.shared.activate(ignoringOtherApps: true) }
         UserDefaults.standard.set(menuBarOnly, forKey: "s.menubaronly")
+    }
+
+    /// 설정을 별도 창으로 분리 (팝오버가 딴 곳 클릭 시 닫히는 게 불편한 경우). 한 번 만들어 재사용.
+    @ObservationIgnored private var detachedWindow: NSWindow?
+    func openSettingsWindow() {
+        if let w = detachedWindow {
+            w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
+        }
+        let host = NSHostingController(rootView: WindowPickerView(appState: self))
+        let w = NSWindow(contentViewController: host)
+        w.title = "MacFG"
+        w.styleMask = [.titled, .closable, .miniaturizable]
+        w.isReleasedWhenClosed = false          // 닫아도 재사용 (accessory라 앱은 안 꺼짐)
+        w.center()
+        detachedWindow = w
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func persistSettings() {
@@ -504,6 +530,9 @@ public final class AppState {
                         try? await Task.sleep(for: .seconds(4))
                         self.startFrameDump()
                     }
+                }
+                if ProcessInfo.processInfo.environment["MACFG_AUTOINFO"] != nil {
+                    Task { @MainActor in try? await Task.sleep(for: .seconds(5)); self.infoOverlayVisible = true; self.refreshInfoOverlay() }
                 }
                 if ProcessInfo.processInfo.environment["MACFG_AUTOOUTDUMP"] != nil {
                     Task { @MainActor in
@@ -1581,10 +1610,9 @@ public final class AppState {
     }
 
     private func updateStats() {
-        // 아무도 못 보는 설정 창엔 갱신 생략 — 전체화면 뷰어가 덮은 상태에서도 stats 쓰기가
-        // SwiftUI 레이아웃(NSHostingView, 4K에서 10-20ms)을 돌려 vsync 콜백을 삼킴 (sample 실측).
-        // 시청 모드(뷰어 전체화면)에서 SwiftUI 부하를 0으로 — 설정을 보면 자동 재개.
-        guard settingsWindowVisible else { return }
+        // 아무도 못 보는 상태에선 갱신 생략 — 뷰어가 덮은 상태에서 stats 쓰기가 SwiftUI 레이아웃을
+        // 돌려 vsync 콜백을 삼킴(실측). 팝오버/분리창(라이브 섹션) 또는 정보 오버레이가 보일 때만 갱신.
+        guard popoverVisible || settingsWindowVisible || infoOverlayVisible else { return }
         // @Observable 쓰기는 값이 실제로 바뀔 때만 — 렌더 틱과 같은 메인스레드에서
         // SwiftUI가 설정 뷰 body를 재평가(4K에서 5-15ms)해 vsync 콜백을 삼키는 것 방지.
         // 지터 콘텐츠에서 fps 소수점이 매번 달라 0.5s마다 전체 뷰 무효화 → tick 116-117Hz로
@@ -1609,6 +1637,26 @@ public final class AppState {
         if latencyMs != newLatency { latencyMs = newLatency }
         let newScale = overlayManager?.scaleStatus
         if upscaleStatus != newScale { upscaleStatus = newScale }
+        refreshInfoOverlay()   // 표시 중이면 라이브 갱신
+    }
+
+    /// 정보 오버레이 갱신 — 표시 중이고 캡처 중이면 소스/보간/업스케일 정보를 뷰어에 그린다.
+    func refreshInfoOverlay() {
+        guard infoOverlayVisible, isCapturing else { overlayManager?.setInfoOverlay(nil); return }
+        let engine = mirrorInterpolationEnabled ? interpolationEngine
+            : L("Interpolation off", "보간 꺼짐", "補間オフ")
+        var lines = ["MacFG"]
+        lines.append(L("Source", "소스", "ソース") + ": \(Int(inputFPS)) fps")
+        lines.append(L("Output", "출력", "出力") + ": \(Int(outputFPS)) fps · \(engine)")
+        lines.append(L("Upscale", "업스케일", "アップスケール") + ": " + (upscaleStatus ?? L("Off", "끔", "オフ")))
+        overlayManager?.setInfoOverlay(lines.joined(separator: "\n"))
+    }
+
+    /// 정보 오버레이 토글 (단축키)
+    func toggleInfoOverlay() {
+        infoOverlayVisible.toggle()
+        refreshInfoOverlay()
+        DiagnosticLog.shared.log("[HOTKEY] 정보 오버레이 \(infoOverlayVisible ? "ON" : "OFF")")
     }
 
     // MARK: - Interpolation Control
@@ -1763,16 +1811,22 @@ public final class AppState {
                 self?.toggleInterpolationHotkey()
             })
         }
-        // 실프레임 덤프 (개발 도구, 고정 ⌃⌥⌘D) — 실콘텐츠 삼중항 캡처
-        bindings.append(.init(id: 5, keyCode: UInt32(kVK_ANSI_D),
-                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
-            self?.startFrameDump()
-        })
-        // 표시 프레임 덤프 (개발 도구, 고정 ⌃⌥⌘O) — 표시 시퀀스 변위 분석용
-        bindings.append(.init(id: 6, keyCode: UInt32(kVK_ANSI_O),
-                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
-            self?.startOutputDump()
-        })
+        if hotInfo.keyCode != 0 {
+            bindings.append(.init(id: 7, keyCode: hotInfo.keyCode, modifiers: hotInfo.modifiers) { [weak self] in
+                self?.toggleInfoOverlay()
+            })
+        }
+        // 개발 도구 덤프 단축키 — 개발자 로그 켜진 동안만 등록 (일반 사용자에겐 미노출).
+        if devLoggingEnabled {
+            bindings.append(.init(id: 5, keyCode: UInt32(kVK_ANSI_D),
+                                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                self?.startFrameDump()   // 실프레임 삼중항 캡처
+            })
+            bindings.append(.init(id: 6, keyCode: UInt32(kVK_ANSI_O),
+                                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                self?.startOutputDump()  // 표시 시퀀스 변위 분석
+            })
+        }
         HotKeyCenter.shared.register(bindings)
     }
 
@@ -1855,6 +1909,7 @@ public final class AppState {
     func updateHotKeys() {
         if let data = try? JSONEncoder().encode(hotCapture) { UserDefaults.standard.set(data, forKey: "hk.capture") }
         if let data = try? JSONEncoder().encode(hotInterp) { UserDefaults.standard.set(data, forKey: "hk.interp") }
+        if let data = try? JSONEncoder().encode(hotInfo) { UserDefaults.standard.set(data, forKey: "hk.info") }
         registerHotKeys()
     }
 
@@ -1863,6 +1918,8 @@ public final class AppState {
            let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotCapture = b }
         if let d = UserDefaults.standard.data(forKey: "hk.interp"),
            let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotInterp = b }
+        if let d = UserDefaults.standard.data(forKey: "hk.info"),
+           let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotInfo = b }
     }
 
     private func configurePairEngine() async {

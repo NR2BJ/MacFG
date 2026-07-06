@@ -184,6 +184,49 @@ public final class OverlayWindow: NSObject {
     public var sourceWindowID: CGWindowID = 0
     private weak var interactionView: ViewerInteractionView?
 
+    /// 정보 오버레이 (단축키 토글) — 좌상단에 소스/보간/업스케일 정보. metal 콘텐츠 위 서브뷰로 합성.
+    private var infoLabel: NSTextField?
+
+    /// 정보 오버레이 표시/갱신. nil이면 숨김. (메인 스레드)
+    public func setInfoOverlay(_ text: String?) {
+        guard let content = window.contentView else { return }
+        guard let text, !text.isEmpty else { infoLabel?.isHidden = true; return }
+        let label: NSTextField
+        if let existing = infoLabel {
+            label = existing
+        } else {
+            label = NSTextField(labelWithString: "")
+            label.isEditable = false; label.isSelectable = false
+            label.isBezeled = false; label.drawsBackground = true
+            label.backgroundColor = NSColor.black.withAlphaComponent(0.55)
+            label.textColor = .white
+            label.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+            label.maximumNumberOfLines = 0
+            label.lineBreakMode = .byWordWrapping
+            label.wantsLayer = true
+            label.layer?.cornerRadius = 6
+            label.layer?.masksToBounds = true
+            label.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+                label.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            ])
+            infoLabel = label
+        }
+        // 인셋 여백 — attributed로 좌우 패딩
+        let para = NSMutableParagraphStyle()
+        para.firstLineHeadIndent = 8; para.headIndent = 8; para.tailIndent = -8
+        para.lineSpacing = 2; para.paragraphSpacingBefore = 6; para.paragraphSpacing = 6
+        label.attributedStringValue = NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: para,
+        ])
+        label.isHidden = false
+        content.addSubview(label, positioned: .above, relativeTo: nil)   // 항상 최상단
+    }
+
     /// 상대커서 모드 — 진짜 커서 위치를 소스로 재타깃 (호버/스크롤/클릭/드래그 전부 진짜 이벤트)
     private let relativePointer = RelativePointer()
 

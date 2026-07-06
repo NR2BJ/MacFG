@@ -284,28 +284,44 @@ struct WindowPickerView: View {
 
     private var shortcutSection: some View {
         section(L("Shortcut", "단축키", "ショートカット")) {
-            HStack {
-                Text(L("Capture toggle", "캡처 토글", "キャプチャ切替")).foregroundStyle(.secondary)
-                HelpButton(title: L("Capture toggle", "캡처 토글", "キャプチャ切替"),
-                           text: L("Focus any window and press this to start or stop capture. Click the field to record a new combo (must include a modifier).",
-                                   "아무 창이나 포커스하고 이 키를 눌러 캡처 시작/정지. 필드를 클릭해 새 조합 녹화(수정키 필수).",
-                                   "任意のウィンドウをフォーカスしてこのキーでキャプチャ開始/停止。フィールドをクリックして新しい組み合わせを記録(修飾キー必須)。"))
-                Spacer()
-                ShortcutRecorder(binding: $appState.hotCapture)
-                    .frame(width: 96, height: 22)
-                    .onChange(of: appState.hotCapture) { appState.updateHotKeys() }
+            shortcutRow(L("Capture toggle", "캡처 토글", "キャプチャ切替"),
+                        L("Focus any window and press this to start or stop capture. Click the field to record a new combo (must include a modifier); the ✕ clears it.",
+                          "아무 창이나 포커스하고 이 키를 눌러 캡처 시작/정지. 필드를 클릭해 새 조합 녹화(수정키 필수). ✕로 지웁니다.",
+                          "任意のウィンドウをフォーカスしてこのキーでキャプチャ開始/停止。フィールドをクリックして記録(修飾キー必須)。✕で消去。"),
+                        $appState.hotCapture)
+            shortcutRow(L("Interpolation toggle", "보간 토글", "補間切替"),
+                        L("Toggle frame interpolation on/off globally. Keep it ON for video; press to turn OFF for text/interactive apps. Leave blank (✕) if unused.",
+                          "프레임 보간 on/off 전역 토글. 동영상은 켠 채로, 텍스트/인터랙티브는 끄기. 안 쓰면 ✕로 비워둡니다.",
+                          "フレーム補間のオン/オフを全体切替。動画はオン、テキスト/操作系はオフ。使わなければ✕で空に。"),
+                        $appState.hotInterp)
+            shortcutRow(L("Info overlay", "정보 오버레이", "情報オーバーレイ"),
+                        L("Show source / interpolated frame rate and upscale info in the top-left of the viewer.",
+                          "뷰어 좌상단에 소스/보간 프레임레이트와 업스케일 정보를 표시합니다.",
+                          "ビューアー左上にソース/補間フレームレートとアップスケール情報を表示。"),
+                        $appState.hotInfo)
+        }
+    }
+
+    /// 단축키 행 — 라벨 + 도움말 + 녹화 필드 + ✕(지우기, 미등록으로).
+    @ViewBuilder
+    private func shortcutRow(_ label: String, _ help: String, _ binding: Binding<HotKeyBinding>) -> some View {
+        HStack(spacing: 6) {
+            Text(label).foregroundStyle(.secondary)
+            HelpButton(title: label, text: help)
+            Spacer()
+            ShortcutRecorder(binding: binding)
+                .frame(width: 96, height: 22)
+                .onChange(of: binding.wrappedValue) { appState.updateHotKeys() }
+            Button {
+                binding.wrappedValue = HotKeyBinding(keyCode: 0, modifiers: 0, label: "")
+                appState.updateHotKeys()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(binding.wrappedValue.keyCode == 0 ? .quaternary : .tertiary)
             }
-            HStack {
-                Text(L("Interpolation toggle", "보간 토글", "補間切替")).foregroundStyle(.secondary)
-                HelpButton(title: L("Interpolation toggle", "보간 토글", "補間切替"),
-                           text: L("Toggle frame interpolation on/off globally. Keep it ON for video; press to turn OFF for text/interactive apps (lower latency, no morphing).",
-                                   "프레임 보간 on/off 전역 토글. 동영상은 켠 채로, 텍스트/인터랙티브 앱은 눌러서 끄기(저지연, 뭉개짐 없음).",
-                                   "フレーム補間のオン/オフを全体切替。動画はオン、テキスト/操作系はオフ(低遅延)。"))
-                Spacer()
-                ShortcutRecorder(binding: $appState.hotInterp)
-                    .frame(width: 96, height: 22)
-                    .onChange(of: appState.hotInterp) { appState.updateHotKeys() }
-            }
+            .buttonStyle(.plain)
+            .disabled(binding.wrappedValue.keyCode == 0)
+            .help(L("Clear (no shortcut)", "지우기 (단축키 없음)", "消去(ショートカットなし)"))
         }
     }
 
@@ -343,8 +359,12 @@ struct WindowPickerView: View {
 
             Divider().padding(.top, 2)
             HStack {
-                Text(L("MacFG lives in the menu bar.", "MacFG는 메뉴바에 상주합니다.", "MacFGはメニューバーに常駐します。"))
-                    .font(.caption2).foregroundStyle(.secondary)
+                Button {
+                    appState.openSettingsWindow()
+                } label: {
+                    Label(L("Open as window", "창으로 열기", "ウィンドウで開く"), systemImage: "macwindow")
+                }
+                .controlSize(.small)
                 Spacer()
                 Button(role: .destructive) {
                     NSApplication.shared.terminate(nil)
@@ -353,6 +373,8 @@ struct WindowPickerView: View {
                 }
                 .controlSize(.small)
             }
+            Text(L("MacFG lives in the menu bar.", "MacFG는 메뉴바에 상주합니다.", "MacFGはメニューバーに常駐します。"))
+                .font(.caption2).foregroundStyle(.tertiary)
         }
     }
 }

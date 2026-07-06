@@ -104,6 +104,9 @@ public final class OverlayManager {
     /// 업스케일 실동작 상태 (UI 표시용)
     public var scaleStatus: String? { overlayWindow?.scaleStatus }
 
+    /// 정보 오버레이 (단축키 토글) 표시/갱신 — nil이면 숨김.
+    public func setInfoOverlay(_ text: String?) { overlayWindow?.setInfoOverlay(text) }
+
     /// 현재 출력 창의 렌더 표면 (렌더 스레드가 직접 사용 — A2)
     public var currentRenderSurface: RenderSurface? { overlayWindow?.surface }
 

@@ -10,6 +10,8 @@ struct MacFGApp: App {
         // 바로 아래로 펼쳐진다. 별도 창 없음 → 빨간 닫기 버튼으로 종료되는 문제 자체가 사라짐.
         MenuBarExtra {
             WindowPickerView(appState: delegate.appState)
+                .onAppear { delegate.appState.popoverVisible = true }
+                .onDisappear { delegate.appState.popoverVisible = false }
         } label: {
             // 캡처 중이면 배지 아이콘으로 상태 표시 (관찰 뷰)
             MenuBarLabel(appState: delegate.appState)

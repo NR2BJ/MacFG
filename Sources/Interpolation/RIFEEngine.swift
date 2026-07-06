@@ -85,6 +85,11 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     private var slots: [Slot] = []
     private let slotLock = NSLock()
 
+    // 시간적 flow 스무딩 상태 (모델 해상도, 쌍 간 공유 — 캘러 cb가 같은 큐라 순서 보장)
+    private var tempFlowPrev: (any MTLTexture)?
+    private var tempMaskPrev: (any MTLTexture)?
+    private var tempPrevValid = false
+
     // 출력 텍스처 링 (소스 크기 BGRA)
     private var outputPool: [any MTLTexture] = []
     private var outputIndex = 0
@@ -325,6 +330,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                     self.slots = newSlots
                     self.currentShort = short
                     self.currentGPU = gpu
+                    self.tempFlowPrev = nil          // 해상도 변경 — 시간적 prior 무효
+                    self.tempMaskPrev = nil
+                    self.tempPrevValid = false
                 }
                 self.predictMsRing.withLock { $0 = [] }   // 새 속도 — 예산 재학습
                 DiagnosticLog.shared.log("[RIFE] ladder 전환 완료: \(w)x\(h) (\(short)p/\(gpu ? "GPU" : "ANE"))")
@@ -481,15 +489,51 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
         // ── ③ 호출자 cb: 이벤트 대기 → 앵커별 unpack → t별 최근접 앵커 워프
         commandBuffer.encodeWaitForEvent(slot.event, value: signalValue)
+        // 시간적 스무딩은 단일 앵커(60fps 영상 경로 — 워블 체감 지점)에만. 캘러 cb들이 같은
+        // 큐에서 직렬이라 prev 텍스처의 쌍 간 read→write 순서는 큐가 보장.
+        let (prevF, prevM, prevValid) = slotLock.withLock {
+            () -> (any MTLTexture, any MTLTexture, Bool)? in
+            if tempFlowPrev == nil || tempFlowPrev!.width != mW0 || tempFlowPrev!.height != mH0 {
+                let fd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: mW0, height: mH0, mipmapped: false)
+                fd.usage = [.shaderRead, .shaderWrite]; fd.storageMode = .private
+                let md = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: mW0, height: mH0, mipmapped: false)
+                md.usage = [.shaderRead, .shaderWrite]; md.storageMode = .private
+                guard let dev = device,
+                      let f = dev.makeTexture(descriptor: fd), let m = dev.makeTexture(descriptor: md) else { return nil }
+                tempFlowPrev = f; tempMaskPrev = m; tempPrevValid = false
+            }
+            return (tempFlowPrev!, tempMaskPrev!, tempPrevValid)
+        } ?? (slot.flowTexs[0], slot.maskTexs[0], false)
+        var temporalW: Float = (anchors.count == 1 && prevValid) ? 0.5 : 0.0
         for i in 0..<anchors.count {
             guard let upEnc = commandBuffer.makeComputeCommandEncoder() else { releaseSlot(slot); return nil }
             upEnc.setComputePipelineState(unpackPSO)
             upEnc.setBuffer(slot.flowBufs[i], offset: 0, index: 0)
             upEnc.setBuffer(slot.maskBufs[i], offset: 0, index: 1)
+            upEnc.setBytes(&temporalW, length: MemoryLayout<Float>.size, index: 2)
             upEnc.setTexture(slot.flowTexs[i], index: 0)
             upEnc.setTexture(slot.maskTexs[i], index: 1)
+            upEnc.setTexture(prevF, index: 2)
+            upEnc.setTexture(prevM, index: 3)
             dispatch(upEnc, width: mW0, height: mH0, pso: unpackPSO)
             upEnc.endEncoding()
+        }
+        // 이번 쌍의 (스무딩된) flow/mask를 prev로 보존 — 다음 쌍의 prior
+        if anchors.count == 1, let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(from: slot.flowTexs[0], sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: mW0, height: mH0, depth: 1),
+                      to: prevF, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.copy(from: slot.maskTexs[0], sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: mW0, height: mH0, depth: 1),
+                      to: prevM, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+            slotLock.withLock { tempPrevValid = true }
+        } else {
+            slotLock.withLock { tempPrevValid = false }   // 멀티앵커 구간 — prior 단절
         }
 
         var frames: [(t: Float, texture: any MTLTexture)] = []
@@ -618,7 +662,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     // MARK: - Reset / Shutdown
 
     public func reset() {
-        // 무상태 (쌍 독립 — 시간적 prior 없음). 진행 중 슬롯은 자연 완료.
+        // 시간적 flow prior만 무효화 (불연속에서 이전 flow 블렌드 방지). 진행 중 슬롯은 자연 완료.
+        slotLock.withLock { tempPrevValid = false }
     }
 
     public func shutdown() {
@@ -670,11 +715,18 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     }
 
     // flow/mask fp16 CHW 버퍼 → 텍스처 (워프에서 하드웨어 bilinear 샘플용)
+    // temporalW>0이면 직전 쌍 flow/mask와 게이트 블렌드 — 영상 모션은 프레임 간 연속이라
+    // 일치(|Δ|≤~3 모델px)하는 곳은 평균으로 쌍 간 서브픽셀 노이즈를 절반화(120Hz 마이크로
+    // 워블의 원인 — 288 flow에서 1080p의 2~5px 모션은 서브픽셀 영역이라 쌍마다 흔들림, 실증상
+    // "미세하게 부들거림"). 급변(진짜 모션 변화/컷)은 게이트가 0으로 열어 랙 없음.
     kernel void rifeUnpack(
         device const half* flowBuf [[buffer(0)]],
         device const half* maskBuf [[buffer(1)]],
+        constant float& temporalW [[buffer(2)]],
         texture2d<float, access::write> flowTex [[texture(0)]],
         texture2d<float, access::write> maskTex [[texture(1)]],
+        texture2d<float, access::read> prevFlow [[texture(2)]],
+        texture2d<float, access::read> prevMask [[texture(3)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = flowTex.get_width();
@@ -682,9 +734,19 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         if (gid.x >= w || gid.y >= h) return;
         uint plane = w * h;
         uint idx = gid.y * w + gid.x;
-        flowTex.write(float4(float(flowBuf[idx]), float(flowBuf[plane + idx]),
-                             float(flowBuf[2 * plane + idx]), float(flowBuf[3 * plane + idx])), gid);
-        maskTex.write(float4(float(maskBuf[idx])), gid);
+        float4 f = float4(float(flowBuf[idx]), float(flowBuf[plane + idx]),
+                          float(flowBuf[2 * plane + idx]), float(flowBuf[3 * plane + idx]));
+        float m = float(maskBuf[idx]);
+        if (temporalW > 0.001) {
+            float4 pf = prevFlow.read(gid);
+            float d = max(length(f.xy - pf.xy), length(f.zw - pf.zw));
+            float agree = 1.0 - smoothstep(1.5, 4.0, d);      // 모델px 기준
+            float wgt = temporalW * agree;
+            f = mix(f, pf, wgt);
+            m = mix(m, prevMask.read(gid).r, wgt);
+        }
+        flowTex.write(f, gid);
+        maskTex.write(float4(m), gid);
     }
 
     // 풀해상도 워프: I_t = warp(A, f_t0)·σ(mask) + warp(B, f_t1)·(1-σ(mask))

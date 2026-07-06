@@ -514,6 +514,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             }
             return (tempFlowPrev!, tempMaskPrev!, tempPrevValid)
         } ?? (slot.flowTexs[0], slot.maskTexs[0], false)
+        // 스무딩은 실측 순이득(등속 σ 24% vs OFF 71%) — 단 게이트를 조여(0.75~2.0px) 가감속
+        // 랙 고스팅을 차단. 디버그: MACFG_NO_TEMPORAL=1로 끄기.
         var temporalW: Float = (anchors.count == 1 && prevValid
             && ProcessInfo.processInfo.environment["MACFG_NO_TEMPORAL"] == nil) ? 0.5 : 0.0
         for i in 0..<anchors.count {
@@ -755,7 +757,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         if (temporalW > 0.001) {
             float4 pf = prevFlow.read(gid);
             float d = max(length(f.xy - pf.xy), length(f.zw - pf.zw));
-            float agree = 1.0 - smoothstep(1.5, 4.0, d);      // 모델px 기준
+            float agree = 1.0 - smoothstep(1.2, 3.0, d);      // 모델px — 서브픽셀 노이즈(≤1.2)는
+            // 풀 스무딩(등속 σ 24% 실측), 가감속(Δ≥3px/쌍)은 해제해 prev-flow 랙 고스팅 차단
             float wgt = temporalW * agree;
             f = mix(f, pf, wgt);
             m = mix(m, prevMask.read(gid).r, wgt);

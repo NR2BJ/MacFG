@@ -601,3 +601,12 @@ UI에서 세 엔진 전환 즉시 적용, M4 기준 1080p 60fps 출력 안정적
 3. (해도 되고 안해도) 게임 도메인 파인튜닝은 화질 이미 충분해 후순위로 강등.
 
 재검증 도구: 실프레임 캡처(⌃⌥⌘D) + select_triplets + InterpBench --pair-dir + metrics.py(PSNR/SSIM) = 원래 벤치를 실콘텐츠로 재현하는 표준 경로.
+
+### N3 [아키텍처 법칙 2026-07-06]. ANE 엔진 > GPU 엔진 (전달 매끄러움), 약한 HW서 증폭
+
+핵심 법칙: **보간을 ANE에서 하는 엔진(AppleFI)이 GPU에서 하는 엔진(MetalFlow/RIFE-GPU)보다 전달이 매끄럽다** — ANE는 GPU(업스케일+present)와 경쟁하지 않기 때문. M4 실측 확증(GPU-RIFE 360→drawBusy 적체+glass 요동; ANE-AppleFI 매끄러움). **M1 사용자 리포트("AppleFI가 MetalFlow보다 유의미하게 나음")도 동일 메커니즘** — M1 GPU가 ~2배 느려 MetalFlow(전부 GPU: flow+warp+MetalFX+present)가 8.3ms 예산 초과 포화 → 부들부들; AppleFI(ANE 보간, GPU-free)는 매끄러움. 화질 차이 아님(성능/전달).
+
+시사점:
+- 약한 맥(M1/base) 권장 = AppleFI. GPU 엔진(MetalFlow)은 근본 불리.
+- **ANE-RIFE 목표 정당화 강화**: RIFE(화질 천장) + ANE 전달(전 HW 매끄러움) = 이상적. N3-딜리버리(ANE 효율 재수출)가 이걸 실현.
+- 보조 레버: MetalFlow "약한 GPU 모드"(flowBase↓ + bilinear+CAS 업스케일)로 M1 개선 가능.

@@ -700,15 +700,19 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // flow 오류(오위치 유령): errW ≥ dBlur → 제자리 크로스페이드 강등.
         // 정적 UI(조준점/글자): dBlur≈0 + errW(배경 워프)큼 → 비율↑ → 원본 크로스페이드 = 고정.
         // (별도 정적 마스크는 제거 — 느린 팬까지 얼려 60fps 계단을 만들었음, 실측 '부드러움 없음'.)
-        float ratio = errW / (dBlur + 0.01);
-        float conf = 1.0 - smoothstep(0.9, 1.6, ratio);
+        // 모션 비례 관용 — 큰 모션(8~25px, 실측 게임)일수록 coarse flow의 수 px 오차는 불가피
+        // + 크로스페이드는 명백한 이중상이라 워프가 낫다. 관용 없인 conf~0.6 물타기(실측
+        // '보간 못 느낌'). 정적 UI는 ratio 5~10이라 관용 2.5배에도 철벽.
+        float fmag = (length(f0) + length(f1)) * 0.5;
+        float tol = 1.0 + min(fmag * 0.06, 1.5);
+        float ratio = errW / ((dBlur + 0.01) * tol);
+        float conf = 1.0 - smoothstep(1.0, 1.8, ratio);
         float3 srcBlend = mix(a0, b0, p.tPhase);
         float3 outc = mix(srcBlend, warped, conf);
         // conf/flow 실측 (16px 격자 스파스 — '보간이 실제로 얼마나 걸리는가' 계측)
         if ((gid.x & 15u) == 0u && (gid.y & 15u) == 0u) {
             atomic_fetch_add_explicit(&confStats[0], uint(conf * 255.0), memory_order_relaxed);
             atomic_fetch_add_explicit(&confStats[1], 1u, memory_order_relaxed);
-            float fmag = (length(f0) + length(f1)) * 0.5;
             atomic_fetch_add_explicit(&confStats[2], uint(clamp(fmag, 0.0, 500.0) * 8.0), memory_order_relaxed);
         }
         outTex.write(float4(outc, 1.0), gid);

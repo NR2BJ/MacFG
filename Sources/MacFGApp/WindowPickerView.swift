@@ -330,17 +330,6 @@ struct WindowPickerView: View {
                 .labelsHidden().pickerStyle(.menu).fixedSize()
             }
 
-            field(L("Hide from Dock", "Dock에서 숨기기", "Dockから隠す"),
-                  hint: L("Menu-bar only — no Dock icon.",
-                          "메뉴바 전용 — Dock 아이콘 없음.",
-                          "メニューバーのみ — Dockアイコンなし。"),
-                  detail: L("The app lives in the menu bar; open this window from the menu-bar icon. ⌘Tab won't list it.",
-                            "앱은 메뉴바에 상주합니다. 이 창은 메뉴바 아이콘에서 엽니다. ⌘Tab 목록에도 안 뜹니다.",
-                            "アプリはメニューバーに常駐します。このウィンドウはメニューバーアイコンから開きます。⌘Tabにも表示されません。")) {
-                Toggle("", isOn: $appState.menuBarOnly).labelsHidden()
-                    .onChange(of: appState.menuBarOnly) { appState.updateMenuBarOnly() }
-            }
-
             field(L("Developer logging", "개발자 로그", "開発者ログ"),
                   hint: L("Off by default — records only when on.",
                           "기본 꺼짐 — 켤 때만 기록.",
@@ -350,6 +339,19 @@ struct WindowPickerView: View {
                             "オンで /tmp/MacFG_diag.log を記録します。オフでファイルを削除し記録を停止します。")) {
                 Toggle("", isOn: $appState.devLoggingEnabled).labelsHidden()
                     .onChange(of: appState.devLoggingEnabled) { appState.updateDevLogging() }
+            }
+
+            Divider().padding(.top, 2)
+            HStack {
+                Text(L("MacFG lives in the menu bar.", "MacFG는 메뉴바에 상주합니다.", "MacFGはメニューバーに常駐します。"))
+                    .font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Button(role: .destructive) {
+                    NSApplication.shared.terminate(nil)
+                } label: {
+                    Label(L("Quit", "종료", "終了"), systemImage: "power")
+                }
+                .controlSize(.small)
             }
         }
     }

@@ -23,9 +23,9 @@ public final class UIStaticDetector {
 
     /// 튜닝(오프라인 clo0.8 chi2.0 시작점). alpha=EMA율(~1/창길이). enabled=off면 no-op.
     public nonisolated(unsafe) static var enabled = true
-    public nonisolated(unsafe) static var alpha: Float = 0.04   // ~25프레임 창
-    public nonisolated(unsafe) static var clo: Float = 0.8
-    public nonisolated(unsafe) static var chi: Float = 2.0
+    public nonisolated(unsafe) static var alpha: Float = 0.04   // ~25프레임 창 (스윕 최적)
+    public nonisolated(unsafe) static var clo: Float = 0.5      // 스윕 최적 — 흐린 UI까지 잡되 무회귀
+    public nonisolated(unsafe) static var chi: Float = 1.7
     public nonisolated(unsafe) static var strength: Float = 1.0  // 마스크 최대 프리즈 강도
 
     /// 워프가 샘플할 마스크 (없으면 nil). 워밍업 전(<8프레임)엔 nil 반환해 초기 노이즈 회피.

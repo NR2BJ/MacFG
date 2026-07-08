@@ -537,9 +537,12 @@ public final class AppState {
                 if ProcessInfo.processInfo.environment["MACFG_AUTOINFO"] != nil {
                     Task { @MainActor in try? await Task.sleep(for: .seconds(5)); self.infoOverlayVisible = true; self.refreshInfoOverlay() }
                 }
-                if ProcessInfo.processInfo.environment["MACFG_AUTOOUTDUMP"] != nil {
+                if let od = ProcessInfo.processInfo.environment["MACFG_AUTOOUTDUMP"] {
+                    // 값이 숫자면 지연(초) — 사다리 승격 전환창(~1s 소스-온리)을 피해
+                    // 정착 후를 측정할 때 사용 (예: MACFG_AUTOOUTDUMP=25). 그 외엔 6초.
+                    let delay = Double(od) ?? 6
                     Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(6))
+                        try? await Task.sleep(for: .seconds(delay > 0 ? delay : 6))
                         self.startOutputDump()
                     }
                 }

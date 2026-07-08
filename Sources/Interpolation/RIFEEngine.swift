@@ -38,10 +38,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     public nonisolated(unsafe) static var useGPU: Bool = true
     /// 앱 적응 사다리(ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
     public nonisolated(unsafe) static var adaptiveLadder: Bool = true
-    /// 사다리 티어 — M4 실측 predict p50: 288=13.7 / 360=21.0 / 432=30.8ms. 예산 규칙
-    /// (med×면적비 < gap×0.75)이 자기제한: 60fps→288, 30fps→360, 24fps 영화→432.
-    /// 432는 하드케이스(대모션+저대비 채팅) SSIM +0.02(평균 스텝의 2~4배, 실프레임 삼중항
-    /// 실측)로 24fps 감상 화질을 배포 아키텍처(저해상 flow+풀 warp) 천장까지 올린다 (N3 1단계).
+    /// 사다리 티어 — v2 모델(다운스케일 후 워프 재수출, N3 2단계) M4 실측 ANE p50:
+    /// 288=7.2 / 360=10.9 / 432=16.7ms (v1 대비 -47%: 내부 워프 16회를 블록 입력
+    /// 해상도에서 수행해 resample 비용 ⅓ — 화질은 실프레임 삼중항 SSIM 동일 ±0.002).
+    /// 예산 규칙(med×면적비 < gap×0.75)이 자기제한: **60fps→360(신규), 30fps 이하→432**.
+    /// 432는 하드케이스(대모션+저대비 채팅) SSIM +0.02(평균 스텝의 2~4배)로 배포
+    /// 아키텍처(저해상 flow+풀 warp) 천장. M1은 예산상 자동으로 낮은 티어에 머무름.
     static let ladderTiers = [288, 360, 432]
     public nonisolated(unsafe) static var ladderMaxShort: Int = 432
 
@@ -208,7 +210,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
     public func prepare(device: any MTLDevice) async throws {
         self.device = device
-        // 앱(adaptiveLadder): 시작 = (288, ANE) — GPU-free + 60fps 예산 내(13.9ms)로 안전.
+        // 앱(adaptiveLadder): 시작 = (288, ANE) — GPU-free + 60fps 예산 내(v2 7.2ms)로 안전.
         // 소스가 30fps 이하로 판명되면 사다리가 360/ANE로 승격(화질↑, 여전히 GPU-free).
         // GPU predict는 업스케일/표시와 경쟁해 부들부들을 만들어(실측) 앱 경로에서 배제.
         // 벤치(adaptiveLadder=false): flowShortSide/useGPU 그대로 (고정 조건 비교).
@@ -308,8 +310,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
         // ANE-only 사다리 — 원칙: predict는 항상 ANE(GPU-free). GPU predict는 업스케일/표시와
         // 경쟁해 present 타이밍을 흔든다(30fps 소스 360/GPU에서 glass σ 2.3~7.4ms 부들부들 실측;
-        // ANE 엔진(AppleFI)이 전 HW에서 매끄러운 이유). 해상도만 예산에 맞춰 288↔360 조절:
-        //   288/ANE=13.9ms(60fps 예산 내 유일) ↔ 360/ANE=20.8ms(30fps 이하 여유).
+        // ANE 엔진(AppleFI)이 전 HW에서 매끄러운 이유). 해상도만 예산에 맞춰 티어 조절
+        //   (v2 실측: 288=7.2 / 360=10.9 / 432=16.7ms — 60fps→360, 30fps 이하→432).
         let overloaded = med > gapMsEMA * 0.9 || exhaustRate > 0.05
         if currentGPU, Self.modelAvailable(short: currentShort) {
             // GPU 모드는 과도기 유산 — 어떤 상황이든 ANE로 이전 (과부하면 288, 아니면 동해상도)

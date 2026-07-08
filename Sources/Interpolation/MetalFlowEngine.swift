@@ -81,6 +81,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// outputPool 슬롯별 현 점유 세대 (표시 직전 isFrameLive 검증용). encode/조회 모두 렌더 스레드.
     private var slotStamps: [UInt64] = []
     private var nextStamp: UInt64 = 0
+    /// 화면정지 UI 마스크 (UIStaticDetector) — 워프가 이 영역을 소스로 프리즈
+    private var uiMaskTex: (any MTLTexture)?
+    public func setUIMask(_ texture: (any MTLTexture)?) { uiMaskTex = texture }
     // 히스토그램은 쌍당 1개 — 별도 링
     private var statsBuffers: [any MTLBuffer] = []
     private var statsIndex = 0
@@ -254,6 +257,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         enc2.setTexture(flowF[0], index: 2)
         enc2.setTexture(flowB[0], index: 3)
         enc2.setTexture(maskTex, index: 4)
+        enc2.setTexture(uiMaskTex ?? stableA, index: 6)   // 정지-UI 마스크 (미사용 시 더미)
         let dirBlend: Float = Self.occlusionDirectional ? 1.0 : 0.0
         for t in tValues.sorted() {
             let slotIdx = outputIndex
@@ -262,7 +266,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             nextStamp &+= 1
             let stamp = nextStamp
             if slotIdx < slotStamps.count { slotStamps[slotIdx] = stamp }   // 이 슬롯의 현 점유 세대
-            var wp = WarpParams(t: t, dirBlend: dirBlend, fadeLo: fadeLo, fadeHi: fadeHi, flowBlur: flowBlur)
+            var wp = WarpParams(t: t, dirBlend: dirBlend, fadeLo: fadeLo, fadeHi: fadeHi, flowBlur: flowBlur,
+                                useUIMask: uiMaskTex != nil ? 1 : 0)
             enc2.setTexture(output, index: 5)
             enc2.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
             dispatch(enc2, output.width, output.height, warpPSO)
@@ -312,6 +317,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var fadeLo: Float
         var fadeHi: Float
         var flowBlur: Float
+        var useUIMask: Float = 0
     }
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -414,7 +420,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     using namespace metal;
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; };
-    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -657,6 +663,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         texture2d<float, access::sample> flowB [[texture(3)]],
         texture2d<float, access::sample> mask [[texture(4)]],
         texture2d<half, access::write> dst [[texture(5)]],
+        texture2d<float, access::sample> uiMask [[texture(6)]],
         constant WarpParams& p [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
@@ -715,6 +722,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                                half(smoothstep(p.fadeLo, p.fadeHi, t)));
         half3 moving = mix(nearestPix, interp, conf);
         half3 outc = mix(moving, bOrig, half(staticness)); // 정적 → B 원본 (선명)
+        // 시간축 정지-UI 프리즈 (staticness가 못 잡는 반투명/저대비 UI) — 소스로 고정
+        if (p.useUIMask > 0.5) {
+            float uim = clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
+            outc = mix(outc, nearestPix, half(uim));
+        }
         dst.write(half4(outc, 1.0h), gid);
     }
     """

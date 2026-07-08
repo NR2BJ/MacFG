@@ -96,6 +96,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     // 출력 텍스처 링 (소스 크기 BGRA)
     private var outputPool: [any MTLTexture] = []
     private var outputIndex = 0
+    /// outputPool 슬롯별 현 점유 세대. 표시 직전 isFrameLive가 stamp==slotStamps[슬롯] 확인 —
+    /// contains로 조회(stamp는 전역 단조라 유일). encode/isFrameLive 모두 렌더 스레드 → 락 불요.
+    private var slotStamps: [UInt64] = []
+    private var nextStamp: UInt64 = 0
     private var outputWidth = 0
     private var outputHeight = 0
 
@@ -591,15 +595,19 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             useDiffTex = 1
         }
 
-        var frames: [(t: Float, texture: any MTLTexture)] = []
+        var frames: [(t: Float, texture: any MTLTexture, stamp: UInt64)] = []
         for t in ts {
             // 최근접 앵커 (동률이면 아무쪽 — 스케일 편차 동일)
             var ai = 0
             var best = Float.greatestFiniteMagnitude
             for (j, a) in anchors.enumerated() where abs(t - a) < best { best = abs(t - a); ai = j }
             let anchor = anchors[ai]
+            let slotIdx = outputIndex
             let output = outputPool[outputIndex]
             outputIndex = (outputIndex + 1) % outputPool.count
+            nextStamp &+= 1
+            let stamp = nextStamp
+            if slotIdx < slotStamps.count { slotStamps[slotIdx] = stamp }   // 이 슬롯의 현 점유 세대
             guard let enc = commandBuffer.makeComputeCommandEncoder() else { break }
             enc.setComputePipelineState(warpPSO)
             enc.setTexture(stableA, index: 0)
@@ -618,7 +626,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             enc.setBuffer(slot.confBuf, offset: 0, index: 1)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
             enc.endEncoding()
-            frames.append((t, output))
+            frames.append((t: t, texture: output, stamp: stamp))
         }
 
         // 슬롯 반납은 호출자 cb 완료 시 (unpack/warp가 버퍼·텍스처를 다 읽은 뒤)
@@ -711,6 +719,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         for _ in 0..<16 {
             if let tex = device.makeTexture(descriptor: desc) { outputPool.append(tex) }
         }
+        slotStamps = [UInt64](repeating: 0, count: outputPool.count)   // 슬롯 세대 리셋
         // dBlur 선계산 텍스처 (멀티-t 쌍당 1회, r16Float ≈ 출력의 1/2 바이트/px)
         let dd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
@@ -732,6 +741,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // 시간적 flow prior만 무효화 (불연속에서 이전 flow 블렌드 방지). 진행 중 슬롯은 자연 완료.
         slotLock.withLock { tempPrevValid = false }
     }
+
+    /// 표시 직전 검증 — stamp가 아직 어느 슬롯의 현 세대면 유효(안 덮임). 렌더 스레드 전용.
+    public func isFrameLive(_ stamp: UInt64) -> Bool { slotStamps.contains(stamp) }
 
     public func shutdown() {
         cancelled.withLock { $0 = true }

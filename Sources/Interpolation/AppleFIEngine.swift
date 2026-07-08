@@ -70,6 +70,9 @@ public final class AppleFIEngine: PairInterpolationEngine {
     // 히스토그램 버퍼 링 (출력 풀과 같은 인덱스): uint32 x 64 (yA 32빈 + yB 32빈)
     private var statsBuffers: [any MTLBuffer] = []
     private var outputIndex = 0
+    /// outputPool 슬롯별 현 점유 세대 (표시 직전 isFrameLive 검증용). encode/조회 모두 렌더 스레드.
+    private var slotStamps: [UInt64] = []
+    private var nextStamp: UInt64 = 0
     private var outputWidth = 0
     private var outputHeight = 0
 
@@ -207,6 +210,9 @@ public final class AppleFIEngine: PairInterpolationEngine {
         let output = outputPool[slotIndex]
         let statsBuffer = statsBuffers[slotIndex]
         outputIndex = (outputIndex + 1) % outputPool.count
+        nextStamp &+= 1
+        let stamp = nextStamp
+        if slotIndex < slotStamps.count { slotStamps[slotIndex] = stamp }   // 이 슬롯의 현 점유 세대
 
         // 0) 히스토그램 버퍼 클리어
         if let fill = commandBuffer.makeBlitCommandEncoder() {
@@ -298,7 +304,7 @@ public final class AppleFIEngine: PairInterpolationEngine {
         // 전체 인코딩 성공 시에만 갱신 — 중도 실패면 불일치로 남아 다음 쌍이 전체 경로 폴백
         lastEncodedTsB = tsB
         lastStableBID = ObjectIdentifier(stableB as AnyObject)
-        return PairEncodeResult(frames: [(0.5, output)], sceneCutEvaluator: evaluator)
+        return PairEncodeResult(frames: [(t: 0.5, texture: output, stamp: stamp)], sceneCutEvaluator: evaluator)
     }
 
     private func encodeDownscale(_ enc: any MTLComputeCommandEncoder, source: any MTLTexture, target: PlanarBuffer) {
@@ -348,6 +354,7 @@ public final class AppleFIEngine: PairInterpolationEngine {
                 statsBuffers.append(buf)
             }
         }
+        slotStamps = [UInt64](repeating: 0, count: outputPool.count)   // 슬롯 세대 리셋
         upscaledTmp = device.makeTexture(descriptor: desc)
 
         // MetalFX spatial scaler (출력 크기 의존) — 실패 시 bilinear 폴백
@@ -402,6 +409,9 @@ public final class AppleFIEngine: PairInterpolationEngine {
     }
 
     // MARK: - Reset / Shutdown
+
+    /// 표시 직전 검증 — stamp가 아직 어느 슬롯의 현 세대면 유효(안 덮임). 렌더 스레드 전용.
+    public func isFrameLive(_ stamp: UInt64) -> Bool { slotStamps.contains(stamp) }
 
     public func reset() {
         // 타임스탬프 연속성만 관리 — 다음 encodePair에서 역행 감지 시 세션 재시작

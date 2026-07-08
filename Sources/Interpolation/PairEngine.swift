@@ -3,12 +3,15 @@ import FramePacing
 
 /// encodePair 결과 — 요청한 t별 보간 텍스처
 public struct PairEncodeResult {
-    /// (위상 t, 텍스처) — t 오름차순. 엔진이 일부 t만 지원하면 지원분만 반환.
-    public let frames: [(t: Float, texture: any MTLTexture)]
+    /// (위상 t, 텍스처, stamp) — t 오름차순. 엔진이 일부 t만 지원하면 지원분만 반환.
+    /// stamp: 이 텍스처가 엔진 출력 링에서 차지한 슬롯의 세대 도장 (0 = 링 재사용 없음/검증 불요).
+    /// 표시 직전 isFrameLive(stamp)로 "후속 warp가 이 슬롯을 덮지 않았나" 확인 — burst에서
+    /// 표시 대기 텍스처가 덮여도 잘못된 픽셀 대신 깨끗한 드롭(직전 프레임 유지)이 되게 한다.
+    public let frames: [(t: Float, texture: any MTLTexture, stamp: UInt64)]
     /// command buffer 완료 후 호출 가능 — true면 장면 전환 (모든 보간 프레임 폐기 권장). nil이면 판정 없음.
     public let sceneCutEvaluator: (@Sendable () -> Bool)?
 
-    public init(frames: [(t: Float, texture: any MTLTexture)], sceneCutEvaluator: (@Sendable () -> Bool)? = nil) {
+    public init(frames: [(t: Float, texture: any MTLTexture, stamp: UInt64)], sceneCutEvaluator: (@Sendable () -> Bool)? = nil) {
         self.frames = frames
         self.sceneCutEvaluator = sceneCutEvaluator
     }
@@ -43,6 +46,15 @@ public protocol PairInterpolationEngine: AnyObject {
     func reset()
 
     func shutdown()
+
+    /// stamp가 가리키는 출력 텍스처가 아직 유효한가 (후속 encodePair가 그 링 슬롯을 재사용해
+    /// 덮지 않았는가). 표시 경로가 렌더 스레드에서 호출 — encodePair와 같은 스레드라 락 불요.
+    /// 링을 재사용하지 않는 엔진(Legacy 등)은 기본 구현(항상 true)을 그대로 쓴다.
+    func isFrameLive(_ stamp: UInt64) -> Bool
+}
+
+public extension PairInterpolationEngine {
+    func isFrameLive(_ stamp: UInt64) -> Bool { true }
 }
 
 /// 기존 FrameInterpolator(Blend 등)를 PairInterpolationEngine으로 감싸는 어댑터
@@ -70,7 +82,8 @@ public final class LegacyPairEngine: PairInterpolationEngine {
               texes.count == tValues.count else {
             return nil
         }
-        return PairEncodeResult(frames: Array(zip(tValues, texes)))
+        // Blend는 매 호출 새 텍스처(링 재사용 없음) → stamp 0 = 검증 불요 (isFrameLive 기본 true)
+        return PairEncodeResult(frames: zip(tValues, texes).map { (t: $0, texture: $1, stamp: UInt64(0)) })
     }
 
     public func reset() {}

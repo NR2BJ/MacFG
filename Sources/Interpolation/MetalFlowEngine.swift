@@ -78,6 +78,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     // 출력 링: 갭 채움으로 쌍당 최대 4장 → 넉넉히 12 (타임라인 cap 12와 정합)
     private var outputPool: [any MTLTexture] = []
     private var outputIndex = 0
+    /// outputPool 슬롯별 현 점유 세대 (표시 직전 isFrameLive 검증용). encode/조회 모두 렌더 스레드.
+    private var slotStamps: [UInt64] = []
+    private var nextStamp: UInt64 = 0
     // 히스토그램은 쌍당 1개 — 별도 링
     private var statsBuffers: [any MTLBuffer] = []
     private var statsIndex = 0
@@ -244,7 +247,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         // 4) 풀해상도 워프 + 합성 — flow는 한 번 계산, t별로 워프만 반복 (장당 ~1ms)
         // 이게 갭 채움(드랍된 소스 프레임 자리 메꾸기)을 싸게 만드는 핵심.
-        var frames: [(t: Float, texture: any MTLTexture)] = []
+        var frames: [(t: Float, texture: any MTLTexture, stamp: UInt64)] = []
         enc2.setComputePipelineState(warpPSO)
         enc2.setTexture(stableA, index: 0)
         enc2.setTexture(stableB, index: 1)
@@ -253,13 +256,17 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         enc2.setTexture(maskTex, index: 4)
         let dirBlend: Float = Self.occlusionDirectional ? 1.0 : 0.0
         for t in tValues.sorted() {
+            let slotIdx = outputIndex
             let output = outputPool[outputIndex]
             outputIndex = (outputIndex + 1) % outputPool.count
+            nextStamp &+= 1
+            let stamp = nextStamp
+            if slotIdx < slotStamps.count { slotStamps[slotIdx] = stamp }   // 이 슬롯의 현 점유 세대
             var wp = WarpParams(t: t, dirBlend: dirBlend, fadeLo: fadeLo, fadeHi: fadeHi, flowBlur: flowBlur)
             enc2.setTexture(output, index: 5)
             enc2.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
             dispatch(enc2, output.width, output.height, warpPSO)
-            frames.append((t, output))
+            frames.append((t: t, texture: output, stamp: stamp))
         }
         enc2.endEncoding()
 
@@ -362,7 +369,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         prevCoarseB = tex(cl.w, cl.h, .rg16Float)
         hasTemporalPrior = false
 
-        outputPool = []; statsBuffers = []; outputIndex = 0; statsIndex = 0
+        outputPool = []; statsBuffers = []; outputIndex = 0; statsIndex = 0; slotStamps = []
         // 출력 풀 크기: 호출측이 쌍당 최대 8 t를 보내므로(갭 채움) 연속 2쌍=16장이 타임라인
         // 지연버퍼(60~100ms) 동안 동시 생존 가능 — 12장이면 표시 전 텍스처를 후속 워프가
         // 덮어씀 (RIFE 8→16과 동일 클래스, 감사 확정). 4K 16×33MB=531MB.
@@ -382,8 +389,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 statsBuffers.append(b)
             }
         }
+        slotStamps = [UInt64](repeating: 0, count: outputPool.count)   // 슬롯 세대 리셋
         DiagnosticLog.shared.log("[MetalFlow] resources: src=\(width)x\(height) base=\(bw)x\(bh) levels=\(levels.count)")
     }
+
+    /// 표시 직전 검증 — stamp가 아직 어느 슬롯의 현 세대면 유효(안 덮임). 렌더 스레드 전용.
+    public func isFrameLive(_ stamp: UInt64) -> Bool { slotStamps.contains(stamp) }
 
     public func reset() {
         hasTemporalPrior = false

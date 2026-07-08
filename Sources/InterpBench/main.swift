@@ -321,7 +321,7 @@ func benchmarkMultiT(_ engine: any PairInterpolationEngine, key: String,
             cb.commit(); await cb.completed(); ts += dt
         }
         var encodeMs: [Double] = []
-        var frames: [(t: Float, texture: any MTLTexture)] = []
+        var frames: [(t: Float, texture: any MTLTexture, stamp: UInt64)] = []
         for i in 0..<8 {
             guard let cb = commandQueue.makeCommandBuffer() else { break }
             let t0 = CFAbsoluteTimeGetCurrent()

@@ -48,6 +48,9 @@ private struct TimelineEntry {
     let isInterpolated: Bool
     /// 레이턴시 측정용 원본 캡처 시각 (보간 프레임은 B의 캡처 시각)
     let captureTimestamp: CFTimeInterval
+    /// 엔진 출력 링 슬롯의 세대 도장 (0 = 소스/검증 불요). 표시 직전 engine.isFrameLive로
+    /// "후속 warp가 이 텍스처를 덮지 않았나" 확인 — burst 오버런 시 깨끗한 드롭용.
+    var stamp: UInt64 = 0
 }
 
 /// GPU 완료/presented 핸들러(백그라운드 스레드) → 렌더 틱(MainActor) 전달함
@@ -795,6 +798,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagResyncCount = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTimestamp: CFTimeInterval = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTexture: (any MTLTexture)?
+    /// 마지막 표시 텍스처의 세대 도장 — 강제 재표시(링크 재부착) 시 그 사이 덮였는지 검증
+    @ObservationIgnored nonisolated(unsafe) private var lastPresentedStamp: UInt64 = 0
     /// 링크 재부착 직후 남은 강제 재present 틱 수 — 정적 콘텐츠(새 프레임 없음)에서 흐린(작은
     /// 드로어블) 프레임을 새 드로어블 크기로 교체. 드로어블 풀(3) 순환분 커버.
     @ObservationIgnored nonisolated(unsafe) private var forceRepresentTicks = 0
@@ -925,6 +930,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagStaleDropCount = 0
     /// 타임라인 하드캡(12) 트림이 버린 표시 대기 프레임 수 — 배압 사문화 감시용 (감사 확정)
     @ObservationIgnored nonisolated(unsafe) private var diagCapDropCount = 0
+    /// 세대 검증(ring lease)이 덮인 텍스처로 판정해 드롭한 보간 프레임 수 — burst 오버런 감시용
+    @ObservationIgnored nonisolated(unsafe) private var diagLeaseDropCount = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipBackpressure = 0
     // 틱 핸들러 CPU 계측 — 8ms 초과 시 다음 vsync 콜백 스킵 = 틱 레이트 유실 (120 고정 실패 원인)
     @ObservationIgnored nonisolated(unsafe) private var diagTickCPUSum: Double = 0
@@ -1020,6 +1027,15 @@ public final class AppState {
             diagCapDropCount += timeline.count - 12   // 표시 직전 프레임 강제 드롭 — [SCHED]에 노출
             timeline.removeFirst(min(timeline.count - 12, timeline.count))
         }
+        // 세대 검증 (ring lease) — 표시 대기 중 후속 warp가 링 슬롯을 덮은 보간 엔트리 제거.
+        // present는 아래에서, ingest(step3)는 그 뒤라, 이 프루닝은 '이전 틱까지의 오버런'을
+        // 반영해 덮인 텍스처가 화면에 나가는 걸 막는다(잘못된 픽셀 대신 직전 프레임 유지).
+        // 정상상태는 링 미포화라 no-op — burst(숨김해제/드랍복구)에서만 발동.
+        if let eng = pairEngine {
+            let before = timeline.count
+            timeline.removeAll { $0.stamp != 0 && !eng.isFrameLive($0.stamp) }
+            diagLeaseDropCount += before - timeline.count
+        }
         let presentBefore = diagPresentCount
         presentDueEntry(targetTimestamp: targetTimestamp, drawable: drawable)
         // 링크 재부착 직후 강제 재present — 정적 콘텐츠는 새 프레임이 없어 presentDueEntry가
@@ -1027,7 +1043,9 @@ public final class AppState {
         // 이번 틱에 새 present가 없었으면 최신 텍스처를 새(큰) 드로어블에 다시 그려 교체한다.
         if forceRepresentTicks > 0 {
             forceRepresentTicks -= 1
-            if diagPresentCount == presentBefore, let tex = lastPresentedTexture {
+            // 재표시 텍스처가 그 사이 링에서 덮였으면(보간 프레임) 스킵 — 화면은 이전 상태 유지
+            let stillLive = lastPresentedStamp == 0 || (pairEngine?.isFrameLive(lastPresentedStamp) ?? false)
+            if diagPresentCount == presentBefore, stillLive, let tex = lastPresentedTexture {
                 let e = TimelineEntry(timestamp: lastPresentedTimestamp, texture: tex,
                                       isInterpolated: false, captureTimestamp: lastPresentedTimestamp)
                 presentEntry(e, at: targetTimestamp, drawable: drawable)
@@ -1330,7 +1348,7 @@ public final class AppState {
             if !isSceneCut {
                 for frame in interpFrames {
                     let ts = startTs + gapRef * Double(frame.t)
-                    entries.append(TimelineEntry(timestamp: ts, texture: frame.texture, isInterpolated: true, captureTimestamp: entryTs))
+                    entries.append(TimelineEntry(timestamp: ts, texture: frame.texture, isInterpolated: true, captureTimestamp: entryTs, stamp: frame.stamp))
                 }
             }
             entries.append(TimelineEntry(timestamp: entryTs, texture: stableRef, isInterpolated: false, captureTimestamp: entryTs))
@@ -1387,6 +1405,7 @@ public final class AppState {
         }
         lastPresentedTimestamp = entry.timestamp
         lastPresentedTexture = entry.texture
+        lastPresentedStamp = entry.stamp
         diagPresentCount += 1
         if entry.isInterpolated { diagInterpPresentCount += 1 }
         diagFrameTypes.append(entry.isInterpolated ? "I" : "S")
@@ -1589,6 +1608,7 @@ public final class AppState {
         if diagSkipOther > 0 { skipParts.append("other:\(diagSkipOther)") }
         if diagStaleDropCount > 0 { skipParts.append("staleDrop:\(diagStaleDropCount)") }
         if diagCapDropCount > 0 { skipParts.append("capDrop:\(diagCapDropCount)") }
+        if diagLeaseDropCount > 0 { skipParts.append("leaseDrop:\(diagLeaseDropCount)") }
         if diagSkipBackpressure > 0 { skipParts.append("backpres:\(diagSkipBackpressure)") }
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
@@ -1599,7 +1619,7 @@ public final class AppState {
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
-        diagStaleDropCount = 0; diagCapDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
+        diagStaleDropCount = 0; diagCapDropCount = 0; diagLeaseDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
 
         diagSourceCount = 0
         diagDupSkipCount = 0

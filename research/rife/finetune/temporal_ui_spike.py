@@ -40,6 +40,18 @@ def static_ui_mask(frames, mlo, mhi, elo, ehi):
     m = ss(edge, elo, ehi) * (1 - ss(tmot, mlo, mhi))                       # 구조↑ AND 이동↓
     return gblur(m, 9, 3)                                                    # 마스크 부드럽게
 
+def static_ui_mask_consistency(frames, clo, chi):
+    """일관성 신호 — 흐린 정지 텍스트도 잡기 위해 '고주파의 시간적 일관성' 사용.
+    hp_t의 시간평균 |mean| 대비 시간표준편차: 정지구조=일관(큼), 이동배경=비일관(작음)."""
+    g = [gray(f) for f in frames]
+    hp = torch.stack([gi - gblur(gi) for gi in g], 0)          # [T,1,1,H,W] (각 gi=[1,1,H,W])
+    mean_hp = hp.mean(0).abs()                                  # [1,1,H,W] 시간평균 고주파 크기
+    std_hp = hp.std(0)                                          # [1,1,H,W] 시간표준편차 (이동=큼)
+    cons = mean_hp / (std_hp + 0.01)                            # 일관성 (정지구조=큼)
+    cons = gblur(cons, 15, 4)
+    def ss(x, a, b): return ((x - a) / (b - a)).clamp(0, 1)
+    return gblur(ss(cons, clo, chi), 9, 3)
+
 def roi_ssim(x, y, box):
     y0, y1, x0, x1 = box
     return ssim(x[:, :, y0:y1, x0:x1], y[:, :, y0:y1, x0:x1])
@@ -62,8 +74,8 @@ if __name__ == '__main__':
     for paths in seqs:
         imgs = [load(p).to(DEV) for p in paths]
         H, W = imgs[0].shape[-2:]
-        roi = (int(H*0.28), int(H*1.0), int(W*0.72), int(W*1.0))   # 우하단 = 페이스캠+채팅(실패케이스)
-        M = static_ui_mask(imgs, mlo, mhi, elo, ehi)
+        roi = (int(H*0.44), int(H*0.74), int(W*0.0), int(W*0.42))   # 좌중단 = 인게임 채팅(진짜 하드)
+        M = static_ui_mask_consistency(imgs, mlo, mhi) if os.environ.get("CONS") else static_ui_mask(imgs, mlo, mhi, elo, ehi)
         for i in range(len(imgs) - 2):
             a, gt, b = imgs[i], imgs[i+1], imgs[i+2]
             with torch.no_grad():

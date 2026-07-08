@@ -736,6 +736,7 @@ public final class AppState {
         paceCleanWindows = 0
         lastPaceAdjustTick = 0
         paceWarmupUntilTick = diagTick + 720   // ~6s 과도기 무시 (케이던스 락)
+        paceWorkP90 = 0   // 이전(무거운) 세션의 work p90 하한이 새 캡처의 extra를 재부풀리지 않게 (감사 확정)
         pendingIngest = []
         inFlightPresents.withLock { $0 = 0 }
         _ = mailbox.drain()
@@ -922,6 +923,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagSkipEngineFail = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipOther = 0
     @ObservationIgnored nonisolated(unsafe) private var diagStaleDropCount = 0
+    /// 타임라인 하드캡(12) 트림이 버린 표시 대기 프레임 수 — 배압 사문화 감시용 (감사 확정)
+    @ObservationIgnored nonisolated(unsafe) private var diagCapDropCount = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipBackpressure = 0
     // 틱 핸들러 CPU 계측 — 8ms 초과 시 다음 vsync 콜백 스킵 = 틱 레이트 유실 (120 고정 실패 원인)
     @ObservationIgnored nonisolated(unsafe) private var diagTickCPUSum: Double = 0
@@ -1014,6 +1017,7 @@ public final class AppState {
         // 방어적 클램프 — 재부착/리셋 타이밍 경합으로 count가 줄어도 "remove more than it has"
         // 크래시가 나지 않게 현재 count로 상한 (v1.1.0 크래시 실측 후 봉쇄).
         if timeline.count > 12 {
+            diagCapDropCount += timeline.count - 12   // 표시 직전 프레임 강제 드롭 — [SCHED]에 노출
             timeline.removeFirst(min(timeline.count - 12, timeline.count))
         }
         let presentBefore = diagPresentCount
@@ -1121,6 +1125,7 @@ public final class AppState {
             if delta > diagSrcIntMax { diagSrcIntMax = delta }
         }
         let previousAcceptedTs = lastAcceptedTimestamp
+        let previousAcceptedFingerprint = lastAcceptedFingerprint
         lastAcceptedTimestamp = slot.timestamp
         lastAcceptedFingerprint = slot.contentFingerprint
         performanceMonitor.recordFrameArrival()
@@ -1133,8 +1138,11 @@ public final class AppState {
               let stable = acquireStableTexture(width: sourceTexture.width, height: sourceTexture.height),
               let cb = workQueue.makeCommandBuffer() else {
             diagPoolExhaustCount += 1
-            // 이 프레임은 수용 실패 — 상태를 되돌려 다음 프레임이 정상 쌍(연속성 유지)을 만들게 함
+            // 이 프레임은 수용 실패 — 상태를 되돌려 다음 프레임이 정상 쌍(연속성 유지)을 만들게 함.
+            // 지문도 함께 롤백 — 안 하면 드롭된 콘텐츠와 동일한 후속 프레임이 '중복'으로
+            // 거절돼 실제 콘텐츠 변화가 다음 변화까지 표시 지연 (감사 확정)
             lastAcceptedTimestamp = previousAcceptedTs
+            lastAcceptedFingerprint = previousAcceptedFingerprint
             resetSnapState()
             return
         }
@@ -1174,6 +1182,7 @@ public final class AppState {
         cb.commit()
         guard let cb2 = workQueue.makeCommandBuffer() else {
             lastAcceptedTimestamp = previousAcceptedTs
+            lastAcceptedFingerprint = previousAcceptedFingerprint   // 위와 동일 — 지문 롤백
             resetSnapState()
             return
         }
@@ -1263,11 +1272,15 @@ public final class AppState {
                 // + 적응 지연 슬롯: extra만큼 큐가 깊어지는 건 의도(지터 흡수 버퍼)이므로
                 // 배압이 이를 적체로 오판해 보간을 솎아내지 않게 문턱도 함께 올린다.
                 let expectedDepth = Int((gap / displayInterval).rounded(.up)) * 2 + 3 + Int(extraLatencySlots)
-                if timeline.count >= expectedDepth && tValues.count > 1 {
+                // 문턱을 타임라인 하드캡(12, 틱 스텝2 트림) 아래로 클램프 — 안 하면 저fps
+                // 소스(24fps@120Hz 등)에서 expectedDepth≥13이라 배압이 영구 사문화되고,
+                // 대신 캡 트림이 '표시 직전' 프레임을 무진단 대량 드롭 (감사 확정).
+                // 60fps 경로는 expectedDepth≤11이라 거동 불변.
+                if timeline.count >= min(expectedDepth, 10) && tValues.count > 1 {
                     // 절반 솎아내기 (홀수 인덱스 유지)
                     tValues = tValues.enumerated().filter { $0.offset % 2 == 1 }.map(\.element)
                 }
-                if timeline.count >= expectedDepth + 4 {
+                if timeline.count >= min(expectedDepth + 4, 12) {
                     tValues = []
                     diagSkipBackpressure += 1
                 }
@@ -1575,6 +1588,7 @@ public final class AppState {
         if diagSkipEngineFail > 0 { skipParts.append("engFail:\(diagSkipEngineFail)") }
         if diagSkipOther > 0 { skipParts.append("other:\(diagSkipOther)") }
         if diagStaleDropCount > 0 { skipParts.append("staleDrop:\(diagStaleDropCount)") }
+        if diagCapDropCount > 0 { skipParts.append("capDrop:\(diagCapDropCount)") }
         if diagSkipBackpressure > 0 { skipParts.append("backpres:\(diagSkipBackpressure)") }
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
@@ -1585,7 +1599,7 @@ public final class AppState {
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
-        diagStaleDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
+        diagStaleDropCount = 0; diagCapDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
 
         diagSourceCount = 0
         diagDupSkipCount = 0
@@ -1922,9 +1936,24 @@ public final class AppState {
            let b = try? JSONDecoder().decode(HotKeyBinding.self, from: d) { hotInfo = b }
     }
 
+    /// pairEngine 교체를 렌더 틱과 직렬화 — 틱(ingest)이 nonisolated(unsafe)로 읽는 중
+    /// 메인에서 직접 shutdown/nil 하면 encodePair 도중 엔진 풀이 비워져 인덱스 트랩/레이스
+    /// (감사 확정 — ⌃⌥⌘I 토글·모드 전환이 캡처 중 이 경로를 탐). perform은 틱과 같은
+    /// 런루프라 절대 안 겹치고, 렌더 스레드 미기동 시엔 틱이 없어 직접 대입이 안전.
+    private func swapPairEngine(_ newEngine: (any PairInterpolationEngine)?) {
+        if renderDriver.isRunning {
+            // perform은 동기 + 틱과 직렬 — 블록 실행 중 메인은 대기하므로 실제 동시 접근 없음
+            nonisolated(unsafe) let engineRef = newEngine
+            renderDriver.perform { [weak self] in self?.pairEngine = engineRef }
+        } else {
+            pairEngine = newEngine
+        }
+    }
+
     private func configurePairEngine() async {
-        pairEngine?.shutdown()
-        pairEngine = nil
+        let old = pairEngine
+        swapPairEngine(nil)          // 틱이 더는 old를 못 보게 먼저 떼어낸 뒤
+        old?.shutdown()              // 안전하게 해체 (렌더 스레드는 이미 nil만 봄)
 
         guard isInterpolationEnabled else {
             interpolationEngine = "Off"
@@ -1955,17 +1984,17 @@ public final class AppState {
 
         do {
             try await engine.prepare(device: device)
-            pairEngine = engine
+            swapPairEngine(engine)
             interpolationEngine = engine.name
             DiagnosticLog.shared.log("[ENGINE] ready: \(engine.name)")
         } catch {
             DiagnosticLog.shared.log("[ENGINE] \(engine.name) prepare FAILED: \(error) → Blend fallback")
             let fallback = LegacyPairEngine(BlendInterpolator())
             if (try? await fallback.prepare(device: device)) != nil {
-                pairEngine = fallback
+                swapPairEngine(fallback)
                 interpolationEngine = fallback.name
             } else {
-                pairEngine = nil
+                swapPairEngine(nil)
                 interpolationEngine = "Failed"
             }
         }

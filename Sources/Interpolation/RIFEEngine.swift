@@ -56,6 +56,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     private var packPSO: (any MTLComputePipelineState)?
     private var unpackPSO: (any MTLComputePipelineState)?
     private var warpPSO: (any MTLComputePipelineState)?
+    private var srcDiffPSO: (any MTLComputePipelineState)?
+    /// dBlur(소스 불일치, t 무관) 선계산 — 멀티-t 쌍에서 워프의 픽셀당 8샘플 재계산 제거
+    private var diffTex: (any MTLTexture)?
 
     /// 앵커별 flow/mask 세트 최대 수 (예산이 넉넉하면 t별 전부 exact)
     static let maxAnchors = 4
@@ -218,6 +221,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         packPSO = try await pso("rifePack")
         unpackPSO = try await pso("rifeUnpack")
         warpPSO = try await pso("rifeWarp")
+        srcDiffPSO = try await pso("rifeSrcDiff")
 
         slots = try Self.buildSlots(device: device, modelW: modelW, modelH: modelH)
         cancelled.withLock { $0 = false }
@@ -384,7 +388,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let signalValue = slot.useCount
 
         ensureOutputPool(width: stableB.width, height: stableB.height)
-        let ts = tValues.prefix(6).map { min(max($0, 0.01), 0.99) }
+        // 쌍당 6장 예산(풀 16의 오버런 여유 유지) 초과 시 prefix가 아닌 균등 스트라이드로
+        // 선택 — prefix(6)는 뒤쪽 t(B 직전)를 뭉텅이로 버려 저fps 콘텐츠에서 매 쌍 25~35ms
+        // 홀드(반복 케이던스 단절)를 만들었다 (감사 확정). 스트라이드는 구멍을 쌍 전체에 분산.
+        let capped: [Float] = tValues.count <= 6 ? tValues :
+            (0..<6).map { tValues[Int((Double($0) * Double(tValues.count - 1) / 5.0).rounded())] }
+        let ts = capped.map { min(max($0, 0.01), 0.99) }
         guard outputPool.count >= ts.count else { releaseSlot(slot); return nil }
 
         // ── 앵커 선택: predict 예산(쌍 간격×0.8 ÷ 중앙값) 내에서 최대한 exact
@@ -407,18 +416,16 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         }
         anchors = anchors.map { min(max($0, 0.05), 0.95) }
 
-        // ── ① pack: 자체 cb (flow/mask 0클리어 → 실패 시 50/50 블렌드 강등 보장)
+        // ── ① pack: 자체 cb. flow/mask 버퍼는 여기서 클리어하지 않는다 — predict 성공 시
+        // outputBackings가 전량 덮어써 클리어가 순수 낭비(멀티앵커 360p ~9MB/쌍, 감사 확정).
+        // 실패/취소 경로의 50/50 강등 보장은 워커의 명시적 memset(0)이 담당 (아래 ②).
         guard let packCB = packQueue.makeCommandBuffer() else { releaseSlot(slot); return nil }
         // 입력 준비 대기 — 호출자 blit(별도 큐)이 stableA/B를 다 쓴 뒤에 pack이 읽게
         if let ready = inputReady.withLock({ $0 }) {
             packCB.encodeWaitForEvent(ready.event, value: ready.value)
         }
         if let fill = packCB.makeBlitCommandEncoder() {
-            for i in 0..<anchors.count {
-                fill.fill(buffer: slot.flowBufs[i], range: 0..<slot.flowBufs[i].length, value: 0)
-                fill.fill(buffer: slot.maskBufs[i], range: 0..<slot.maskBufs[i].length, value: 0)
-            }
-            fill.fill(buffer: slot.statsBuf, range: 0..<(64 * 4), value: 0)
+            fill.fill(buffer: slot.statsBuf, range: 0..<(64 * 4), value: 0)   // GPU 누적이라 필수
             fill.fill(buffer: slot.confBuf, range: 0..<(3 * 4), value: 0)
             fill.endEncoding()
         }
@@ -443,9 +450,20 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         packCB.addCompletedHandler { [weak model] _ in
             workerRef.async {
                 defer { slot.event.signaledValue = signalValue }
-                guard let model, !cancelledRef.withLock({ $0 }) else { return }
+                // predict를 못 채우는 앵커는 flow=0/mask=0으로 명시 클리어 — unpack이 50/50
+                // 블렌드로 강등. (슬롯 재사용이라 클리어 없인 이전 쌍의 stale flow로 워프됨)
+                func degradeAnchors(_ range: Range<Int>) {
+                    for i in range {
+                        memset(slot.flowBufs[i].contents(), 0, slot.flowBufs[i].length)
+                        memset(slot.maskBufs[i].contents(), 0, slot.maskBufs[i].length)
+                    }
+                }
+                guard let model, !cancelledRef.withLock({ $0 }) else {
+                    degradeAnchors(0..<anchorsRef.count)
+                    return
+                }
                 for (i, anchorT) in anchorsRef.enumerated() {
-                    if cancelledRef.withLock({ $0 }) { return }
+                    if cancelledRef.withLock({ $0 }) { degradeAnchors(i..<anchorsRef.count); return }
                     do {
                         let t0 = CFAbsoluteTimeGetCurrent()
                         let xArr = try MLMultiArray(
@@ -490,6 +508,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                             if ring.count > 15 { ring.removeFirst() }
                         }
                     } catch {
+                        degradeAnchors(i..<(i + 1))   // 이 앵커만 50/50 강등
                         loggerRef.error("predict failed (anchor \(anchorT)): \(error.localizedDescription)")
                     }
                 }
@@ -519,7 +538,14 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         var temporalW: Float = (anchors.count == 1 && prevValid
             && ProcessInfo.processInfo.environment["MACFG_NO_TEMPORAL"] == nil) ? 0.5 : 0.0
         for i in 0..<anchors.count {
-            guard let upEnc = commandBuffer.makeComputeCommandEncoder() else { releaseSlot(slot); return nil }
+            guard let upEnc = commandBuffer.makeComputeCommandEncoder() else {
+                // packCB 커밋 후엔 predict 워커가 인플라이트로 slot 공유버퍼를 읽고/쓰는 중 —
+                // 즉시 반납하면 다음 쌍이 같은 버퍼를 동시 접근(레이스, 감사 확정). 이 cb는
+                // 위에서 slot.event 대기를 인코딩했고 호출자(AppState/InterpBench)가 nil에도
+                // 무조건 commit하므로, cb 완료(=predict signal 후)에 반납을 묶으면 안전.
+                commandBuffer.addCompletedHandler { [weak self] _ in self?.releaseSlot(slot) }
+                return nil
+            }
             upEnc.setComputePipelineState(unpackPSO)
             upEnc.setBuffer(slot.flowBufs[i], offset: 0, index: 0)
             upEnc.setBuffer(slot.maskBufs[i], offset: 0, index: 1)
@@ -531,8 +557,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             dispatch(upEnc, width: mW0, height: mH0, pso: unpackPSO)
             upEnc.endEncoding()
         }
-        // 이번 쌍의 (스무딩된) flow/mask를 prev로 보존 — 다음 쌍의 prior
-        if anchors.count == 1, let blit = commandBuffer.makeBlitCommandEncoder() {
+        // 이번 쌍의 (스무딩된) flow/mask를 prev로 보존 — 다음 쌍의 prior.
+        // prev 텍스처 할당 실패 폴백이면 prevF가 slot 텍스처 자신 → 자기복사 blit은 UB라 스킵.
+        let prevIsFallback = (prevF as AnyObject) === (slot.flowTexs[0] as AnyObject)
+        if anchors.count == 1, !prevIsFallback, let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.copy(from: slot.flowTexs[0], sourceSlice: 0, sourceLevel: 0,
                       sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                       sourceSize: MTLSize(width: mW0, height: mH0, depth: 1),
@@ -547,6 +575,20 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             slotLock.withLock { tempPrevValid = true }
         } else {
             slotLock.withLock { tempPrevValid = false }   // 멀티앵커 구간 — prior 단절
+        }
+
+        // dBlur(소스 불일치)는 t·flow 무관 — 멀티-t 쌍은 쌍당 1회 선계산해 워프에서 read
+        // (t마다 픽셀당 8샘플 재계산 제거, 감사 확정). 단일 t는 인라인이 더 싸서 그대로.
+        var useDiffTex: Float = 0
+        if ts.count > 1, let diffTex, let diffPSO = srcDiffPSO,
+           let dEnc = commandBuffer.makeComputeCommandEncoder() {
+            dEnc.setComputePipelineState(diffPSO)
+            dEnc.setTexture(stableA, index: 0)
+            dEnc.setTexture(stableB, index: 1)
+            dEnc.setTexture(diffTex, index: 2)
+            dispatch(dEnc, width: diffTex.width, height: diffTex.height, pso: diffPSO)
+            dEnc.endEncoding()
+            useDiffTex = 1
         }
 
         var frames: [(t: Float, texture: any MTLTexture)] = []
@@ -565,11 +607,13 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             enc.setTexture(slot.flowTexs[ai], index: 2)
             enc.setTexture(slot.maskTexs[ai], index: 3)
             enc.setTexture(output, index: 4)
+            enc.setTexture(diffTex ?? stableA, index: 5)   // 미사용 시에도 바인딩 (검증 레이어)
             var wp = WarpParams(
                 flowScale: SIMD2<Float>(Float(output.width) / Float(mW0), Float(output.height) / Float(mH0)),
                 scale0: t / anchor,
                 scale1: (1 - t) / (1 - anchor),
-                tPhase: t)
+                tPhase: t,
+                useDiffTex: useDiffTex)
             enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)
             enc.setBuffer(slot.confBuf, offset: 0, index: 1)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
@@ -642,7 +686,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         var scale0: Float
         var scale1: Float
         var tPhase: Float        // 표시 위상 t — flow 불신 시 원본 A/B 블렌드 가중
-        var pad: Float = 0
+        var useDiffTex: Float = 0   // 1이면 dBlur를 diffTex에서 read (멀티-t 선계산)
     }
 
     private func releaseSlot(_ slot: Slot) {
@@ -667,6 +711,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         for _ in 0..<16 {
             if let tex = device.makeTexture(descriptor: desc) { outputPool.append(tex) }
         }
+        // dBlur 선계산 텍스처 (멀티-t 쌍당 1회, r16Float ≈ 출력의 1/2 바이트/px)
+        let dd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r16Float, width: width, height: height, mipmapped: false)
+        dd.usage = [.shaderRead, .shaderWrite]
+        dd.storageMode = .private
+        diffTex = device.makeTexture(descriptor: dd)
         DiagnosticLog.shared.log("[RIFE] output pool \(width)x\(height) x\(outputPool.count)")
     }
 
@@ -689,6 +739,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         model = nil
         slots = []
         outputPool = []
+        diffTex = nil
         packQueue = nil
     }
 
@@ -698,7 +749,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct WarpParams { float2 flowScale; float scale0; float scale1; float tPhase; float pad; };
+    struct WarpParams { float2 flowScale; float scale0; float scale1; float tPhase; float useDiffTex; };
     constant float3 kLuma = float3(0.2126, 0.7152, 0.0722);
 
     // stableA/B → 모델크기 fp16 CHW 6플레인 (RGB 0-1) + 루마 히스토그램 (장면 전환용)
@@ -767,6 +818,29 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         maskTex.write(float4(m), gid);
     }
 
+    // 소스 불일치 dBlur(±0.75px 4점 미니블러)는 t·flow 무관 → 멀티-t 쌍에서 워프가 t마다
+    // 픽셀당 8샘플 재계산하던 것을 쌍당 1회 선계산 (감사 확정 — 24fps 4t에서 워프 ~27% 절감)
+    kernel void rifeSrcDiff(
+        texture2d<float, access::sample> imgA [[texture(0)]],
+        texture2d<float, access::sample> imgB [[texture(1)]],
+        texture2d<float, access::write> outTex [[texture(2)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint w = outTex.get_width(), h = outTex.get_height();
+        if (gid.x >= w || gid.y >= h) return;
+        constexpr sampler s(filter::linear, address::clamp_to_edge);
+        float2 sizeF = float2(w, h);
+        float2 uv = (float2(gid) + 0.5) / sizeF;
+        const float3 kL = float3(0.299, 0.587, 0.114);
+        float2 po = 0.75 / sizeF;
+        float dBlur = 0.0;
+        dBlur += dot(abs(imgA.sample(s, uv + float2( po.x,  po.y)).rgb - imgB.sample(s, uv + float2( po.x,  po.y)).rgb), kL);
+        dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x,  po.y)).rgb - imgB.sample(s, uv + float2(-po.x,  po.y)).rgb), kL);
+        dBlur += dot(abs(imgA.sample(s, uv + float2( po.x, -po.y)).rgb - imgB.sample(s, uv + float2( po.x, -po.y)).rgb), kL);
+        dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x, -po.y)).rgb - imgB.sample(s, uv + float2(-po.x, -po.y)).rgb), kL);
+        outTex.write(float4(dBlur * 0.25, 0, 0, 0), gid);
+    }
+
     // 풀해상도 워프: I_t = warp(A, f_t0)·σ(mask) + warp(B, f_t1)·(1-σ(mask))
     // flow는 모델픽셀 단위 → flowScale로 풀해상도 변환. scale0/1은 선형 t 재배치.
     // clamp_to_edge = grid_sample padding_mode='border' 등가.
@@ -776,6 +850,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         texture2d<float, access::sample> flowTex [[texture(2)]],
         texture2d<float, access::sample> maskTex [[texture(3)]],
         texture2d<float, access::write> outTex [[texture(4)]],
+        texture2d<float, access::read> diffTex [[texture(5)]],
         constant WarpParams& p [[buffer(0)]],
         device atomic_uint* confStats [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]]
@@ -798,14 +873,20 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float3 warped = a * m + b * (1.0 - m);
         float3 a0 = imgA.sample(s, uv).rgb;
         float3 b0 = imgB.sample(s, uv).rgb;
-        // 소스 불일치(±0.75px 4점 미니블러 — 코덱 노이즈 내성)
-        float2 po = 0.75 / sizeF;
-        float dBlur = 0.0;
-        dBlur += dot(abs(imgA.sample(s, uv + float2( po.x,  po.y)).rgb - imgB.sample(s, uv + float2( po.x,  po.y)).rgb), kL);
-        dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x,  po.y)).rgb - imgB.sample(s, uv + float2(-po.x,  po.y)).rgb), kL);
-        dBlur += dot(abs(imgA.sample(s, uv + float2( po.x, -po.y)).rgb - imgB.sample(s, uv + float2( po.x, -po.y)).rgb), kL);
-        dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x, -po.y)).rgb - imgB.sample(s, uv + float2(-po.x, -po.y)).rgb), kL);
-        dBlur *= 0.25;
+        // 소스 불일치(±0.75px 4점 미니블러 — 코덱 노이즈 내성).
+        // 멀티-t 쌍은 rifeSrcDiff가 쌍당 1회 선계산(useDiffTex=1) — 값 동일, 샘플 8→1.
+        float dBlur;
+        if (p.useDiffTex > 0.5) {
+            dBlur = diffTex.read(gid).r;
+        } else {
+            float2 po = 0.75 / sizeF;
+            dBlur = 0.0;
+            dBlur += dot(abs(imgA.sample(s, uv + float2( po.x,  po.y)).rgb - imgB.sample(s, uv + float2( po.x,  po.y)).rgb), kL);
+            dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x,  po.y)).rgb - imgB.sample(s, uv + float2(-po.x,  po.y)).rgb), kL);
+            dBlur += dot(abs(imgA.sample(s, uv + float2( po.x, -po.y)).rgb - imgB.sample(s, uv + float2( po.x, -po.y)).rgb), kL);
+            dBlur += dot(abs(imgA.sample(s, uv + float2(-po.x, -po.y)).rgb - imgB.sample(s, uv + float2(-po.x, -po.y)).rgb), kL);
+            dBlur *= 0.25;
+        }
         // 워프 후 불일치도 ±1.5px 미니블러 — coarse flow(288→풀해상도 6.7×)의 1~3px 양자화
         //    어긋남은 정상인데, 단일점 비교는 텍스처에서 이를 오류로 오판해 conf를 깎아
         //    절반 크로스페이드(부드러움 소실, 실측)를 만든다. 블러 비교는 소소한 어긋남을

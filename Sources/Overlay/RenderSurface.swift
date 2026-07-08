@@ -42,6 +42,14 @@ public final class RenderSurface: @unchecked Sendable {
     private var params: Params
     private var _scaleStatus: String?
     private var dbgLastTexW = 0, dbgLastTexH = 0   // 캡처 소스 크기 변화 추적(진단)
+    /// status 문자열 재구성 게이트 — 입력(소스크기/모드/샤프/업스케일 결과)이 바뀔 때만
+    /// 문자열 할당+lock write. 렌더 틱(120Hz)마다 돌던 할당/락을 제거 (미세 지터 저감).
+    /// 기본값(전 필드 0/false, sharp 0)은 '업스케일 off' 상태를 뜻함.
+    private struct StatusSig: Equatable {
+        var tw = 0, th = 0, aw = 0, ah = 0, mw = 0, mh = 0, sharp = 0
+        var viewer = false
+    }
+    private var lastStatusSig = StatusSig()
 
     /// 업스케일/샤픈 실동작 상태 (UI 표시용)
     public var scaleStatus: String? {
@@ -139,7 +147,8 @@ public final class RenderSurface: @unchecked Sendable {
         }
         var source = texture
         if p.upscaleMode != .off || p.sharpness > 0.01 {
-            var chain: [String] = []
+            // 업스케일 결과를 숫자로만 기록 (문자열 할당 없음) — status 문자열은 시그니처 변화 시에만.
+            var aneW = 0, aneH = 0, mfxW = 0, mfxH = 0
             if p.isViewer, p.upscaleMode != .off {
                 let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
@@ -154,23 +163,33 @@ public final class RenderSurface: @unchecked Sendable {
                        texture.width <= NeuralUpscaler.maxInput, texture.height <= NeuralUpscaler.maxInput,
                        let n = neuralUpscaler?.upscale(texture, into: commandBuffer) {
                         cur = n
-                        chain.append("ANE→\(n.width)×\(n.height)")
+                        aneW = n.width; aneH = n.height
                     }
                     if p.upscaleMode == .metalfx || p.upscaleMode == .aneMetalfx,
                        targetW > cur.width || targetH > cur.height,
                        let m = upscaler?.upscale(cur, outWidth: targetW, outHeight: targetH, commandBuffer: commandBuffer) {
                         cur = m
-                        chain.append("MetalFX→\(targetW)×\(targetH)")
+                        mfxW = targetW; mfxH = targetH
                     }
                     source = cur
                 }
             }
-            if chain.isEmpty { chain.append(p.isViewer ? "1:1" : "1:1 cover") }
-            chain.append(p.sharpness > 0.01 ? String(format: "sharpen %.1f", p.sharpness) : "sharpen off")
-            // 소스 해상도를 앞에 표시 — 첫 캡처 저해상도 드롭이 UI에 바로 보이도록
-            let status = "src \(texture.width)×\(texture.height) · " + chain.joined(separator: " · ")
-            lock.lock(); _scaleStatus = status; lock.unlock()
-        } else {
+            // 숫자 시그니처 — 렌더 틱마다 비교만(할당 0). 바뀔 때만 문자열 재구성 + lock write.
+            let sharpTag = p.sharpness > 0.01 ? Int(p.sharpness * 100) : -1
+            let sig = StatusSig(tw: texture.width, th: texture.height, aw: aneW, ah: aneH,
+                                mw: mfxW, mh: mfxH, sharp: sharpTag, viewer: p.isViewer)
+            if sig != lastStatusSig {
+                lastStatusSig = sig
+                var chain: [String] = []
+                if aneW > 0 { chain.append("ANE→\(aneW)×\(aneH)") }
+                if mfxW > 0 { chain.append("MetalFX→\(mfxW)×\(mfxH)") }
+                if chain.isEmpty { chain.append(p.isViewer ? "1:1" : "1:1 cover") }
+                chain.append(sharpTag >= 0 ? String(format: "sharpen %.1f", p.sharpness) : "sharpen off")
+                let status = "src \(texture.width)×\(texture.height) · " + chain.joined(separator: " · ")
+                lock.lock(); _scaleStatus = status; lock.unlock()
+            }
+        } else if lastStatusSig != StatusSig() {
+            lastStatusSig = StatusSig()
             lock.lock(); _scaleStatus = nil; lock.unlock()
         }
         encodeBlit(source: source, into: commandBuffer, target: drawable.texture, params: p)

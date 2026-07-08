@@ -63,6 +63,13 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
         performSync(block)
     }
 
+    /// 렌더 런루프 기동 여부 — perform()이 no-op일지 판별용 (미기동이면 틱이 없어
+    /// 호출측이 직접 상태를 만져도 안전). 런루프는 한 번 설정되면 해제되지 않는다.
+    var isRunning: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return runLoop != nil
+    }
+
     /// 렌더 스레드에서 블록 실행 (완료 대기)
     private func performSync(_ block: @escaping () -> Void) {
         lock.lock(); let rl = runLoop; lock.unlock()

@@ -120,7 +120,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
               tsB > tsA, !tValues.isEmpty else { return nil }
 
         ensureResources(width: stableB.width, height: stableB.height)
-        guard !levels.isEmpty, outputPool.count >= tValues.count, let maskTex,
+        // 2×t 불변식: 연속 2쌍의 출력이 타임라인 지연버퍼에 동시 생존해도 링이 안 겹치게
+        // 쌍당 t 수를 풀의 절반으로 제한 (풀 16이면 8 = 호출측 상한과 일치 → 거동 불변)
+        guard !levels.isEmpty, outputPool.count >= tValues.count * 2, let maskTex,
               !statsBuffers.isEmpty else { return nil }
 
         let statsBuffer = statsBuffers[statsIndex]
@@ -361,16 +363,21 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         hasTemporalPrior = false
 
         outputPool = []; statsBuffers = []; outputIndex = 0; statsIndex = 0
-        // 출력 풀 크기를 바이트 예산으로 스케일 — 16MP(5120x3140) 캡처에서 12×64MB=770MB
-        // 메모리 압박 실측. 예산 ~420MB: 4K→12장, 16MP→6장 (갭 채움 최소 요구 충족)
+        // 출력 풀 크기: 호출측이 쌍당 최대 8 t를 보내므로(갭 채움) 연속 2쌍=16장이 타임라인
+        // 지연버퍼(60~100ms) 동안 동시 생존 가능 — 12장이면 표시 전 텍스처를 후속 워프가
+        // 덮어씀 (RIFE 8→16과 동일 클래스, 감사 확정). 4K 16×33MB=531MB.
+        // 16MP(5120x3140)는 메모리 압박 실측(770MB)이라 예산으로 축소하되, encodePair의
+        // 2×t 가드가 풀의 절반까지만 쌍을 수용해 오버런을 구조적으로 차단한다.
         let bytesPerTexture = max(width * height * 4, 1)
-        let poolCount = min(12, max(6, (420 << 20) / bytesPerTexture))
+        let poolCount = min(16, max(6, (600 << 20) / bytesPerTexture))
         for _ in 0..<poolCount {
             if let t = tex(width, height, .bgra8Unorm) {
                 outputPool.append(t)
             }
         }
-        for _ in 0..<4 {
+        // statsBuffers도 풀과 동수 — 4개면 완료 핸들러(sceneCutEvaluator)가 N쌍 히스토그램을
+        // 읽기 전에 N+4쌍의 GPU fill이 덮어쓸 수 있다 (AppleFI는 풀과 동수로 방어 — 동일화)
+        for _ in 0..<poolCount {
             if let b = device.makeBuffer(length: 64 * 4, options: .storageModeShared) {
                 statsBuffers.append(b)
             }
@@ -442,13 +449,30 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         uint w = dst.get_width(), h = dst.get_height();
         if (gid.x >= w || gid.y >= h) return;
         int W = int(w) - 1, H = int(h) - 1;
-        half acc = 0.0h;
+        // 중심 탭(gid)은 한 번만 읽어 창 합과 최종 감산에 재사용 (기존 26탭 → 25탭).
+        // 고정 바운드 루프는 컴파일 시 완전 언롤되어 dx=dy=0 가드는 런타임 분기 없이 제거됨.
+        half center = src.read(gid).r;
+        half acc = center;
         for (int dy = -2; dy <= 2; dy++)
             for (int dx = -2; dx <= 2; dx++) {
+                if (dx == 0 && dy == 0) continue;
                 uint2 q = uint2(clamp(int(gid.x) + dx, 0, W), clamp(int(gid.y) + dy, 0, H));
                 acc += src.read(q).r;
             }
-        dst.write(half4(src.read(gid).r - acc / 25.0h), gid);
+        dst.write(half4(center - acc / 25.0h), gid);
+    }
+
+    // 6x6 SAD (gather 9회) — 탐색/refine 공용. gid_c = 후보의 절대 좌표(gid + 오프셋).
+    static inline half sad6x6(texture2d<half, access::sample> ref, sampler s,
+                              thread const half4* patch, float2 gid_c, float2 size) {
+        half4 acc = half4(0.0h);
+        int j = 0;
+        for (int dy = -2; dy <= 2; dy += 2)
+            for (int dx = -2; dx <= 2; dx += 2) {
+                float2 q = (gid_c + float2(dx + 1, dy + 1)) / size;
+                acc += abs(ref.gather(s, q) - patch[j++]);
+            }
+        return acc.x + acc.y + acc.z + acc.w;
     }
 
     // 피라미드 매칭: prior(코스 레벨) flow를 시작점으로 ±searchRadius 정수 국소 탐색 (6x6 SAD)
@@ -489,43 +513,43 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         half bestSAD = 65504.0h;
         float2 bestOff = float2(0.0);
+        // refine 레벨(radius=1) 전용: 탐색이 계산한 raw SAD 9개를 레지스터에 보관 —
+        // refine이 대다수 픽셀(bestOff가 격자 내부)에서 재-gather 없이 재사용 (36 gather 절감).
+        // 값은 페널티 이전 raw = 기존 refine의 raw gather와 동일 → 비트 동일 거동.
+        half sad9[3][3];
+        bool cache9 = (p.refine != 0) && (p.searchRadius == 1);
         for (int oy = -p.searchRadius; oy <= p.searchRadius; oy++) {
             for (int ox = -p.searchRadius; ox <= p.searchRadius; ox++) {
                 float2 cand = base + float2(ox, oy);
-                half4 acc = half4(0.0h);
-                int j = 0;
-                for (int dy = -2; dy <= 2; dy += 2)
-                    for (int dx = -2; dx <= 2; dx += 2) {
-                        float2 q = (float2(gid) + cand + float2(dx + 1, dy + 1)) / size;
-                        acc += abs(ref.gather(s, q) - patch[j++]);
-                    }
-                half sad = acc.x + acc.y + acc.z + acc.w;
+                half rawSad = sad6x6(ref, s, patch, float2(gid) + cand, size);
+                if (cache9) sad9[oy + 1][ox + 1] = rawSad;
                 // 평활 페널티 — 애매(평탄) 영역에서 벡터가 prior에서 멋대로 점프하는
                 // 노이즈 억제 (shimmer의 주범). 36탭 SAD 스케일 기준 (25탭 0.012 × 36/25).
-                sad += 0.017h * half(length(float2(ox, oy)));
+                half sad = rawSad + 0.017h * half(length(float2(ox, oy)));
                 if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
             }
         }
 
         // 서브픽셀 refine (x/y 독립 3점 포물선) — 최종 레벨만. ±1 시프트도 gather 정렬 유지.
+        // 이웃 SAD는 sad9 캐시에서 조회, bestOff가 탐색 격자 경계면 그 방향만 gather 폴백.
         float2 refined = bestOff;
         if (p.refine != 0) {
             float sadC = float(bestSAD);
-            half4 aL = half4(0.0h), aR = half4(0.0h), aU = half4(0.0h), aD = half4(0.0h);
-            int j = 0;
-            for (int dy = -2; dy <= 2; dy += 2)
-                for (int dx = -2; dx <= 2; dx += 2) {
-                    half4 pv = patch[j++];
-                    float2 c = float2(gid) + bestOff;
-                    aL += abs(ref.gather(s, (c + float2(dx    , dy + 1)) / size) - pv);
-                    aR += abs(ref.gather(s, (c + float2(dx + 2, dy + 1)) / size) - pv);
-                    aU += abs(ref.gather(s, (c + float2(dx + 1, dy    )) / size) - pv);
-                    aD += abs(ref.gather(s, (c + float2(dx + 1, dy + 2)) / size) - pv);
-                }
-            float sadL = float(aL.x + aL.y + aL.z + aL.w);
-            float sadR = float(aR.x + aR.y + aR.z + aR.w);
-            float sadU = float(aU.x + aU.y + aU.z + aU.w);
-            float sadD = float(aD.x + aD.y + aD.z + aD.w);
+            float2 c = float2(gid) + bestOff;
+            int bi = cache9 ? int(bestOff.x - base.x) : 2;   // ∈[-1,1], 2=캐시 미사용
+            int bj = cache9 ? int(bestOff.y - base.y) : 2;
+            half sL = (bi > -1 && bi < 2 && bj < 2) ? sad9[bj + 1][bi]
+                                                    : sad6x6(ref, s, patch, c + float2(-1, 0), size);
+            half sR = (bi < 1)                      ? sad9[bj + 1][bi + 2]
+                                                    : sad6x6(ref, s, patch, c + float2( 1, 0), size);
+            half sU = (bj > -1 && bj < 2 && bi < 2) ? sad9[bj][bi + 1]
+                                                    : sad6x6(ref, s, patch, c + float2( 0, -1), size);
+            half sD = (bj < 1)                      ? sad9[bj + 2][bi + 1]
+                                                    : sad6x6(ref, s, patch, c + float2( 0, 1), size);
+            float sadL = float(sL);
+            float sadR = float(sR);
+            float sadU = float(sU);
+            float sadD = float(sD);
             float denomX = sadL - 2.0 * sadC + sadR;
             if (denomX > 1e-5) refined.x += clamp(0.5 * (sadL - sadR) / denomX, -0.5, 0.5);
             float denomY = sadU - 2.0 * sadC + sadD;
@@ -539,21 +563,23 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     // smoothAmt: 원본 대비 박스평균 혼합량 (0=원본 flow=예리, 1=완전 박스=부드러움).
     // "Motion smoothness" 슬라이더의 하단 절반(예리 방향)이 이 값을 낮춰 flow 디테일을 살린다.
     kernel void mfSmooth(
-        texture2d<float, access::sample> src [[texture(0)]],
+        texture2d<float, access::read> src [[texture(0)]],
         texture2d<float, access::write> dst [[texture(1)]],
         constant float& smoothAmt [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = dst.get_width(), h = dst.get_height();
         if (gid.x >= w || gid.y >= h) return;
-        constexpr sampler s(filter::linear, address::clamp_to_edge);
-        float2 size = float2(w, h);
-        float2 center = src.sample(s, (float2(gid) + 0.5) / size).rg;
-        float2 acc = float2(0.0);
+        int W = int(w) - 1, H = int(h) - 1;
+        // 접근이 전부 텍셀 정렬 정수 좌표라 bilinear sample()은 낭비 — read()+수동 clamp로
+        // 샘플러 유닛 우회 (mfZeroMean과 동일 패턴). 중심 탭은 1회만 읽어 박스합·mix에 재사용.
+        float2 center = src.read(gid).rg;
+        float2 acc = center;
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++) {
-                float2 uv = (float2(gid) + 0.5 + float2(dx, dy)) / size;
-                acc += src.sample(s, uv).rg;
+                if (dx == 0 && dy == 0) continue;
+                uint2 q = uint2(clamp(int(gid.x) + dx, 0, W), clamp(int(gid.y) + dy, 0, H));
+                acc += src.read(q).rg;
             }
         float2 box = acc / 9.0;
         dst.write(float4(mix(center, box, smoothAmt), 0, 0), gid);
@@ -634,6 +660,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float2 fRaw = flowF.sample(s, uv).rg;
         float2 bRaw = flowB.sample(s, uv).rg;
         // 부드러움 상단: flow를 4-이웃 평균으로 블러 → 워프가 완만(모션 경계 에러 부드럽게).
+        // 주의(의도된 근사): mask(conf/staticness)는 블러 *이전* flow 기준(mfFinalize) —
+        // 둘 다 이미 박스 스무딩된 flow를 공유하고 여기의 ±1.3px 4탭은 소폭 추가 블러라
+        // 경계 게이트 어긋남은 미미. 블러 flow를 finalize에 재공급하는 비용이 이득보다 큼(감사 검증).
         if (p.flowBlur > 0.001) {
             float2 e = 1.3 / baseSize;
             float2 fb = (flowF.sample(s, uv + float2(e.x,0)).rg + flowF.sample(s, uv - float2(e.x,0)).rg
@@ -670,10 +699,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         // 저신뢰 폴백: A/B 원본 크로스페이드. 폭(fadeLo~fadeHi)이 smoothness 슬라이더:
         // 좁으면(예리) 단일 프레임에 가까워 저더, 넓으면(부드러움) 부드러운 블렌드(약간 고스트).
-        half3 nearestPix = mix(imgA.sample(s, uv).rgb, imgB.sample(s, uv).rgb,
+        half3 bOrig = imgB.sample(s, uv).rgb;   // 원본 UV B — 폴백/정적 합성 공용 (중복 샘플 제거)
+        half3 nearestPix = mix(imgA.sample(s, uv).rgb, bOrig,
                                half(smoothstep(p.fadeLo, p.fadeHi, t)));
         half3 moving = mix(nearestPix, interp, conf);
-        half3 outc = mix(moving, imgB.sample(s, uv).rgb, half(staticness)); // 정적 → B 원본 (선명)
+        half3 outc = mix(moving, bOrig, half(staticness)); // 정적 → B 원본 (선명)
         dst.write(half4(outc, 1.0h), gid);
     }
     """

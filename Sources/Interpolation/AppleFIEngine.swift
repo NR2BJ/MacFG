@@ -43,6 +43,8 @@ public final class AppleFIEngine: PairInterpolationEngine {
     private var device: (any MTLDevice)?
     private var processor: VTFrameProcessor?
     private var sessionActive = false
+    /// 세션 지연 복구 스로틀 (마지막 재시도 시각)
+    private var lastSessionRetry: CFTimeInterval = 0
     private var lastVTTimestamp: CMTime = .invalid
 
     // 720p 420v 버퍼 3개: prev / src / dst — 각각 Y/CbCr plane 텍스처 뷰
@@ -53,6 +55,9 @@ public final class AppleFIEngine: PairInterpolationEngine {
     }
     private var prevBuf: PlanarBuffer?
     private var srcBuf: PlanarBuffer?
+    /// 직전 쌍의 B 추적 — A(=이전 B)가 그대로면 prevBuf 다운스케일 재계산 생략 (역할 스왑)
+    private var lastEncodedTsB: CFTimeInterval = -1
+    private var lastStableBID: ObjectIdentifier?
     private var dstBuf: PlanarBuffer?
 
     // 720p 중간들
@@ -147,7 +152,23 @@ public final class AppleFIEngine: PairInterpolationEngine {
     ) -> PairEncodeResult? {
         // LLFI는 t=0.5 고정 (모델 제약) — 갭이 커도 중간 한 장만 생성
         guard #available(macOS 26.0, *) else { return nil }
-        guard let processor, sessionActive,
+        // 이전 세션 재시작이 실패해 죽어있으면 여기서 재기동 시도 — 없으면 일시적 VT/ANE
+        // 실패 한 번에 엔진이 영구 소스-온리로 고착 (reset()은 세션을 안 살림, 감사 확정).
+        // VT가 장기 불능이면 매 쌍(60/s) 세션 생성 시도 자체가 비용이라 2초 스로틀.
+        if !sessionActive, prevBuf != nil {
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastSessionRetry > 2.0 {
+                lastSessionRetry = now
+                try? startVTSession()
+            }
+        }
+        // A(=이전 쌍의 B)가 동일 객체·동일 ts면 prevBuf에 넣을 내용이 직전 srcBuf와 비트
+        // 동일(결정적 다운스케일) — 역할 스왑으로 A 다운스케일 패스(쌍당 ~0.1-0.3ms GPU) 생략.
+        // 연속성 단절(reset/갭/실패) 시 lastEncodedTsB 불일치로 자동 전체 경로 폴백 (감사 확정).
+        let reuseA = tsA == lastEncodedTsB && lastStableBID == ObjectIdentifier(stableA as AnyObject)
+        if reuseA { swap(&prevBuf, &srcBuf) }
+
+        guard processor != nil, sessionActive,
               let prevBuf, let srcBuf, let dstBuf,
               let downscalePSO, let maskHistPSO, let compositePSO,
               let maskTex,
@@ -162,11 +183,17 @@ public final class AppleFIEngine: PairInterpolationEngine {
         let cmB = CMTime(seconds: tsB, preferredTimescale: 1_000_000)
         if lastVTTimestamp.isValid && cmA < lastVTTimestamp {
             logger.warning("VT timestamp regression, restarting session")
-            processor.endSession()
+            processor?.endSession()
             sessionActive = false
             try? startVTSession()
-            guard sessionActive else { return nil }
+            guard sessionActive else {
+                logger.error("VT session restart failed — retrying on next pair")
+                return nil   // 다음 encodePair 진입부의 지연 복구가 재시도
+            }
         }
+        // 재시작 분기 이후에 바인딩 — 분기 전에 바인딩하면 방금 endSession된 옛 인스턴스로
+        // process()를 불러 이 쌍의 dst가 안 써지고 이전 쌍 720p가 합성됨 (감사 확정)
+        guard let processor else { return nil }
 
         guard let fPrev = VTFrameProcessorFrame(buffer: prevBuf.pixelBuffer, presentationTimeStamp: cmA),
               let fSrc = VTFrameProcessorFrame(buffer: srcBuf.pixelBuffer, presentationTimeStamp: cmB),
@@ -190,7 +217,9 @@ public final class AppleFIEngine: PairInterpolationEngine {
         // 1) 다운스케일+CSC (A→prev, B→src) + 모션 마스크/히스토그램
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return nil }
         enc.setComputePipelineState(downscalePSO)
-        encodeDownscale(enc, source: stableA, target: prevBuf)
+        if !reuseA {
+            encodeDownscale(enc, source: stableA, target: prevBuf)   // 재사용 시 생략 (위 스왑)
+        }
         encodeDownscale(enc, source: stableB, target: srcBuf)
         enc.setComputePipelineState(maskHistPSO)
         enc.setTexture(prevBuf.lumaTexture, index: 0)
@@ -240,7 +269,7 @@ public final class AppleFIEngine: PairInterpolationEngine {
 
         pairCount += 1
         if pairCount <= 3 || pairCount % 600 == 0 {
-            DiagnosticLog.shared.log("[AppleFI] pair #\(pairCount) encoded (\(stableB.width)x\(stableB.height), scaler=\(spatialScaler != nil ? "MetalFX" : "bilinear"), composite=masked)")
+            DiagnosticLog.shared.log("[AppleFI] pair #\(pairCount) encoded (\(stableB.width)x\(stableB.height), scaler=\(spatialScaler != nil ? "MetalFX" : "bilinear"), composite=masked, reuseA=\(reuseA))")
         }
 
         // 장면 전환 판정: CB 완료 후 히스토그램 교집합 계산 (shared 버퍼 CPU 읽기)
@@ -266,6 +295,9 @@ public final class AppleFIEngine: PairInterpolationEngine {
             }
             return intersect / totalA < threshold
         }
+        // 전체 인코딩 성공 시에만 갱신 — 중도 실패면 불일치로 남아 다음 쌍이 전체 경로 폴백
+        lastEncodedTsB = tsB
+        lastStableBID = ObjectIdentifier(stableB as AnyObject)
         return PairEncodeResult(frames: [(0.5, output)], sceneCutEvaluator: evaluator)
     }
 
@@ -305,7 +337,11 @@ public final class AppleFIEngine: PairInterpolationEngine {
             pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
         desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
         desc.storageMode = .private
-        for _ in 0..<4 {
+        // 링 크기 = 타임라인 엔트리 상한(12). 4로는 60fps→120Hz에서 표시 대기 중인 보간
+        // 출력(지연버퍼 ~6프레임)이 한 바퀴 돌아 compositeMasked가 아직 안 나간 슬롯을
+        // 덮어써 프레임 순서 교란/티어링 (RIFE outputPool 8→16과 동일 클래스). statsBuffers도
+        // 같은 slotIndex를 공유하므로 함께 확장된다.
+        for _ in 0..<12 {
             if let tex = device.makeTexture(descriptor: desc),
                let buf = device.makeBuffer(length: 64 * 4, options: .storageModeShared) {
                 outputPool.append(tex)
@@ -370,6 +406,8 @@ public final class AppleFIEngine: PairInterpolationEngine {
     public func reset() {
         // 타임스탬프 연속성만 관리 — 다음 encodePair에서 역행 감지 시 세션 재시작
         lastVTTimestamp = .invalid
+        lastEncodedTsB = -1   // 연속성 단절 — 다음 쌍은 prevBuf 재사용 없이 전체 다운스케일
+        lastStableBID = nil
     }
 
     public func shutdown() {

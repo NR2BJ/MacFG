@@ -36,8 +36,14 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     public nonisolated(unsafe) static var flowShortSide: Int = 360
     /// CoreML 유닛 — true=GPU(전 사이즈 최속), false=ANE(느리지만 GPU를 비움) — 벤치 전용 노브
     public nonisolated(unsafe) static var useGPU: Bool = true
-    /// 앱 적응 사다리(288↔360 ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
+    /// 앱 적응 사다리(ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
     public nonisolated(unsafe) static var adaptiveLadder: Bool = true
+    /// 사다리 티어 — M4 실측 predict p50: 288=13.7 / 360=21.0 / 432=30.8ms. 예산 규칙
+    /// (med×면적비 < gap×0.75)이 자기제한: 60fps→288, 30fps→360, 24fps 영화→432.
+    /// 432는 하드케이스(대모션+저대비 채팅) SSIM +0.02(평균 스텝의 2~4배, 실프레임 삼중항
+    /// 실측)로 24fps 감상 화질을 배포 아키텍처(저해상 flow+풀 warp) 천장까지 올린다 (N3 1단계).
+    static let ladderTiers = [288, 360, 432]
+    public nonisolated(unsafe) static var ladderMaxShort: Int = 432
 
     /// 모델 파일 존재 여부 (엔진 등록 가드용)
     public static func modelAvailable(short: Int) -> Bool {
@@ -313,11 +319,15 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         } else if overloaded, currentShort > 288, Self.modelAvailable(short: 288) {
             kickSwitch(short: 288, gpu: false,
                        reason: "과부하 강등 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
-        } else if !overloaded, currentShort < Self.flowShortSide, Self.modelAvailable(short: Self.flowShortSide),
-                  med * 1.6 < gapMsEMA * 0.75 {
-            // 승격: 360 비용 ≈ 288×(360/288)² ≈ ×1.56 — 여유(30fps 이하 소스)면 화질 상향
-            kickSwitch(short: Self.flowShortSide, gpu: false,
-                       reason: "여유 승격 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
+        } else if !overloaded,
+                  let next = Self.ladderTiers.first(where: { $0 > currentShort && $0 <= Self.ladderMaxShort && Self.modelAvailable(short: $0) }) {
+            // 한 티어씩 승격 — 다음 해상도 예상 비용(면적비 = (next/cur)²)이 갭 여유 안일 때만.
+            // 288→360 ×1.56, 360→432 ×1.44 (실측 ×1.53/×1.47과 부합). 여유 없으면 자연히 안 올라감.
+            let factor = Double(next * next) / Double(currentShort * currentShort)
+            if med * factor < gapMsEMA * 0.75 {
+                kickSwitch(short: next, gpu: false,
+                           reason: "여유 승격 →\(next) med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
+            }
         }
     }
 

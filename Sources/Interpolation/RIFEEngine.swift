@@ -67,6 +67,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     private var srcDiffPSO: (any MTLComputePipelineState)?
     /// dBlur(소스 불일치, t 무관) 선계산 — 멀티-t 쌍에서 워프의 픽셀당 8샘플 재계산 제거
     private var diffTex: (any MTLTexture)?
+    /// 화면정지 UI 마스크 (UIStaticDetector) — 워프가 이 영역을 소스로 프리즈
+    private var uiMaskTex: (any MTLTexture)?
+    public func setUIMask(_ texture: (any MTLTexture)?) { uiMaskTex = texture }
 
     /// 앵커별 flow/mask 세트 최대 수 (예산이 넉넉하면 t별 전부 exact)
     static let maxAnchors = 4
@@ -628,12 +631,14 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             enc.setTexture(slot.maskTexs[ai], index: 3)
             enc.setTexture(output, index: 4)
             enc.setTexture(diffTex ?? stableA, index: 5)   // 미사용 시에도 바인딩 (검증 레이어)
+            enc.setTexture(uiMaskTex ?? stableA, index: 6) // 정지-UI 마스크 (미사용 시 더미 바인딩)
             var wp = WarpParams(
                 flowScale: SIMD2<Float>(Float(output.width) / Float(mW0), Float(output.height) / Float(mH0)),
                 scale0: t / anchor,
                 scale1: (1 - t) / (1 - anchor),
                 tPhase: t,
-                useDiffTex: useDiffTex)
+                useDiffTex: useDiffTex,
+                useUIMask: uiMaskTex != nil ? 1 : 0)
             enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)
             enc.setBuffer(slot.confBuf, offset: 0, index: 1)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
@@ -707,6 +712,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         var scale1: Float
         var tPhase: Float        // 표시 위상 t — flow 불신 시 원본 A/B 블렌드 가중
         var useDiffTex: Float = 0   // 1이면 dBlur를 diffTex에서 read (멀티-t 선계산)
+        var useUIMask: Float = 0    // 1이면 uiMask로 정지-UI 소스 프리즈
     }
 
     private func releaseSlot(_ slot: Slot) {
@@ -773,7 +779,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct WarpParams { float2 flowScale; float scale0; float scale1; float tPhase; float useDiffTex; };
+    struct WarpParams { float2 flowScale; float scale0; float scale1; float tPhase; float useDiffTex; float useUIMask; };
     constant float3 kLuma = float3(0.2126, 0.7152, 0.0722);
 
     // stableA/B → 모델크기 fp16 CHW 6플레인 (RGB 0-1) + 루마 히스토그램 (장면 전환용)
@@ -875,6 +881,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         texture2d<float, access::sample> maskTex [[texture(3)]],
         texture2d<float, access::write> outTex [[texture(4)]],
         texture2d<float, access::read> diffTex [[texture(5)]],
+        texture2d<float, access::sample> uiMask [[texture(6)]],
         constant WarpParams& p [[buffer(0)]],
         device atomic_uint* confStats [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]]
@@ -941,6 +948,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // 게임에서 UI 안정적인 핵심. 문턱이 슬로우팬(|A-B|>0.008)은 안 얼려 60fps 스텝 회피.
         float staticW = 1.0 - smoothstep(0.008, 0.04, dBlur);
         outc = mix(outc, srcBlend, staticW);
+        // 시간축 정지-UI 프리즈 — dBlur staticW가 못 잡는 반투명/저대비 UI(방송채팅·HUD)를
+        // UIStaticDetector 마스크(시간적 일관성)로 소스 고정. 소스 좌표 UV 공유(마스크=소스정렬).
+        if (p.useUIMask > 0.5) {
+            float uim = uiMask.sample(s, uv).r;
+            outc = mix(outc, srcBlend, clamp(uim, 0.0, 1.0));
+        }
         // conf/flow 실측 (16px 격자 스파스 — '보간이 실제로 얼마나 걸리는가' 계측)
         if ((gid.x & 15u) == 0u && (gid.y & 15u) == 0u) {
             atomic_fetch_add_explicit(&confStats[0], uint(conf * 255.0), memory_order_relaxed);

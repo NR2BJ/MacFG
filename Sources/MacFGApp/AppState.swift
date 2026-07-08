@@ -184,6 +184,8 @@ public final class AppState {
     private var overlayManager: OverlayManager?
     private let performanceMonitor = PerformanceMonitor()
     @ObservationIgnored nonisolated(unsafe) private var pairEngine: (any PairInterpolationEngine)?
+    /// 시간축 정지-UI 검출기 (채팅/HUD 프리즈) — 렌더 스레드 소유(ingest에서 갱신·조회).
+    @ObservationIgnored nonisolated(unsafe) private var uiDetector: UIStaticDetector?
     private let mailbox = RenderMailbox()
     private let logger = Logger(subsystem: "com.macfg", category: "AppState")
 
@@ -226,6 +228,8 @@ public final class AppState {
         self.presentQueue = device.makeCommandQueue()
         self.overlayManager = OverlayManager(device: device)
         self.interpolationEngine = selectedRenderMode.displayName
+        // 정지-UI 프리즈 토글 (A/B·회귀 확인용). 기본 on.
+        if ProcessInfo.processInfo.environment["MACFG_NO_UISTATIC"] != nil { UIStaticDetector.enabled = false }
         // 뷰어 창 X 버튼 → 캡처 정지
         self.overlayManager?.onViewerClosed = { [weak self] in
             Task { @MainActor in
@@ -721,6 +725,7 @@ public final class AppState {
     }
 
     nonisolated private func resetScheduler() {
+        uiDetector?.reset()   // 불연속(재시작/리사이즈) — 정지-UI 누적도 리셋
         timeline = []
         inFlightTextures = []
         stablePool = []
@@ -1183,6 +1188,10 @@ public final class AppState {
             blit.endEncoding()
         }
 
+        // 시간축 정지-UI 검출 갱신 — blit 직후 같은 cb1(소스 준비됨, 순서 보장). 누적 마스크는
+        // cb1 완료(=stableReady) 후 유효 → cb2 워프가 stableReady 대기 후 읽으므로 안전.
+        uiDetector?.update(source: stable, into: cb)
+
         // 실프레임 덤프 — 무장(⌃⌥⌘D)돼 있으면 이 고유 프레임을 PNG로. blit과 같은 cb1(순서 보장).
         if frameDumpRemaining > 0, let dir = frameDumpDir {
             dumpStableFrame(stable, cb: cb, dir: dir, index: frameDumpIndex)
@@ -1305,6 +1314,7 @@ public final class AppState {
                     tValues = []
                     diagSkipBackpressure += 1
                 }
+                pairEngine?.setUIMask(uiDetector?.mask)   // 정지-UI 프리즈 마스크 (없으면 nil)
                 interpResult = tValues.isEmpty ? nil : pairEngine?.encodePair(
                     stableA: prev.texture, stableB: stable,
                     tsA: prev.timestamp, tsB: snappedTs,
@@ -1982,6 +1992,14 @@ public final class AppState {
             interpolationEngine = "Off"
             return
         }
+
+        // 정지-UI 검출기 1회 준비 (엔진 무관 공유). 렌더 스레드 미기동이라 여기서 안전하게 생성.
+        if uiDetector == nil {
+            let det = UIStaticDetector(device: device)
+            try? await det.prepare()
+            uiDetector = det
+        }
+        uiDetector?.reset()   // 새 캡처/엔진 전환 = 불연속 → 누적 리셋
 
         let engine: any PairInterpolationEngine
         switch selectedRenderMode {

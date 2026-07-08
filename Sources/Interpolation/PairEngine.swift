@@ -51,10 +51,16 @@ public protocol PairInterpolationEngine: AnyObject {
     /// 덮지 않았는가). 표시 경로가 렌더 스레드에서 호출 — encodePair와 같은 스레드라 락 불요.
     /// 링을 재사용하지 않는 엔진(Legacy 등)은 기본 구현(항상 true)을 그대로 쓴다.
     func isFrameLive(_ stamp: UInt64) -> Bool
+
+    /// 화면정지 UI 마스크(UIStaticDetector 산출, 소스 좌표 UV) — 워프가 이 영역을 소스로
+    /// 프리즈해 채팅/HUD가 배경 flow에 끌리는 것을 막는다. 다음 encodePair에서 사용. nil=미사용.
+    /// 지원 안 하는 엔진은 기본 no-op.
+    func setUIMask(_ texture: (any MTLTexture)?)
 }
 
 public extension PairInterpolationEngine {
     func isFrameLive(_ stamp: UInt64) -> Bool { true }
+    func setUIMask(_ texture: (any MTLTexture)?) {}
 }
 
 /// 기존 FrameInterpolator(Blend 등)를 PairInterpolationEngine으로 감싸는 어댑터

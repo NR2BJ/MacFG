@@ -1902,9 +1902,11 @@ public final class AppState {
     /// 전체화면이 새 창을 만들어 원 창엔 검정+썸네일만 남는 문제 대응. statsTimer(0.5s)에서 호출.
     /// MACFG_NO_RETARGET로 비활성. 영역캡처 중엔 비활성(크롭이 원 창 기준이라).
     private func detectFullscreenRetarget() {
-        guard isCapturing, !retargetInFlight, captureRegion == nil,
-              sourceOwnerPID > 0, originalCaptureWindowID > 0,
-              ProcessInfo.processInfo.environment["MACFG_NO_RETARGET"] == nil else { return }
+        // 기본 OFF — 오탐(PiP/전체화면 잔재 창을 잡아 정상 캡처를 깨뜨림) 회귀 확인되어 옵트인으로.
+        // 단일 모니터 전체화면 문제도 못 풀면서 정상 사용만 망가뜨려, MACFG_RETARGET=1일 때만 동작.
+        guard ProcessInfo.processInfo.environment["MACFG_RETARGET"] != nil,
+              isCapturing, !retargetInFlight, captureRegion == nil,
+              sourceOwnerPID > 0, originalCaptureWindowID > 0 else { return }
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return }
         let screens = NSScreen.screens.map(\.frame)

@@ -10,7 +10,6 @@ research/rife/__pycache__/
 dist/
 *.dmg
 # RIFE 고해상 flow 모델 — 288→432 화질차 미미(실측) + 실시간 예산 초과라 미배포
-Models/rife540.mlpackage/
 Models/rife720.mlpackage/
 
 # 실프레임 삼중항 캡처 (로컬 벤치용 — 용량 큼)

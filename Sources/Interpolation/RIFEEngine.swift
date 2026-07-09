@@ -39,13 +39,13 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 앱 적응 사다리(ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
     public nonisolated(unsafe) static var adaptiveLadder: Bool = true
     /// 사다리 티어 — v2 모델(다운스케일 후 워프 재수출, N3 2단계) M4 실측 ANE p50:
-    /// 288=7.2 / 360=10.9 / 432=16.7ms (v1 대비 -47%: 내부 워프 16회를 블록 입력
-    /// 해상도에서 수행해 resample 비용 ⅓ — 화질은 실프레임 삼중항 SSIM 동일 ±0.002).
-    /// 예산 규칙(med×면적비 < gap×0.75)이 자기제한: **60fps→360(신규), 30fps 이하→432**.
-    /// 432는 하드케이스(대모션+저대비 채팅) SSIM +0.02(평균 스텝의 2~4배)로 배포
-    /// 아키텍처(저해상 flow+풀 warp) 천장. M1은 예산상 자동으로 낮은 티어에 머무름.
-    static let ladderTiers = [288, 360, 432]
-    public nonisolated(unsafe) static var ladderMaxShort: Int = 432
+    /// 288=7.2 / 360=10.9 / 432=16.7 / 540=26.1ms (v1 대비 -47%: 내부 워프 16회를 블록
+    /// 입력 해상도에서 수행해 resample 비용 ⅓ — 화질은 실프레임 삼중항 SSIM 동일 ±0.002).
+    /// 예산 규칙(med×면적비 < gap×0.75)이 자기제한: **60fps→360, 30/24fps→540**.
+    /// 앵커vs해상도는 실측 결판(anchor_vs_res.py): 같은 예산에선 등가, 최고해상도 앵커1이 최선.
+    /// M1은 예산상 자동으로 낮은 티어에 머무름.
+    static let ladderTiers = [288, 360, 432, 540]
+    public nonisolated(unsafe) static var ladderMaxShort: Int = 540
 
     /// 모델 파일 존재 여부 (엔진 등록 가드용)
     public static func modelAvailable(short: Int) -> Bool {
@@ -327,8 +327,11 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         } else if !overloaded,
                   let next = Self.ladderTiers.first(where: { $0 > currentShort && $0 <= Self.ladderMaxShort && Self.modelAvailable(short: $0) }) {
             // 한 티어씩 승격 — 다음 해상도 예상 비용(면적비 = (next/cur)²)이 갭 여유 안일 때만.
-            // 288→360 ×1.56, 360→432 ×1.44 (실측 ×1.53/×1.47과 부합). 여유 없으면 자연히 안 올라감.
+            // 288→360 ×1.56, 360→432 ×1.44, 432→540 ×1.56 (실측 부합). 여유 없으면 자연히 안 올라감.
             let factor = Double(next * next) / Double(currentShort * currentShort)
+            // 앵커 vs 해상도는 실측(anchor_vs_res.py, 대모션 66.7ms 갭)으로 결판: 같은 예산에서
+            // 거의 등가(288exact=432a1)이고 최고해상도+앵커1(540a1 .7846)이 실현가능 최선 —
+            // 정확앵커 확보를 위해 승격을 막을 이유 없음. 순수 예산 규칙만 적용.
             if med * factor < gapMsEMA * 0.75 {
                 kickSwitch(short: next, gpu: false,
                            reason: "여유 승격 →\(next) med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")

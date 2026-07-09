@@ -166,6 +166,18 @@ struct WindowPickerView: View {
                         .toggleStyle(.switch).labelsHidden()
                         .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
                 }
+
+                field(L("Keep overlay while multitasking", "멀티태스킹 중 오버레이 유지", "マルチタスク中もオーバーレイ維持"),
+                      hint: L("Cover mode: don't hide when you click another app.",
+                              "Cover 모드: 다른 앱을 클릭해도 숨기지 않음.",
+                              "Coverモード: 他アプリをクリックしても隠さない。"),
+                      detail: L("By default the Cover overlay hides when you switch to another app so it doesn't block it (single-monitor safety). Turn on to keep watching the interpolated output while working in other windows — it stays on top of the source area.",
+                                "기본값은 다른 앱으로 전환하면 Cover 오버레이가 그 앱을 안 가리려고 숨습니다(단일 모니터 안전장치). 켜면 다른 창에서 작업하면서도 보간 출력을 계속 볼 수 있습니다 — 소스 영역 위에 유지됩니다.",
+                                "既定では他アプリに切り替えるとCoverオーバーレイが非表示になります(単一モニタの安全策)。オンにすると他ウィンドウで作業しながら補間出力を見続けられます。")) {
+                    Toggle(L("Enable", "켜기", "有効"), isOn: $appState.coverKeepVisible)
+                        .toggleStyle(.switch).labelsHidden()
+                        .onChange(of: appState.coverKeepVisible) { appState.refreshOverlayVisibility() }
+                }
             }
         }
     }

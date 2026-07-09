@@ -148,6 +148,10 @@ public final class AppState {
     /// 오클루전 방향별 워프 (실험, MetalFlow 전용) — 가림/드러남 경계에서 보이는 쪽 단방향 워프.
     /// 반복 패턴 aliasing 부작용 가능 → 실영상 A/B용. 기본 off.
     var occlusionDirectional: Bool = false
+    /// Cover 모드에서 다른 앱으로 전환해도 오버레이를 계속 표시 (기본 off = 자동숨김).
+    /// off: 제3앱 최전면 시 오버레이를 숨겨 그 앱을 안 가림(단일 모니터 트랩 회피).
+    /// on: 소스 영역 위에 계속 떠 멀티태스킹 중에도 보간을 볼 수 있음.
+    var coverKeepVisible: Bool = false
     /// 모션 부드러움 0(예리)~1(부드러움), 0.5=기본. MetalFlow 전용 취향 슬라이더 (실시간 반영).
     var motionSmoothness: Double = 0.5
     /// 경계 전환 0(crisp/저더)~1(soft/고스팅), 0.5=기본. 콘텐츠 취향(게임 crisp / 영화 soft).
@@ -341,6 +345,7 @@ public final class AppState {
         d.set(sourcePreset, forKey: "s.preset")
         d.set(isInterpolationEnabled, forKey: "s.interp")
         d.set(occlusionDirectional, forKey: "s.occdir")
+        d.set(coverKeepVisible, forKey: "s.coverkeep")
         d.set(motionSmoothness, forKey: "s.msmooth")
         d.set(boundarySoftness, forKey: "s.bsoft")
     }
@@ -356,6 +361,7 @@ public final class AppState {
         if d.object(forKey: "s.sharp") != nil { sharpness = d.double(forKey: "s.sharp") }
         if d.object(forKey: "s.preset") != nil { sourcePreset = d.integer(forKey: "s.preset") }
         if d.object(forKey: "s.interp") != nil { isInterpolationEnabled = d.bool(forKey: "s.interp") }
+        if d.object(forKey: "s.coverkeep") != nil { coverKeepVisible = d.bool(forKey: "s.coverkeep") }
         if d.object(forKey: "s.occdir") != nil { occlusionDirectional = d.bool(forKey: "s.occdir") }
         MetalFlowEngine.occlusionDirectional = occlusionDirectional
         if d.object(forKey: "s.msmooth") != nil { motionSmoothness = d.double(forKey: "s.msmooth") }
@@ -1877,7 +1883,7 @@ public final class AppState {
         let sourceFront = sourceOwnerPID == 0
             || frontPID == sourceOwnerPID
             || frontPID == ProcessInfo.processInfo.processIdentifier
-        let shouldHide = overlayUserHidden || !sourceFront
+        let shouldHide = overlayUserHidden || (!sourceFront && !coverKeepVisible)
         guard shouldHide != overlayHiddenState else { return }
         overlayHiddenState = shouldHide
         overlayManager?.setOverlayHidden(shouldHide)

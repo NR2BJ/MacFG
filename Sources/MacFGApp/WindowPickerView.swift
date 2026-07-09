@@ -272,20 +272,9 @@ struct WindowPickerView: View {
         section(L("Live", "실시간", "リアルタイム")) {
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
                 GridRow {
-                    Label("FPS", systemImage: "speedometer").foregroundStyle(.secondary).gridColumnAlignment(.leading)
-                    Text(String(format: "%.0f → %.0f", appState.inputFPS, appState.outputFPS))
-                        .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
-                }
-                GridRow {
-                    Label(L("Latency", "지연", "遅延"), systemImage: "timer").foregroundStyle(.secondary)
+                    Label(L("Latency", "지연", "遅延"), systemImage: "timer").foregroundStyle(.secondary).gridColumnAlignment(.leading)
                     Text(String(format: "%.0f ms", appState.latencyMs))
                         .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
-                }
-                if let scale = appState.upscaleStatus {
-                    GridRow {
-                        Label(L("Scale", "스케일", "スケール"), systemImage: "arrow.up.left.and.arrow.down.right").foregroundStyle(.secondary)
-                        Text(scale).font(.caption).lineLimit(1).frame(width: 250, alignment: .leading)
-                    }
                 }
             }
             .font(.callout)

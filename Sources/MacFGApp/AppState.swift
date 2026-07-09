@@ -148,10 +148,10 @@ public final class AppState {
     /// 오클루전 방향별 워프 (실험, MetalFlow 전용) — 가림/드러남 경계에서 보이는 쪽 단방향 워프.
     /// 반복 패턴 aliasing 부작용 가능 → 실영상 A/B용. 기본 off.
     var occlusionDirectional: Bool = false
-    /// Cover 모드에서 다른 앱으로 전환해도 오버레이를 계속 표시 (기본 off = 자동숨김).
-    /// off: 제3앱 최전면 시 오버레이를 숨겨 그 앱을 안 가림(단일 모니터 트랩 회피).
-    /// on: 소스 영역 위에 계속 떠 멀티태스킹 중에도 보간을 볼 수 있음.
-    var coverKeepVisible: Bool = false
+    /// Cover 모드에서 다른 앱으로 전환해도 오버레이를 계속 표시 (기본 ON — 시청 중 멀티태스킹이
+    /// 핵심 사용이라). off면 제3앱 최전면 시 오버레이 숨김+보간 정지(GPU 양보, 단일모니터 전체화면
+    /// Cover 트랩 회피용). 창 소스는 소스 영역만 덮으니 켜둬도 안전; 트랩 시 보간/오버레이 단축키로 escape.
+    var coverKeepVisible: Bool = true
     /// 모션 부드러움 0(예리)~1(부드러움), 0.5=기본. MetalFlow 전용 취향 슬라이더 (실시간 반영).
     var motionSmoothness: Double = 0.5
     /// 경계 전환 0(crisp/저더)~1(soft/고스팅), 0.5=기본. 콘텐츠 취향(게임 crisp / 영화 soft).

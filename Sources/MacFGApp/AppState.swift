@@ -179,6 +179,10 @@ public final class AppState {
     /// present 전용 큐 (틱당 ~0.3ms 렌더패스만)
     @ObservationIgnored nonisolated(unsafe) private var presentQueue: (any MTLCommandQueue)?
     private let captureManager = CaptureManager()
+    // U2 전체화면 재타깃: 사용자가 고른 원 창 / 현재 실제 캡처 중인 창(전체화면 시 전환).
+    private var originalCaptureWindowID: CGWindowID = 0
+    private var currentTargetWindowID: CGWindowID = 0
+    private var retargetInFlight = false
     /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
     /// 설정되면 resize-reconfigure를 끈다(영역이 창-리사이즈 재구성으로 날아가지 않게).
     @ObservationIgnored nonisolated(unsafe) var captureRegion: CGRect?
@@ -592,6 +596,7 @@ public final class AppState {
             statsTimer = addCommonTimer(0.5) { [weak self] _ in
                 Task { @MainActor in
                     self?.updateStats()
+                    self?.detectFullscreenRetarget()
                 }
             }
 
@@ -615,7 +620,7 @@ public final class AppState {
                     let nowT = CFAbsoluteTimeGetCurrent()
                     if nowT - self.lastResizeCheck >= 0.5 {
                         self.lastResizeCheck = nowT
-                        if !self.isRestartingCapture, self.captureRegion == nil, self.stablePoolWidth > 0,
+                        if !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
                            let src = self.overlayManager?.sourcePixelSize {
                             let mismatch = abs(src.width - self.stablePoolWidth) > 8 || abs(src.height - self.stablePoolHeight) > 8
                             if mismatch {
@@ -634,6 +639,8 @@ public final class AppState {
 
             // 자동 숨김 기준용 소스 PID + 초기 표시 상태
             sourceOwnerPID = ownerPID(of: windowID)
+        originalCaptureWindowID = windowID
+        currentTargetWindowID = windowID
             overlayManager?.sourcePID = sourceOwnerPID   // 뷰어 마우스 역매핑 대상
             overlayUserHidden = false
             overlayHiddenState = false
@@ -1883,6 +1890,44 @@ public final class AppState {
         }
     }
 
+
+    /// U2 전체화면/PiP 재타깃: 소스 앱(PID)의 온스크린 창 중 디스플레이를 거의 덮는(≥92%)
+    /// 전체화면 창이 새로 나타나면 그리로 무중단 재타깃, 사라지면 원 창 복귀. YouTube 등 HTML5
+    /// 전체화면이 새 창을 만들어 원 창엔 검정+썸네일만 남는 문제 대응. statsTimer(0.5s)에서 호출.
+    /// MACFG_NO_RETARGET로 비활성. 영역캡처 중엔 비활성(크롭이 원 창 기준이라).
+    private func detectFullscreenRetarget() {
+        guard isCapturing, !retargetInFlight, captureRegion == nil,
+              sourceOwnerPID > 0, originalCaptureWindowID > 0,
+              ProcessInfo.processInfo.environment["MACFG_NO_RETARGET"] == nil else { return }
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return }
+        let screens = NSScreen.screens.map(\.frame)
+        var fullscreenWID: CGWindowID = 0
+        for info in list {
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == sourceOwnerPID,
+                  let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
+                  let wid = info[kCGWindowNumber as String] as? CGWindowID, wid != originalCaptureWindowID,
+                  let b = info[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+            let ww = b["Width"] ?? 0, wh = b["Height"] ?? 0
+            if screens.contains(where: { ww >= $0.width * 0.92 && wh >= $0.height * 0.92 }) {
+                fullscreenWID = wid; break
+            }
+        }
+        let desired = fullscreenWID != 0 ? fullscreenWID : originalCaptureWindowID
+        guard desired != currentTargetWindowID else { return }
+        retargetInFlight = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.captureManager.updateTargetWindow(windowID: desired)
+                self.currentTargetWindowID = desired
+                DiagnosticLog.shared.log("[RETARGET] \(desired == self.originalCaptureWindowID ? "원창 복귀 " : "전체화면 전환 ")wid=\(desired)")
+            } catch {
+                DiagnosticLog.shared.log("[RETARGET] 실패 wid=\(desired): \(error)")
+            }
+            self.retargetInFlight = false
+        }
+    }
 
     /// 현재 최전면 앱의 최상단 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
     private func frontmostWindow() -> (id: CGWindowID, name: String)? {

@@ -122,6 +122,24 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         DiagnosticLog.shared.log("[SCK-CFG] reconfigure → \(width)x\(height)\(captureRect != nil ? " (region)" : "")")
     }
 
+    /// 캡처 대상 창을 무중단 교체 — 전체화면/PiP가 새 창을 만들 때 재타깃 (updateContentFilter).
+    /// captureRect(영역 크롭)는 원 창 기준이라 재타깃 시 무효화하고 새 창 전체를 잡는다.
+    public func updateTargetWindow(windowID: CGWindowID) async throws {
+        guard let stream else { throw CaptureError.notCapturing }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+            throw CaptureError.windowNotFound
+        }
+        let scaleFactor = Self.findScaleFactor(for: window.frame)
+        self.captureScale = scaleFactor
+        self.captureRect = nil   // 재타깃 = 새 창 전체 (원 창 기준 크롭 무효)
+        let w = window.frame.width > 0 ? Int(window.frame.width * scaleFactor) : 1920
+        let h = window.frame.height > 0 ? Int(window.frame.height * scaleFactor) : 1080
+        try await stream.updateContentFilter(SCContentFilter(desktopIndependentWindow: window))
+        try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
+        DiagnosticLog.shared.log("[SCK-RETARGET] → window \(windowID) \(Int(window.frame.width))x\(Int(window.frame.height)) → cfg \(w)x\(h)")
+    }
+
     public func stopCapture() async {
         capturing = false
         if let stream {

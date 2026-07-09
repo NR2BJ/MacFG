@@ -59,6 +59,12 @@ public final class CaptureManager: Sendable {
         try await sckCapture.updateConfiguration(width: width, height: height)
     }
 
+    /// 캡처 대상 창 무중단 교체 (SCK 전용). 전체화면/PiP 새 창 재타깃 (U2).
+    public func updateTargetWindow(windowID: CGWindowID) async throws {
+        guard _activeMethod == .screenCaptureKit else { throw CaptureError.notCapturing }
+        try await sckCapture.updateTargetWindow(windowID: windowID)
+    }
+
     /// 최신 프레임 가져오기
     public func latestFrame() -> FrameSlot? {
         activeSource?.latestFrame()

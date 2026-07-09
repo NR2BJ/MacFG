@@ -11,6 +11,7 @@ import Monitoring
 import os
 import ImageIO
 import UniformTypeIdentifiers
+import Vision
 
 /// 보간 엔진 선택. appleFI(ANE 720p+마스크 합성) vs metalFlow(LSFG 방식 순수 GPU) 비교 가능.
 /// blend는 미지원 폴백/디버그용 (UI 미노출, `--auto-mode blend`).
@@ -186,6 +187,11 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var pairEngine: (any PairInterpolationEngine)?
     /// 시간축 정지-UI 검출기 (채팅/HUD 프리즈) — 렌더 스레드 소유(ingest에서 갱신·조회).
     @ObservationIgnored nonisolated(unsafe) private var uiDetector: UIStaticDetector?
+    /// Vision 텍스트 검출 (흐린 채팅 보완) — ~2초 주기, 백그라운드 큐. 스냅샷 shared 텍스처 재사용.
+    @ObservationIgnored nonisolated(unsafe) private var visionSnapshotTex: (any MTLTexture)?
+    @ObservationIgnored nonisolated(unsafe) private var visionInFlight = false
+    @ObservationIgnored nonisolated(unsafe) private var lastVisionAt: CFTimeInterval = 0
+    private let visionQueue = DispatchQueue(label: "macfg.vision", qos: .utility)
     private let mailbox = RenderMailbox()
     private let logger = Logger(subsystem: "com.macfg", category: "AppState")
 
@@ -724,6 +730,59 @@ public final class AppState {
         }
     }
 
+    /// Vision 텍스트 검출 스케줄 (렌더 스레드, ingest 내) — ~2초 주기로 소스 스냅샷을 shared
+    /// 텍스처에 blit하고, cb 완료 후 백그라운드 큐에서 VNRecognizeTextRequest(.fast) 실행 →
+    /// 박스를 uiDetector에 제출. 일관성 신호가 놓치는 흐린 채팅 라인 보완 (오프라인 GT 검증).
+    nonisolated private func scheduleVisionTextDetection(source: any MTLTexture, cb: any MTLCommandBuffer) {
+        guard UIStaticDetector.enabled, let det = uiDetector, !visionInFlight else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastVisionAt > 2.0 else { return }
+        lastVisionAt = now
+        // 스냅샷 텍스처 (shared, 재사용)
+        if visionSnapshotTex == nil || visionSnapshotTex!.width != source.width || visionSnapshotTex!.height != source.height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: source.width, height: source.height, mipmapped: false)
+            d.usage = [.shaderRead]; d.storageMode = .shared
+            visionSnapshotTex = device.makeTexture(descriptor: d)
+        }
+        guard let snap = visionSnapshotTex, let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
+                  to: snap, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        visionInFlight = true
+        let queue = visionQueue
+        nonisolated(unsafe) let selfRef = self   // visionInFlight 플래그 리셋용 (unsafe 필드)
+        cb.addCompletedHandler { [weak det] _ in
+            queue.async {
+                defer { selfRef.visionInFlight = false }
+                guard let det else { return }
+                let w = snap.width, h = snap.height
+                var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                snap.getBytes(&bytes, bytesPerRow: w * 4,
+                              from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+                guard let ctx = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                                          bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                              | CGBitmapInfo.byteOrder32Little.rawValue),
+                      let cg = ctx.makeImage() else { return }
+                let req = VNRecognizeTextRequest()
+                req.recognitionLevel = .fast
+                req.usesLanguageCorrection = false
+                try? VNImageRequestHandler(cgImage: cg).perform([req])
+                // Vision은 좌하 원점 → 좌상 원점 정규화로 변환
+                let rects: [CGRect] = (req.results ?? []).map { o in
+                    let b = o.boundingBox
+                    return CGRect(x: b.origin.x, y: 1 - b.origin.y - b.height, width: b.width, height: b.height)
+                }
+                det.submitTextBoxes(rects)
+                DiagnosticLog.shared.log("[UISTATIC] vision \(rects.count)개 텍스트 박스")
+            }
+        }
+    }
+
     nonisolated private func resetScheduler() {
         uiDetector?.reset()   // 불연속(재시작/리사이즈) — 정지-UI 누적도 리셋
         timeline = []
@@ -1191,6 +1250,8 @@ public final class AppState {
         // 시간축 정지-UI 검출 갱신 — blit 직후 같은 cb1(소스 준비됨, 순서 보장). 누적 마스크는
         // cb1 완료(=stableReady) 후 유효 → cb2 워프가 stableReady 대기 후 읽으므로 안전.
         uiDetector?.update(source: stable, into: cb)
+        // Vision 텍스트 검출 (~2초 주기) — cb1에 스냅샷 blit, 완료 후 백그라운드에서 검출
+        scheduleVisionTextDetection(source: stable, cb: cb)
 
         // 실프레임 덤프 — 무장(⌃⌥⌘D)돼 있으면 이 고유 프레임을 PNG로. blit과 같은 cb1(순서 보장).
         if frameDumpRemaining > 0, let dir = frameDumpDir {

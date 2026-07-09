@@ -1,4 +1,6 @@
 @preconcurrency import Metal
+import Foundation
+import CoreGraphics
 import Monitoring
 
 /// 시간축 화면정지 UI 검출 (채팅/HUD/오버레이). 오프라인 스파이크(temporal_ui_spike.py)에서
@@ -20,6 +22,29 @@ public final class UIStaticDetector {
     private var w = 0, h = 0
     private var needsReset = true
     private var frames = 0
+
+    // ── 텍스트 박스 부스트 (Vision 검출 결과 — 일관성 신호가 놓치는 흐린 텍스트 보완)
+    private let boxLock = NSLock()
+    private var pendingBoxes: [CGRect]?          // 새 제출 (정규화, 좌상 원점)
+    private var boxesStamp = 0                    // 제출 세대 (업로드 트리거)
+    private var uploadedStamp = -1
+    private var lastSubmitAt: CFTimeInterval = 0
+    private var boostTex: [any MTLTexture] = []   // ping-pong (r8, 마스크 해상도)
+    private var boostCur = 0
+    private var boostBitmap: [UInt8] = []
+    private var boostActive = false
+    /// 텍스트 박스 유지 시간 — 이 시간 내 재검출 없으면 부스트 소멸 (채팅 사라짐 대응)
+    public nonisolated(unsafe) static var boxTTL: CFTimeInterval = 6.0
+
+    /// Vision 등 외부 검출기가 텍스트 박스를 제출 (아무 스레드) — 다음 update에서 업로드.
+    /// rects: 정규화 좌표(0..1), 좌상 원점.
+    public func submitTextBoxes(_ rects: [CGRect]) {
+        boxLock.lock()
+        pendingBoxes = rects
+        boxesStamp += 1
+        lastSubmitAt = CFAbsoluteTimeGetCurrent()
+        boxLock.unlock()
+    }
 
     /// 튜닝(오프라인 clo0.8 chi2.0 시작점). alpha=EMA율(~1/창길이). enabled=off면 no-op.
     public nonisolated(unsafe) static var enabled = true
@@ -52,11 +77,23 @@ public final class UIStaticDetector {
         meanTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
         sqTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
         maskTex = tex(.r16Float, [.shaderRead, .shaderWrite])
+        // boost: CPU 업로드용 shared r8 ping-pong (GPU가 이전 장을 읽는 중에도 안전)
+        func sharedTex() -> (any MTLTexture)? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: mw, height: mh, mipmapped: false)
+            d.usage = [.shaderRead]; d.storageMode = .shared
+            return device.makeTexture(descriptor: d)
+        }
+        boostTex = [sharedTex(), sharedTex()].compactMap { $0 }
+        boostBitmap = [UInt8](repeating: 0, count: mw * mh)
+        uploadedStamp = -1
         needsReset = true
     }
 
-    /// 불연속(캡처 시작/장면 전환) — 다음 업데이트에서 누적 리셋.
-    public func reset() { needsReset = true; frames = 0 }
+    /// 불연속(캡처 시작/장면 전환) — 다음 업데이트에서 누적 리셋 (+이전 캡처의 텍스트 박스 폐기).
+    public func reset() {
+        needsReset = true; frames = 0
+        boxLock.lock(); pendingBoxes = nil; boxesStamp += 1; lastSubmitAt = 0; boxLock.unlock()
+    }
 
     /// 현재 소스 프레임으로 누적 갱신 + 마스크 산출. cb에 인코딩 (blit 직후 = 소스 준비됨).
     public func update(source: any MTLTexture, into cb: any MTLCommandBuffer) {
@@ -64,6 +101,36 @@ public final class UIStaticDetector {
         ensure(srcW: source.width, srcH: source.height)
         guard meanTex.count == 2, sqTex.count == 2, let maskTex,
               let enc = cb.makeComputeCommandEncoder() else { return }
+        // 텍스트 박스 갱신 확인 — 새 제출 또는 TTL 만료 시 CPU 비트맵 그려 ping-pong 업로드
+        boxLock.lock()
+        let stamp = boxesStamp
+        let boxes = pendingBoxes
+        let age = CFAbsoluteTimeGetCurrent() - lastSubmitAt
+        boxLock.unlock()
+        if stamp != uploadedStamp || (boostActive && age > Self.boxTTL) {
+            uploadedStamp = stamp
+            boostActive = age <= Self.boxTTL && !(boxes?.isEmpty ?? true)
+            boostBitmap.withUnsafeMutableBufferPointer { _ = memset($0.baseAddress, 0, $0.count) }
+            if age <= Self.boxTTL, let boxes {
+                for r in boxes {
+                    // 소폭 팽창 (텍스트 라인 박스는 타이트 — 가로 0.5%, 세로 라인높이 40%)
+                    let x0 = max(0, Int((r.minX - 0.005) * CGFloat(w)))
+                    let x1 = min(w, Int((r.maxX + 0.005) * CGFloat(w)))
+                    let y0 = max(0, Int((r.minY - r.height * 0.4) * CGFloat(h)))
+                    let y1 = min(h, Int((r.maxY + r.height * 0.4) * CGFloat(h)))
+                    guard x1 > x0, y1 > y0 else { continue }
+                    for y in y0..<y1 {
+                        boostBitmap.withUnsafeMutableBufferPointer { buf in
+                            _ = memset(buf.baseAddress! + y * w + x0, 255, x1 - x0)
+                        }
+                    }
+                }
+            }
+            boostCur = 1 - boostCur
+            boostTex[boostCur].replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0,
+                                       withBytes: boostBitmap, bytesPerRow: w)
+        }
+
         let prev = cur, next = 1 - cur
         enc.setComputePipelineState(pso)
         enc.setTexture(source, index: 0)
@@ -72,6 +139,7 @@ public final class UIStaticDetector {
         enc.setTexture(meanTex[next], index: 3)
         enc.setTexture(sqTex[next], index: 4)
         enc.setTexture(maskTex, index: 5)
+        enc.setTexture(boostTex[boostCur], index: 6)
         var p = SIMD4<Float>(Self.alpha, Self.clo, Self.chi, needsReset ? 1 : 0)
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         var strength = Self.strength
@@ -94,6 +162,7 @@ public final class UIStaticDetector {
         texture2d<float, access::write> meanOut [[texture(3)]],
         texture2d<float, access::write> sqOut   [[texture(4)]],
         texture2d<float, access::write> maskOut [[texture(5)]],
+        texture2d<float, access::read>  boost [[texture(6)]],   // Vision 텍스트 박스 (r8)
         constant float4& p [[buffer(0)]],       // alpha, clo, chi, reset
         constant float&  strength [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]])
@@ -125,8 +194,10 @@ public final class UIStaticDetector {
         float cons = fabs(m0) / (sqrt(var0) + 0.004);        // 시간적 일관성 (정지구조=큼)
         // 구조 게이트: 고주파 크기가 너무 작으면(평탄 배경) UI 아님 — 오검출 방지
         float structured = smoothstep(0.004, 0.02, fabs(m0));
-        float m = smoothstep(p.y, p.z, cons) * structured * strength;
-        maskOut.write(float4(m), gid);
+        float m = smoothstep(p.y, p.z, cons) * structured;
+        // Vision 텍스트 박스 부스트 — 일관성이 놓친 흐린 텍스트 라인을 커버 (오프라인 GT +0.002)
+        m = max(m, boost.read(gid).r);
+        maskOut.write(float4(m * strength), gid);
     }
     """
 }

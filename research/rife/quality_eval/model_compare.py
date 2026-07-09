@@ -12,7 +12,7 @@ RIFE = "../v425/train_log"
 
 def warp(img, flow):
     B, _, H, W = flow.shape
-    yy, xx = torch.meshgrid(torch.arange(H, dtype=img.dtype), torch.arange(W, dtype=img.dtype), indexing='ij')
+    yy, xx = torch.meshgrid(torch.arange(H, dtype=img.dtype, device=flow.device), torch.arange(W, dtype=img.dtype, device=flow.device), indexing='ij')
     grid = torch.stack((xx, yy), 0).unsqueeze(0)
     vg = grid + flow
     vx = 2.0 * vg[:, 0:1] / max(W - 1, 1) - 1.0
@@ -54,10 +54,11 @@ def ssim(x, y):
     lx = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
     ly = (0.299 * y[:, 0] + 0.587 * y[:, 1] + 0.114 * y[:, 2]).unsqueeze(1)
     C1, C2 = 0.01 ** 2, 0.03 ** 2
-    mx = F.conv2d(lx, _W, padding=5); my = F.conv2d(ly, _W, padding=5)
-    vx = F.conv2d(lx * lx, _W, padding=5) - mx * mx
-    vy = F.conv2d(ly * ly, _W, padding=5) - my * my
-    cxy = F.conv2d(lx * ly, _W, padding=5) - mx * my
+    W = _W.to(x.device)
+    mx = F.conv2d(lx, W, padding=5); my = F.conv2d(ly, W, padding=5)
+    vx = F.conv2d(lx * lx, W, padding=5) - mx * mx
+    vy = F.conv2d(ly * ly, W, padding=5) - my * my
+    cxy = F.conv2d(lx * ly, W, padding=5) - mx * my
     return (((2 * mx * my + C1) * (2 * cxy + C2)) / ((mx * mx + my * my + C1) * (vx + vy + C2))).mean().item()
 
 def rife_low(net, a, b, short):

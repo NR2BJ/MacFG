@@ -1735,7 +1735,11 @@ public final class AppState {
         // 지터 콘텐츠에서 fps 소수점이 매번 달라 0.5s마다 전체 뷰 무효화 → tick 116-117Hz로
         // 새던 원인 (깨끗한 소스는 값 불변 → 재평가 없음 → 120.0 실측과 정합).
         // 반올림(fps 정수, latency 정수)로 변경 빈도 자체도 낮춘다.
-        let newInput = performanceMonitor.inputFPS.rounded()
+        // 소스 fps: 평활 EMA(1/sourceIntervalEMA) 사용 — performanceMonitor.inputFPS는 최근 60프레임
+        // 창이라 순간 stall에 창이 길어지면 8fps 등으로 뚝 떨어져 오표시됐다(실측: 실제 30fps인데
+        // 오버레이 8 표기). [SCHED]가 쓰는 EMA와 동일해 안정적으로 실제 소스레이트를 보여준다.
+        let emaFps = sourceIntervalEMA > 0 ? (1.0 / sourceIntervalEMA) : performanceMonitor.inputFPS
+        let newInput = emaFps.rounded()
         if inputFPS != newInput { inputFPS = newInput }
         // 출력 FPS는 실제 glass 시각(presented handler의 presentedTime)으로 계산 —
         // PerformanceMonitor의 renderTimestamps는 mailbox 드레인 시각이라 틱에 뭉쳐

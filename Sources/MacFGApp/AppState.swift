@@ -589,7 +589,7 @@ public final class AppState {
             pendingShowReset = false
             attachRenderDriver()
 
-            statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            statsTimer = addCommonTimer(0.5) { [weak self] _ in
                 Task { @MainActor in
                     self?.updateStats()
                 }
@@ -601,7 +601,7 @@ public final class AppState {
             // 움직였을 때 다음 조작 좌표가 어긋나지 않게 신선도가 필요 (2Hz는 0.5s 지연으로
             // 매핑이 헛돌았음). 렌더는 전용 스레드라 메인 CGWindowList 15Hz는 틱에 무해.
             let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
-            trackingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / trackHz, repeats: true) { [weak self] _ in
+            trackingTimer = addCommonTimer(1.0 / trackHz) { [weak self] _ in
                 Task { @MainActor in
                     guard let self else { return }
                     self.overlayManager?.updateTracking()
@@ -1715,6 +1715,15 @@ public final class AppState {
         NSApp.windows.contains {
             $0.styleMask.contains(.titled) && $0.level == .normal && $0.occlusionState.contains(.visible)
         }
+    }
+
+    /// .common 모드로 반복 타이머 등록 — 메뉴바 팝오버/메뉴 트래킹(.eventTracking) 중에도
+    /// 계속 발화하게. scheduledTimer는 .default 전용이라 팝오버를 열면 통계/추적이 멈췄다
+    /// (렌더는 전용 스레드라 무관 — 카운터 UI만 얼었던 원인).
+    private func addCommonTimer(_ interval: TimeInterval, _ block: @escaping @Sendable (Timer) -> Void) -> Timer {
+        let t = Timer(timeInterval: interval, repeats: true, block: block)
+        RunLoop.main.add(t, forMode: .common)
+        return t
     }
 
     private func updateStats() {

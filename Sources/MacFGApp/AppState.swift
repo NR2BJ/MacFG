@@ -1239,7 +1239,8 @@ public final class AppState {
 
         let delta = lastAcceptedTimestamp > 0 ? slot.timestamp - lastAcceptedTimestamp : 0
         if delta > 0 && delta < 0.5 {
-            sourceIntervalEMA = sourceIntervalEMA == 0 ? delta : sourceIntervalEMA * 0.9 + delta * 0.1
+            // sourceIntervalEMA는 PLL(snapTimestamp)이 단독 소유 — 여기서 raw delta로
+            // 덮어쓰면 히스테리시스의 락 기준 자체가 매 프레임 오염된다 (리뷰 지적).
             if delta < diagSrcIntMin { diagSrcIntMin = delta }
             if delta > diagSrcIntMax { diagSrcIntMax = delta }
         }
@@ -1570,6 +1571,15 @@ public final class AppState {
         }
         func median(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
         var candidate = median(deltas)
+        // 버스트 감지 — 중앙값의 절반 미만 델타(압축 배달의 짧은 쪽)가 반복되면 접기가
+        // 오답: 짧은 델타는 k==0으로 버려지고 긴 델타(58ms)가 주기로 오인된다(8/58ms를
+        // 58 주기로 락, 리뷰 지적). 버스트의 각 델타는 드랍이 아니라 '한 콘텐츠 슬롯의
+        // 압축 배달'이므로 도착률 평균(시간폭/개수)이 진짜 케이던스(33ms)다.
+        let shortCount = deltas.filter { $0 < candidate * 0.5 }.count
+        if shortCount >= 2 {
+            let span = deltas.reduce(0, +)
+            candidate = span / Double(deltas.count)
+        } else {
         for _ in 0..<2 {   // 배수 접기 정련: 각 델타를 최근접 정수배로 나눠 기본 주기 후보로 환원
             let folded = deltas.compactMap { d -> Double? in
                 let k = (d / candidate).rounded()
@@ -1585,7 +1595,9 @@ public final class AppState {
             let k = (d / candidate).rounded()
             if k >= 1 { slotCount += k; slotSpan += d }
         }
-        let interval = slotCount >= 3 ? slotSpan / slotCount : candidate
+        if slotCount >= 3 { candidate = slotSpan / slotCount }
+        }
+        let interval = candidate
         guard interval > 0.002 else {
             snappedLastTimestamp = max(raw, snappedLastTimestamp + 0.001)
             return snappedLastTimestamp
@@ -1619,7 +1631,9 @@ public final class AppState {
             predicted += err * 0.08 // 실클럭 드리프트 추적 (천천히)
             let snapped = max(predicted, snappedLastTimestamp + 0.001)
             snappedLastTimestamp = snapped
-            snapAnchor = snapped
+            // 앵커는 클램프 미반영 예측값 — 이탈 통과(raw) 직후 예측이 단조 클램프에 걸리면
+            // 클램프값을 원점 삼는 순간 격자가 last+1ms 지점으로 끌려가 간격이 요동한다 (리뷰 지적).
+            snapAnchor = predicted
             return snapped
         }
 

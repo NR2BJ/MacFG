@@ -194,6 +194,11 @@ public final class AppState {
     var virtualFullscreenActive = false
     @ObservationIgnored private var vfsOriginalFrame: CGRect?      // 소스 원위치(CG) 복원용
     @ObservationIgnored private var vfsWasCover = false            // 진입 전 배치 복원용
+
+    // 전체화면 자동 뷰어: 소스가 전체화면이면 Cover→Viewer 자동(수동 토글 불필요), 창 복귀 시 원복.
+    @ObservationIgnored private var autoFsViewer = false
+    @ObservationIgnored private var fsSample = false
+    @ObservationIgnored private var fsStableCount = 0
     /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
     /// 설정되면 resize-reconfigure를 끈다(영역이 창-리사이즈 재구성으로 날아가지 않게).
     @ObservationIgnored nonisolated(unsafe) var captureRegion: CGRect?
@@ -646,6 +651,9 @@ public final class AppState {
                                 self.resizeMismatchCount = 0
                             }
                         }
+                        // 전체화면 자동 뷰어(사용자 요청): 소스가 전체화면이면 Cover→Viewer 자동 전환
+                        // (Cover는 소스 전체화면 못 덮어 glass=0; 뷰어=자기 창은 정상 합성). 창 복귀 시 원복.
+                        self.detectFullscreenAutoViewer()
                     }
                 }
             }
@@ -1876,6 +1884,29 @@ public final class AppState {
         overlayUserHidden = false
         overlayHiddenState = false
         refreshOverlayVisibility()
+    }
+
+    /// 전체화면 자동 뷰어 — 트래킹 0.5s 폴에서 호출. 2회 연속(=1s) 안정 시에만 1회 전환
+    /// (전체화면 전환 애니메이션 중 떨림/썰기 방지). 업스케일로 이미 viewer면 무관.
+    private func detectFullscreenAutoViewer() {
+        guard isCapturing, !retargetInFlight, !virtualFullscreenActive, captureRegion == nil,
+              let om = overlayManager else { return }
+        let isFS = om.sourceIsFullscreen
+        if isFS == fsSample { fsStableCount += 1 } else { fsSample = isFS; fsStableCount = 0 }
+        guard fsStableCount == 2 else { return }
+        if isFS {
+            guard selectedOverlayPlacement == .coverSource else { return }
+            autoFsViewer = true
+            selectedOverlayPlacement = .viewerWindow
+            updateOverlayPlacement()
+            DiagnosticLog.shared.log("[AUTOFS] 소스 전체화면 → viewer 자동 전환")
+        } else {
+            guard autoFsViewer else { return }
+            autoFsViewer = false
+            selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
+            updateOverlayPlacement()
+            DiagnosticLog.shared.log("[AUTOFS] 소스 창 복귀 → \(selectedOverlayPlacement == .coverSource ? "cover" : "viewer") 원복")
+        }
     }
 
     // MARK: - 가상 전체화면 (U4)

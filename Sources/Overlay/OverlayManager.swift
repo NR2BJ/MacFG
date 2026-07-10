@@ -58,6 +58,14 @@ public final class OverlayManager {
         NSScreen.screens.first { $0.frame.contains(CGPoint(x: lastSourceFrame.midX, y: lastSourceFrame.midY)) }
     }
 
+    /// 소스 창이 자기 화면을 거의(≥95%) 채우면 true — 전체화면 자동 뷰어 전환 판정용.
+    /// Cover는 소스 전체화면을 못 덮으므로(glass=0), 전체화면이면 뷰어(자기 창)로 가야 합성된다.
+    public var sourceIsFullscreen: Bool {
+        guard lastSourceFrame.width > 1, let scr = sourceScreen else { return false }
+        return lastSourceFrame.width >= scr.frame.width * 0.95
+            && lastSourceFrame.height >= scr.frame.height * 0.95
+    }
+
     /// 소스 창의 글로벌 CG frame (원위치 복원용) / AX 이동 (가상 디스플레이로)
     public func sourceCGFrame() -> CGRect? { windowTracker.currentCGFrame() }
     @discardableResult

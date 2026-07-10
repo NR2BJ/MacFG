@@ -1319,8 +1319,11 @@ public final class AppState {
         if wantInterpolation, let prev = prevStable {
             let gap = snappedTs - prev.timestamp
             let displayInterval = 1.0 / max(refreshRate, 30)
-            // 콘텐츠가 주사율에 근접하면 보간 무의미 (갭에 표시 슬롯이 없음)
-            let contentAlreadyFast = gap < displayInterval * 0.75
+            // 갭이 디스플레이 한 프레임보다 작으면 그 사이에 표시 슬롯이 없어 보간 무의미 —
+            // 게다가 브라우저 버스트 배달(30fps인데 2프레임이 7ms로 붙어 옴)에서 이 퇴화 쌍을
+            // 억지로 보간하면 ANE 과부하로 engFail·아티팩트가 난다(실측). 슬롯 없는 갭은 스킵해도
+            // 구멍이 안 생기므로(보여줄 자리가 없음) 문턱을 한 프레임으로 올려 버스트를 걸러낸다.
+            let contentAlreadyFast = gap < displayInterval
             if gap > 0 && gap < 0.25 && !contentAlreadyFast
                 && prev.texture.width == stable.width && prev.texture.height == stable.height
                 && previousAcceptedTs == prev.rawTimestamp {

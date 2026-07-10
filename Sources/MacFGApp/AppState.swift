@@ -187,6 +187,13 @@ public final class AppState {
     private var originalCaptureWindowID: CGWindowID = 0
     private var currentTargetWindowID: CGWindowID = 0
     private var retargetInFlight = false
+
+    // U4 가상 전체화면: 소스를 가상 디스플레이(진짜 해상도로 렌더)로 옮기고
+    // 실제 모니터엔 보간 뷰어를 전체화면으로 — 단일 모니터 무손실 전체화면.
+    @ObservationIgnored private var virtualDisplay: VirtualDisplayManager?
+    var virtualFullscreenActive = false
+    @ObservationIgnored private var vfsOriginalFrame: CGRect?      // 소스 원위치(CG) 복원용
+    @ObservationIgnored private var vfsWasCover = false            // 진입 전 배치 복원용
     /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
     /// 설정되면 resize-reconfigure를 끈다(영역이 창-리사이즈 재구성으로 날아가지 않게).
     @ObservationIgnored nonisolated(unsafe) var captureRegion: CGRect?
@@ -651,6 +658,13 @@ public final class AppState {
             overlayUserHidden = false
             overlayHiddenState = false
             isCapturing = true
+            // U4 무인 E2E: 캡처 안착 후 가상 전체화면 자동 진입
+            if ProcessInfo.processInfo.environment["MACFG_AUTOVIRTUAL"] != nil {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(3))
+                    await self?.enterVirtualFullscreen()
+                }
+            }
             // 소스 앱을 최전면으로 활성화 — cover/viewer 공통.
             // 첫 캡처는 보통 MacFG 창이 최전면인 상태(옵션 설정 후 핫키/버튼)라, 소스(브라우저)가
             // 백그라운드로 밀려 렌더 품질이 떨어진다(브라우저 백그라운드 스로틀 — 첫 캡처만 저화질,
@@ -676,6 +690,9 @@ public final class AppState {
     }
 
     func stopCapture() async {
+        // 가상 전체화면 중 정지 — 소스 창 원위치 복원 + 가상 디스플레이 해제가 먼저
+        // (캡처/추적이 살아있어야 AX 이동이 가능)
+        if virtualFullscreenActive { await exitVirtualFullscreen() }
         renderDriver.detach()   // 동기 — 반환 후 렌더 틱 없음 보장
         renderSurface = nil
 
@@ -1861,6 +1878,69 @@ public final class AppState {
         refreshOverlayVisibility()
     }
 
+    // MARK: - 가상 전체화면 (U4)
+
+    func toggleVirtualFullscreen() {
+        Task { @MainActor in
+            if virtualFullscreenActive { await exitVirtualFullscreen() }
+            else { await enterVirtualFullscreen() }
+        }
+    }
+
+    /// 소스 창을 가상 디스플레이(실화면과 같은 픽셀 해상도)로 옮기고, 뷰어를 실화면에 전체화면 고정.
+    /// 소스는 가상 화면에서 '보이는 전면 창'이라 풀레이트로 렌더(스로틀 없음, 스파이크 실측),
+    /// 사용자는 뷰어의 보간 출력을 보며 기존 상대커서 포워딩으로 소스를 조작한다.
+    @MainActor func enterVirtualFullscreen() async {
+        guard isCapturing, !virtualFullscreenActive, let om = overlayManager else { return }
+        // 1) 실제 화면·원위치 기억 (해제 시 복원)
+        let realScreen = om.sourceScreen ?? NSScreen.main
+        vfsOriginalFrame = om.sourceCGFrame()
+        // 2) 실화면과 같은 픽셀 해상도의 가상 디스플레이 생성 (콘텐츠가 실화면 그대로 1:1 렌더)
+        let scale = realScreen?.backingScaleFactor ?? 1.0
+        let pxW = Int((realScreen?.frame.width ?? 3840) * scale)
+        let pxH = Int((realScreen?.frame.height ?? 2160) * scale)
+        let vd = VirtualDisplayManager()
+        guard await vd.create(pixelsWide: pxW, pixelsHigh: pxH) else {
+            DiagnosticLog.shared.log("[VFS] 진입 실패 — 가상 디스플레이 생성 불가")
+            return
+        }
+        virtualDisplay = vd
+        // 3) 소스 창을 가상 디스플레이로 이동 + 가득 채움 (리사이즈 머신이 캡처를 무중단 재구성)
+        if !om.moveSourceWindow(toCGFrame: vd.cgBounds) {
+            DiagnosticLog.shared.log("[VFS] 소스 창 이동 실패 (AX trusted=\(AXIsProcessTrusted()) method=\(om.trackingMethod)) — 롤백")
+            vd.destroy(); virtualDisplay = nil
+            return
+        }
+        // 4) 뷰어를 실화면에 고정하고 배치를 뷰어로 (Cover는 소스를 따라가 가상에 숨어버림)
+        om.pinnedViewerScreen = realScreen
+        vfsWasCover = selectedOverlayPlacement == .coverSource
+        selectedOverlayPlacement = .viewerWindow
+        updateOverlayPlacement()
+        virtualFullscreenActive = true
+        DiagnosticLog.shared.log("[VFS] 진입 — 소스→가상(id=\(vd.displayID) \(pxW)x\(pxH)), 뷰어=실화면 고정")
+    }
+
+    /// 소스 창 원위치 복원 + 가상 디스플레이 해제 (+재타깃 중이면 원 창 복귀)
+    @MainActor func exitVirtualFullscreen() async {
+        guard let vd = virtualDisplay else { return }
+        if currentTargetWindowID != originalCaptureWindowID {
+            try? await captureManager.updateTargetWindow(windowID: originalCaptureWindowID)
+            currentTargetWindowID = originalCaptureWindowID
+        }
+        if let f = vfsOriginalFrame { _ = overlayManager?.moveSourceWindow(toCGFrame: f) }
+        vfsOriginalFrame = nil
+        overlayManager?.pinnedViewerScreen = nil
+        vd.destroy()
+        virtualDisplay = nil
+        virtualFullscreenActive = false
+        if vfsWasCover {
+            vfsWasCover = false
+            selectedOverlayPlacement = .coverSource
+            if isCapturing { updateOverlayPlacement() }
+        }
+        DiagnosticLog.shared.log("[VFS] 해제 — 소스 원위치 복원")
+    }
+
     // MARK: - Overlay Visibility / Hotkeys
 
     private func ownerPID(of windowID: CGWindowID) -> pid_t {
@@ -1903,22 +1983,27 @@ public final class AppState {
     /// 전체화면이 새 창을 만들어 원 창엔 검정+썸네일만 남는 문제 대응. statsTimer(0.5s)에서 호출.
     /// MACFG_NO_RETARGET로 비활성. 영역캡처 중엔 비활성(크롭이 원 창 기준이라).
     private func detectFullscreenRetarget() {
-        // 기본 OFF — 오탐(PiP/전체화면 잔재 창을 잡아 정상 캡처를 깨뜨림) 회귀 확인되어 옵트인으로.
-        // 단일 모니터 전체화면 문제도 못 풀면서 정상 사용만 망가뜨려, MACFG_RETARGET=1일 때만 동작.
-        guard ProcessInfo.processInfo.environment["MACFG_RETARGET"] != nil,
+        // 가상 전체화면(U4) 중에만 동작 — 가상 디스플레이 위에서 소스 앱이 만든 전체화면 창
+        // (f키 플레이어 전체화면)을 추적. 후보를 가상 디스플레이 bounds로 한정해 일반 사용에서의
+        // 오탐(PiP/잔재 창 — 실사용 회귀 이력)을 구조적으로 배제. MACFG_RETARGET=1은 전 화면 강제.
+        let envForce = ProcessInfo.processInfo.environment["MACFG_RETARGET"] != nil
+        guard virtualFullscreenActive || envForce,
               isCapturing, !retargetInFlight, captureRegion == nil,
               sourceOwnerPID > 0, originalCaptureWindowID > 0 else { return }
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return }
-        let screens = NSScreen.screens.map(\.frame)
+        let regions: [CGRect] = {
+            if let vd = virtualDisplay, vd.isActive { return [vd.cgBounds] }   // 가상만
+            return NSScreen.screens.map(\.frame)                               // env 강제 시 전 화면
+        }()
         var fullscreenWID: CGWindowID = 0
         for info in list {
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == sourceOwnerPID,
                   let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
                   let wid = info[kCGWindowNumber as String] as? CGWindowID, wid != originalCaptureWindowID,
                   let b = info[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
-            let ww = b["Width"] ?? 0, wh = b["Height"] ?? 0
-            if screens.contains(where: { ww >= $0.width * 0.92 && wh >= $0.height * 0.92 }) {
+            let wf = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
+            if regions.contains(where: { wf.width >= $0.width * 0.92 && wf.height >= $0.height * 0.92 && $0.contains(CGPoint(x: wf.midX, y: wf.midY)) }) {
                 fullscreenWID = wid; break
             }
         }

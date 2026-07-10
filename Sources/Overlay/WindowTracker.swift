@@ -316,6 +316,32 @@ public final class WindowTracker {
         return AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, value) == .success
     }
 
+    /// 추적 창을 글로벌 CG 좌표 frame으로 이동+리사이즈 (가상 전체화면용 — 가상 디스플레이도
+    /// 유효한 화면이므로 clamp 없이 그대로 세팅). 위치를 먼저, 크기를 나중에 (resize와 동일 순서).
+    @discardableResult
+    public func moveTrackedWindow(toCGFrame f: CGRect) -> Bool {
+        guard let element = axElement else {
+            logger.warning("moveTrackedWindow: axElement 없음 (method=\(self.trackingMethod.rawValue))")
+            return false
+        }
+        var pos = f.origin
+        guard let posVal = AXValueCreate(.cgPoint, &pos) else { return false }
+        let posErr = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+        var sz = f.size
+        guard let szVal = AXValueCreate(.cgSize, &sz) else { return false }
+        let szErr = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, szVal)
+        if posErr != .success || szErr != .success {
+            logger.warning("moveTrackedWindow 실패: pos=\(posErr.rawValue) size=\(szErr.rawValue)")
+        }
+        return posErr == .success && szErr == .success
+    }
+
+    /// 추적 창의 현재 글로벌 CG frame (가상 전체화면 원위치 복원용)
+    public func currentCGFrame() -> CGRect? {
+        guard let geom = pollGeometry() else { return nil }
+        return CGRect(origin: geom.origin, size: geom.size)
+    }
+
     /// 목표 크기로 리사이즈 시 화면(visibleFrame) 밖으로 넘치면 안쪽으로 당긴 새 origin(CG 좌상단).
     /// 이동이 불필요하면 nil. AX 위치/CGWindow bounds와 동일한 CG 좌표계로 계산.
     private func clampedOriginForResize(element: AXUIElement, newSize: CGSize) -> CGPoint? {

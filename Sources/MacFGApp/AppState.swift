@@ -601,6 +601,11 @@ public final class AppState {
             await configurePairEngine()
             mirrorInterpolationEnabled = isInterpolationEnabled
             mirrorFrameMultiplier = frameMultiplier
+            // 최초 시작: 엔진 준비(수백 ms) 동안 SCK가 쌓은 백로그를 폐기하고 스케줄러를
+            // 워밍업 포함 깨끗한 상태로 리셋 — 안 하면 첫 틱이 오래된 프레임을 버스트로
+            // 먹고 그 miss로 적응 지연이 +4까지 불필요하게 램프 (리뷰 지적, 로그 확인).
+            _ = captureManager.drainFrames()
+            resetScheduler()
             pendingShowReset = false
             attachRenderDriver()
 
@@ -883,6 +888,12 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var snapTsRing: [CFTimeInterval] = []
     @ObservationIgnored nonisolated(unsafe) private var snapMissStreak = 0
     @ObservationIgnored nonisolated(unsafe) private var snappedLastTimestamp: CFTimeInterval = 0
+    /// 격자 원점 — snappedLastTimestamp(반환값, 단조증가)와 분리. 이탈 프레임은 raw로
+    /// 통과시키되 원점은 3연속 이탈(진짜 불연속)에만 이동 — 버스트 한두 방에 원점이
+    /// 끌려가면 이후 모든 예측이 어긋나 srcInt가 60↔10ms로 뒤집힌다 (리뷰 지적, 실측 일치).
+    @ObservationIgnored nonisolated(unsafe) private var snapAnchor: CFTimeInterval = 0
+    /// interval 히스테리시스 — 락 대비 ±25% 넘는 추정치의 연속 지속 카운트
+    @ObservationIgnored nonisolated(unsafe) private var snapIntervalDeviateStreak = 0
     @ObservationIgnored nonisolated(unsafe) private var diagResyncCount = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTimestamp: CFTimeInterval = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTexture: (any MTLTexture)?
@@ -1541,6 +1552,7 @@ public final class AppState {
         guard snapTsRing.count >= 5, snappedLastTimestamp > 0 else {
             snapMissStreak = 0
             snappedLastTimestamp = raw
+            snapAnchor = raw
             return raw
         }
         // 기본 주기(fundamental) 추정 — 시간폭/프레임수(평균 도착률)는 중복/드랍 갭(2×주기)이
@@ -1578,24 +1590,44 @@ public final class AppState {
             snappedLastTimestamp = max(raw, snappedLastTimestamp + 0.001)
             return snappedLastTimestamp
         }
-        sourceIntervalEMA = interval
+        // interval 히스테리시스 — 버스트가 링을 오염시키면 추정 주기가 뒤집혀(60↔10ms 실측)
+        // latencyOffset·생성 t 개수가 함께 출렁인다. 락 대비 ±25% 넘는 변화는 3윈도 연속
+        // 지속(진짜 케이던스 변화)일 때만 채택, 순간 오염은 락 유지. 작은 변화는 천천히 블렌드.
+        if sourceIntervalEMA > 0, abs(interval - sourceIntervalEMA) > sourceIntervalEMA * 0.25 {
+            snapIntervalDeviateStreak += 1
+            if snapIntervalDeviateStreak >= 3 {
+                snapIntervalDeviateStreak = 0
+                sourceIntervalEMA = interval
+            }
+        } else {
+            snapIntervalDeviateStreak = 0
+            sourceIntervalEMA = sourceIntervalEMA > 0
+                ? sourceIntervalEMA + (interval - sourceIntervalEMA) * 0.2
+                : interval
+        }
+        let usedInterval = sourceIntervalEMA
 
-        let steps = max(1.0, (rawDelta / interval).rounded())
-        var predicted = snappedLastTimestamp + steps * interval
+        // 예측은 앵커(격자 원점) 기준 정수 스텝 투영 — 성공 시 앵커=스냅이라 깨끗한
+        // 경로는 기존 rawDelta 방식과 동일, 이탈 후에는 보호된 원점에서 다시 투영.
+        if snapAnchor <= 0 { snapAnchor = snappedLastTimestamp }
+        let steps = max(1.0, ((raw - snapAnchor) / usedInterval).rounded())
+        var predicted = snapAnchor + steps * usedInterval
         let err = raw - predicted
 
-        if abs(err) <= interval * 0.6 {
+        if abs(err) <= usedInterval * 0.6 {
             snapMissStreak = 0
             predicted += err * 0.08 // 실클럭 드리프트 추적 (천천히)
             let snapped = max(predicted, snappedLastTimestamp + 0.001)
             snappedLastTimestamp = snapped
+            snapAnchor = snapped
             return snapped
         }
 
-        // 이탈 — 이 프레임은 raw로 통과, 3연속이면 재동기
+        // 이탈 — 이 프레임은 raw로 통과. 앵커는 보호, 3연속(진짜 불연속)만 재동기.
         snapMissStreak += 1
         if snapMissStreak >= 3 || rawDelta > 0.5 {
             snapMissStreak = 0
+            snapAnchor = raw
             diagResyncCount += 1
         }
         let snapped = max(raw, snappedLastTimestamp + 0.001)
@@ -1607,6 +1639,8 @@ public final class AppState {
         snapTsRing = []
         snapMissStreak = 0
         snappedLastTimestamp = 0
+        snapAnchor = 0
+        snapIntervalDeviateStreak = 0
     }
 
     /// 사용 중이지 않은 풀 텍스처 획득 (타임라인/직전 소스/마지막 표시/인플라이트 제외)

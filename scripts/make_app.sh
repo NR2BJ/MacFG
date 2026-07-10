@@ -30,7 +30,7 @@ cp "$ROOT/.build/release/MacFGApp" "$APP/Contents/MacOS/MacFG"
 cp "$ICON_TMP/MacFG.icns" "$APP/Contents/Resources/"
 
 echo "── 신경망(RIFE) 모델 컴파일·번들"
-for m in 288 360 432; do
+for m in 288 360 432 540; do
   if [ -d "$ROOT/Models/rife$m.mlpackage" ]; then
     xcrun coremlcompiler compile "$ROOT/Models/rife$m.mlpackage" "$APP/Contents/Resources/" > /dev/null
     echo "   rife$m.mlmodelc"

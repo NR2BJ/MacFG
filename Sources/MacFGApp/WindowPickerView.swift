@@ -166,21 +166,6 @@ struct WindowPickerView: View {
                         .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
                 }
 
-                if appState.isCapturing {
-                    field(L("Virtual fullscreen", "가상 전체화면", "仮想フルスクリーン"),
-                          hint: L("Fullscreen quality on one monitor — source renders on a hidden display.",
-                                  "모니터 하나로 전체화면 화질 — 소스를 숨은 화면에서 렌더.",
-                                  "1台でフルスクリーン画質 — ソースを隠しディスプレイで描画。"),
-                          detail: L("Moves the source window to an invisible virtual display at your monitor's full resolution (it keeps rendering at full rate there), and shows the interpolated output fullscreen on your real monitor. Interact with the source through the viewer (clicks are forwarded) — e.g. press the player's fullscreen button. Toggle off to bring the window back.",
-                                    "소스 창을 모니터와 같은 해상도의 보이지 않는 가상 디스플레이로 옮기고(거기서 풀레이트로 계속 렌더), 실제 모니터엔 보간 출력을 전체화면으로 띄웁니다. 조작은 뷰어를 통해(클릭 전달) — 예: 플레이어의 전체화면 버튼 누르기. 끄면 창이 제자리로 돌아옵니다.",
-                                    "ソースウィンドウをモニタと同解像度の不可視仮想ディスプレイへ移し(そこでフルレート描画継続)、実モニタには補間出力をフルスクリーン表示。操作はビューアー経由(クリック転送) — 例: プレイヤーのフルスクリーンボタン。オフで元の位置に戻ります。")) {
-                        Toggle(L("Enable", "켜기", "有効"),
-                               isOn: Binding(get: { appState.virtualFullscreenActive },
-                                             set: { _ in appState.toggleVirtualFullscreen() }))
-                            .toggleStyle(.switch).labelsHidden()
-                    }
-                }
-
                 field(L("Keep overlay while multitasking", "멀티태스킹 중 오버레이 유지", "マルチタスク中もオーバーレイ維持"),
                       hint: L("Cover mode: don't hide when you click another app.",
                               "Cover 모드: 다른 앱을 클릭해도 숨기지 않음.",

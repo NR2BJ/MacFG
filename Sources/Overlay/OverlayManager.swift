@@ -49,11 +49,7 @@ public final class OverlayManager {
         return (Int(lastSourceFrame.width * scale), Int(lastSourceFrame.height * scale))
     }
 
-    /// 가상 전체화면(U4): 뷰어를 이 화면에 고정 (nil=기본 — 소스 창의 화면을 따라감).
-    /// 소스가 가상 디스플레이로 이동해도 뷰어는 사용자의 실제 모니터에 남게 한다.
-    public var pinnedViewerScreen: NSScreen?
-
-    /// 소스 창이 현재 위치한 화면 (가상 전체화면 진입 시 '실제 화면' 기억용)
+    /// 소스 창이 현재 위치한 화면 (전체화면 자동 뷰어 판정용)
     public var sourceScreen: NSScreen? {
         NSScreen.screens.first { $0.frame.contains(CGPoint(x: lastSourceFrame.midX, y: lastSourceFrame.midY)) }
     }
@@ -65,11 +61,6 @@ public final class OverlayManager {
         return lastSourceFrame.width >= scr.frame.width * 0.95
             && lastSourceFrame.height >= scr.frame.height * 0.95
     }
-
-    /// 소스 창의 글로벌 CG frame (원위치 복원용) / AX 이동 (가상 디스플레이로)
-    public func sourceCGFrame() -> CGRect? { windowTracker.currentCGFrame() }
-    @discardableResult
-    public func moveSourceWindow(toCGFrame f: CGRect) -> Bool { windowTracker.moveTrackedWindow(toCGFrame: f) }
 
     /// 뷰어 창을 사용자가 닫았을 때 (캡처 정지 트리거)
     public var onViewerClosed: (() -> Void)?
@@ -268,8 +259,6 @@ public final class OverlayManager {
     /// visibleFrame이 아니라 frame이라 Dock/메뉴바 영역까지 채우고, 창은 shielding 레벨로 그 위에 뜬다.
     /// 영상은 뷰어 안에서 종횡비 유지 레터박스로 표시됨.
     private func initialViewerFrame(sourceFrame: CGRect) -> CGRect {
-        // 가상 전체화면: 소스는 가상 디스플레이에 있으므로 뷰어는 고정된 실제 화면으로
-        if let pinned = pinnedViewerScreen { return pinned.frame }
         let screens = NSScreen.screens
         let sourceScreen = screens.first(where: { $0.frame.contains(CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)) })
             ?? NSScreen.main

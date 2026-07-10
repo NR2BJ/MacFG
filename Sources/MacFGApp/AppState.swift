@@ -1969,28 +1969,27 @@ public final class AppState {
         }
     }
 
-    /// 현재 최전면 앱의 '가장 큰' 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
-    /// 첫 창이 아니라 최대 면적 창을 고른다 — 브라우저 전체화면 상태에선 앞쪽에 3840×68 같은
-    /// 잔재 띠 창이 있어 그걸 잡으면 "작은 화면+검정" 캡처가 된다(실사용 보고).
+    /// 현재 최전면 앱의 '가장 위(z-order)' 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
+    /// 목록은 앞→뒤 순서라 첫 유효 창 = 최상단. PiP는 항상-위 창이라 최대화 브라우저보다 위에
+    /// 있어 자동으로 잡힌다(사용자는 브라우저 최대화 + PiP 1080 병행). '가장 큰 창'으로 하면
+    /// 최대화 브라우저를 잡아 PiP를 놓쳤다(실사용 보고). 전체화면 잔재 띠(3840×68 등)는 종횡비·
+    /// 높이로 걸러 "작은 화면+검정" 캡처를 막는다.
     private func frontmostWindow() -> (id: CGWindowID, name: String)? {
         guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
-        var best: (id: CGWindowID, name: String, area: CGFloat)?
         for info in list {
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == frontPID,
                   let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
                   let owner = info[kCGWindowOwnerName as String] as? String, !Self.systemOwners.contains(owner),
                   let wid = info[kCGWindowNumber as String] as? CGWindowID,
                   let b = info[kCGWindowBounds as String] as? [String: CGFloat],
-                  let ww = b["Width"], let wh = b["Height"], ww > 50, wh > 50 else { continue }
+                  let ww = b["Width"], let wh = b["Height"],
+                  ww > 50, wh > 120, max(ww, wh) / min(ww, wh) < 8 else { continue }   // 잔재 띠 배제
             let name = info[kCGWindowName as String] as? String ?? ""
-            let area = ww * wh
-            if area > (best?.area ?? 0) {
-                best = (wid, name.isEmpty ? owner : "\(owner) — \(name)", area)
-            }
+            return (wid, name.isEmpty ? owner : "\(owner) — \(name)")
         }
-        return best.map { ($0.id, $0.name) }
+        return nil
     }
 
     /// ⌃⌥⌘U / 버튼: 포커스 창 캡처 토글 — 설정(배치/엔진/업스케일)은 앱에서 미리 정한 대로.

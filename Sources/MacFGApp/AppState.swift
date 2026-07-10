@@ -1891,10 +1891,22 @@ public final class AppState {
     /// 소스는 가상 화면에서 '보이는 전면 창'이라 풀레이트로 렌더(스로틀 없음, 스파이크 실측),
     /// 사용자는 뷰어의 보간 출력을 보며 기존 상대커서 포워딩으로 소스를 조작한다.
     @MainActor func enterVirtualFullscreen() async {
-        guard isCapturing, !virtualFullscreenActive, let om = overlayManager else { return }
+        guard isCapturing, !virtualFullscreenActive, let om = overlayManager else {
+            DiagnosticLog.shared.log("[VFS] 진입 불가 — capturing=\(isCapturing) active=\(virtualFullscreenActive)")
+            return
+        }
         // 1) 실제 화면·원위치 기억 (해제 시 복원)
         let realScreen = om.sourceScreen ?? NSScreen.main
         vfsOriginalFrame = om.sourceCGFrame()
+        // 소스가 이미 네이티브 전체화면(별도 Space)이거나 비정상(잔재 띠)이면 AX 이동이 안 됨 —
+        // 명확히 안내하고 중단 (올바른 흐름: 창 모드 브라우저 → 캡처 → 이 토글 → 뷰어에서 플레이어 전체화면)
+        if let f = vfsOriginalFrame {
+            let coversReal = NSScreen.screens.contains { abs(f.width - $0.frame.width) < 4 && abs(f.height - $0.frame.height) < 4 }
+            if coversReal || f.height < 200 {
+                DiagnosticLog.shared.log("[VFS] 진입 거부 — 소스 창이 전체화면/비정상(\(Int(f.width))x\(Int(f.height))). 브라우저 전체화면을 해제하고 창 모드에서 켜세요.")
+                return
+            }
+        }
         // 2) 실화면과 같은 픽셀 해상도의 가상 디스플레이 생성 (콘텐츠가 실화면 그대로 1:1 렌더)
         let scale = realScreen?.backingScaleFactor ?? 1.0
         let pxW = Int((realScreen?.frame.width ?? 3840) * scale)
@@ -2023,23 +2035,28 @@ public final class AppState {
         }
     }
 
-    /// 현재 최전면 앱의 최상단 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
+    /// 현재 최전면 앱의 '가장 큰' 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
+    /// 첫 창이 아니라 최대 면적 창을 고른다 — 브라우저 전체화면 상태에선 앞쪽에 3840×68 같은
+    /// 잔재 띠 창이 있어 그걸 잡으면 "작은 화면+검정" 캡처가 된다(실사용 보고).
     private func frontmostWindow() -> (id: CGWindowID, name: String)? {
         guard let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
-        // 목록은 앞→뒤 순서 — frontmost 앱의 첫 유효 창을 고른다
+        var best: (id: CGWindowID, name: String, area: CGFloat)?
         for info in list {
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == frontPID,
                   let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
                   let owner = info[kCGWindowOwnerName as String] as? String, !Self.systemOwners.contains(owner),
                   let wid = info[kCGWindowNumber as String] as? CGWindowID,
                   let b = info[kCGWindowBounds as String] as? [String: CGFloat],
-                  (b["Width"] ?? 0) > 50, (b["Height"] ?? 0) > 50 else { continue }
+                  let ww = b["Width"], let wh = b["Height"], ww > 50, wh > 50 else { continue }
             let name = info[kCGWindowName as String] as? String ?? ""
-            return (wid, name.isEmpty ? owner : "\(owner) — \(name)")
+            let area = ww * wh
+            if area > (best?.area ?? 0) {
+                best = (wid, name.isEmpty ? owner : "\(owner) — \(name)", area)
+            }
         }
-        return nil
+        return best.map { ($0.id, $0.name) }
     }
 
     /// ⌃⌥⌘U / 버튼: 포커스 창 캡처 토글 — 설정(배치/엔진/업스케일)은 앱에서 미리 정한 대로.

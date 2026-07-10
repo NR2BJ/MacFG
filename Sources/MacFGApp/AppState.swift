@@ -1782,6 +1782,7 @@ public final class AppState {
         var lines = ["MacFG"]
         lines.append(L("Source", "소스", "ソース") + ": \(Int(inputFPS)) fps")
         lines.append(L("Output", "출력", "出力") + ": \(Int(outputFPS)) fps · \(engine)")
+        lines.append(L("Latency", "지연", "遅延") + ": \(Int(latencyMs)) ms")
         lines.append(L("Upscale", "업스케일", "アップスケール") + ": " + (upscaleStatus ?? L("Off", "끔", "オフ")))
         overlayManager?.setInfoOverlay(lines.joined(separator: "\n"))
     }

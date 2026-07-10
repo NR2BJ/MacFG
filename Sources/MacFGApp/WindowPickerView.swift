@@ -12,7 +12,6 @@ struct WindowPickerView: View {
                 statusCard
                 interpolationSection
                 upscalingSection
-                if appState.isCapturing { liveSection }
                 shortcutSection
                 appSection
             }
@@ -262,22 +261,6 @@ struct WindowPickerView: View {
                     }
                 }
             }
-        }
-    }
-
-    // MARK: - Live stats
-
-    // 값 텍스트 고정 폭 — 자릿수 변화(99→100)가 창 오토레이아웃 연쇄로 메인 스레드 블록하던 것 방지.
-    private var liveSection: some View {
-        section(L("Live", "실시간", "リアルタイム")) {
-            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
-                GridRow {
-                    Label(L("Latency", "지연", "遅延"), systemImage: "timer").foregroundStyle(.secondary).gridColumnAlignment(.leading)
-                    Text(String(format: "%.0f ms", appState.latencyMs))
-                        .fontWeight(.semibold).monospacedDigit().frame(width: 110, alignment: .leading)
-                }
-            }
-            .font(.callout)
         }
     }
 

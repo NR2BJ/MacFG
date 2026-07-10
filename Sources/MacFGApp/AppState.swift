@@ -965,8 +965,10 @@ public final class AppState {
         let slotMs = 1000.0 / refresh
         let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
         let baseMs = (interval * 1.25 + 0.004 + 0.5 / refresh) * 1000.0
+        // 적응 지연 상한 — 측정용 MACFG_MAXLAT로 낮춰 "지연↓ 드롭↑" 트레이드 확인 (기본 4).
+        let maxSlots = ProcessInfo.processInfo.environment["MACFG_MAXLAT"].flatMap { Double($0) } ?? 4.0
         let requiredExtra = paceWorkP90 > 0
-            ? min(4.0, max(0.0, ((paceWorkP90 + 2.0 - baseMs) / slotMs).rounded(.up)))
+            ? min(maxSlots, max(0.0, ((paceWorkP90 + 2.0 - baseMs) / slotMs).rounded(.up)))
             : 0.0
         if extraLatencySlots < requiredExtra {
             extraLatencySlots = requiredExtra
@@ -975,7 +977,7 @@ public final class AppState {
         }
         if paceMissCount >= 4 {
             paceCleanWindows = 0
-            if extraLatencySlots < 4 {
+            if extraLatencySlots < maxSlots {
                 extraLatencySlots += 1
                 DiagnosticLog.shared.log("[PACE] miss \(paceMissCount)/2s → 지연 +1슬롯 (extra=\(Int(extraLatencySlots)))")
             }

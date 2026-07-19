@@ -689,6 +689,11 @@ public final class AppState {
     }
 
     func stopCapture() async {
+        // 플래그를 await 이전에 먼저 내림 — 아래 stopCapture await 중 화면 파라미터 변경이
+        // handleScreenParametersChange(399행, isCapturing 가드)로 detach된 링크를 재부착해
+        // 좀비 렌더 루프를 만들던 것 차단 (리뷰 확정). 진행 중 configurePairEngine도 무효화.
+        isCapturing = false
+        configureEpoch += 1
         renderDriver.detach()   // 동기 — 반환 후 렌더 틱 없음 보장
         renderSurface = nil
 
@@ -707,7 +712,6 @@ public final class AppState {
         drawableReattachTimer = nil
         forceRepresentTicks = 0
 
-        isCapturing = false
         captureMethod = "None"
         trackingMethod = "None"
         sourceOwnerPID = 0
@@ -825,7 +829,12 @@ public final class AppState {
         lastVsyncTarget = 0
         sourceIntervalEMA = 0
         hasReceivedFirstFrame = false
+        // statsLock 규약(224행): presentedTimes는 렌더가 쓰고 메인(updateStats)이 읽음.
+        // 여기만 락 없이 재할당하면 메인의 스냅샷 read와 CoW 버퍼 해제가 겹쳐 UAF 가능 (리뷰 확정).
+        statsLock.lock()
         presentedTimes = []
+        latencySamplesMs = []
+        statsLock.unlock()
         // 적응 지연은 소스/세션 특성이므로 새 캡처에서 다시 학습
         extraLatencySlots = 0
         paceMissCount = 0
@@ -1571,14 +1580,29 @@ public final class AppState {
         }
         func median(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
         var candidate = median(deltas)
-        // 버스트 감지 — 중앙값의 절반 미만 델타(압축 배달의 짧은 쪽)가 반복되면 접기가
-        // 오답: 짧은 델타는 k==0으로 버려지고 긴 델타(58ms)가 주기로 오인된다(8/58ms를
-        // 58 주기로 락, 리뷰 지적). 버스트의 각 델타는 드랍이 아니라 '한 콘텐츠 슬롯의
-        // 압축 배달'이므로 도착률 평균(시간폭/개수)이 진짜 케이던스(33ms)다.
-        let shortCount = deltas.filter { $0 < candidate * 0.5 }.count
+        // 버스트 감지 — 짧은 델타(압축 배달)가 있으면 접기가 오답: k==0으로 버려지고 긴
+        // 델타가 주기로 오인된다(8/58ms를 58 주기로 락, 리뷰 지적). 기준은 도착률 평균 —
+        // 중앙값 기준이면 3장 이상 묶음(짧은 델타가 과반 → 중앙값 자체가 짧은 쪽)에서
+        // 미탐되어 EMA가 버스트 내부 간격(~7ms)으로 붕괴한다(리뷰 2차 지적). 평균은 묶음
+        // 크기와 무관하게 진짜 케이던스 근방이라 짧은/긴 구분 기준으로 안전하다.
+        // 드랍만 있는 소스(모든 델타 ≥ 기본주기 ≈ 0.8×평균)는 짧은 델타가 없어 미발동.
+        let arrivalMean = deltas.reduce(0, +) / Double(deltas.count)
+        let shortCount = deltas.filter { $0 < arrivalMean * 0.5 }.count
         if shortCount >= 2 {
-            let span = deltas.reduce(0, +)
-            candidate = span / Double(deltas.count)
+            // 버스트의 각 델타는 드랍이 아니라 '한 콘텐츠 슬롯의 압축 배달' — 도착률
+            // 평균(시간폭/개수)이 진짜 케이던스(33ms).
+            candidate = arrivalMean
+            // 드랍 혼입 가드 — 버스트 윈도에 드랍이 섞이면 평균이 과대추정된다(리뷰 지적:
+            // [7,93] 지속 = 33 소스인데 평균 50). 갭만으로는 슬롯 수를 셀 수 없으므로
+            // (버스트 압축이 갭 경계를 ±주기만큼 흔든다), 락된 주기의 정수비(×1.5/×2/×3)
+            // 근방이면 드랍으로 얇아진 윈도로 보고 락을 유지한다.
+            if sourceIntervalEMA > 0 {
+                let ratio = candidate / sourceIntervalEMA
+                for m in [1.5, 2.0, 3.0] where abs(ratio - m) < m * 0.12 {
+                    candidate = sourceIntervalEMA
+                    break
+                }
+            }
         } else {
         for _ in 0..<2 {   // 배수 접기 정련: 각 델타를 최근접 정수배로 나눠 기본 주기 후보로 환원
             let folded = deltas.compactMap { d -> Double? in
@@ -2199,7 +2223,15 @@ public final class AppState {
         }
     }
 
+    /// configurePairEngine 세대 — MainActor async라 prepare await 중 재진입이 교차하면
+    /// "늦게 끝난 쪽"이 무조건 이겨 UI 선택과 실제 엔진이 불일치하고 패자 엔진 shutdown이
+    /// 누락된다 (리뷰 확정: RIFE 로드 수백 ms 중 빠른 모드 재변경). await마다 세대 검사,
+    /// stopCapture도 +1로 진행 중 설치를 무효화.
+    private var configureEpoch = 0
+
     private func configurePairEngine() async {
+        configureEpoch += 1
+        let epoch = configureEpoch
         let old = pairEngine
         swapPairEngine(nil)          // 틱이 더는 old를 못 보게 먼저 떼어낸 뒤
         old?.shutdown()              // 안전하게 해체 (렌더 스레드는 이미 nil만 봄)
@@ -2213,6 +2245,7 @@ public final class AppState {
         if uiDetector == nil {
             let det = UIStaticDetector(device: device)
             try? await det.prepare()
+            guard epoch == configureEpoch else { return }   // 교차 진입 — 최신 호출이 이어감
             uiDetector = det
         }
         uiDetector?.reset()   // 새 캡처/엔진 전환 = 불연속 → 누적 리셋
@@ -2241,6 +2274,7 @@ public final class AppState {
 
         do {
             try await engine.prepare(device: device)
+            guard epoch == configureEpoch else { engine.shutdown(); return }
             swapPairEngine(engine)
             interpolationEngine = engine.name
             DiagnosticLog.shared.log("[ENGINE] ready: \(engine.name)")
@@ -2248,9 +2282,10 @@ public final class AppState {
             DiagnosticLog.shared.log("[ENGINE] \(engine.name) prepare FAILED: \(error) → Blend fallback")
             let fallback = LegacyPairEngine(BlendInterpolator())
             if (try? await fallback.prepare(device: device)) != nil {
+                guard epoch == configureEpoch else { fallback.shutdown(); return }
                 swapPairEngine(fallback)
                 interpolationEngine = fallback.name
-            } else {
+            } else if epoch == configureEpoch {
                 swapPairEngine(nil)
                 interpolationEngine = "Failed"
             }

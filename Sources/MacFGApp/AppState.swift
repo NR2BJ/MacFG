@@ -399,6 +399,7 @@ public final class AppState {
     private func handleScreenParametersChange() {
         guard isCapturing else { return }
         DiagnosticLog.shared.log("[DISPLAY] screen parameters changed → 렌더 링크 재부착")
+        overlayManager?.ensureViewerOnScreen()   // 디스플레이 분리/해상도 축소 시 화면 밖 잔류 방지
         attachRenderDriver()
     }
 
@@ -622,39 +623,7 @@ public final class AppState {
             // 움직였을 때 다음 조작 좌표가 어긋나지 않게 신선도가 필요 (2Hz는 0.5s 지연으로
             // 매핑이 헛돌았음). 렌더는 전용 스레드라 메인 CGWindowList 15Hz는 틱에 무해.
             let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
-            trackingTimer = addCommonTimer(1.0 / trackHz) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.overlayManager?.updateTracking()
-                    // 창 종료/리사이즈 감지 (렌더 틱에서 이관 — overlayManager는 MainActor)
-                    guard self.isCapturing else { return }
-                    if self.hasReceivedFirstFrame, (self.overlayManager?.trackingFailureCount ?? 0) > 30 {
-                        DiagnosticLog.shared.log("[CAPTURE] target window gone (tracking) → stop")
-                        await self.stopCapture()
-                        return
-                    }
-                    let nowT = CFAbsoluteTimeGetCurrent()
-                    if nowT - self.lastResizeCheck >= 0.5 {
-                        self.lastResizeCheck = nowT
-                        if !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
-                           let src = self.overlayManager?.sourcePixelSize {
-                            let mismatch = abs(src.width - self.stablePoolWidth) > 8 || abs(src.height - self.stablePoolHeight) > 8
-                            if mismatch {
-                                self.resizeMismatchCount += 1
-                                if self.resizeMismatchCount >= 2 {
-                                    self.resizeMismatchCount = 0
-                                    await self.resizeCaptureStream(width: src.width, height: src.height)
-                                }
-                            } else {
-                                self.resizeMismatchCount = 0
-                            }
-                        }
-                        // 전체화면 자동 뷰어(사용자 요청): 소스가 전체화면이면 Cover→Viewer 자동 전환
-                        // (Cover는 소스 전체화면 못 덮어 glass=0; 뷰어=자기 창은 정상 합성). 창 복귀 시 원복.
-                        self.detectFullscreenAutoViewer()
-                    }
-                }
-            }
+            trackingTimer = makeTrackingTimer(hz: trackHz)
 
             // 자동 숨김 기준용 소스 PID + 초기 표시 상태
             sourceOwnerPID = ownerPID(of: windowID)
@@ -683,8 +652,74 @@ public final class AppState {
                 }
             }
         } catch {
+            // 롤백 — 실패 지점이 어디든 이미 열린 자원을 되감는다. 안 하면 isCapturing=false인데
+            // SCK 스트림·오버레이·타이머는 계속 도는 유령 상태가 되고, 재시도 시 옛 스트림과
+            // 새 스트림이 이중으로 프레임을 공급한다 (리뷰 확정).
             logger.error("Failed to start capture: \(error)")
+            DiagnosticLog.shared.log("[CAPTURE] start failed → rollback: \(error)")
+            configureEpoch += 1              // 진행 중 엔진 준비 무효화
+            renderDriver.detach()
+            renderSurface = nil
+            await captureManager.stopCapture()
+            overlayManager?.stop()
+            pairEngine?.shutdown()
+            pairEngine = nil
+            interpolationEngine = "None"
+            statsTimer?.invalidate();          statsTimer = nil
+            trackingTimer?.invalidate();       trackingTimer = nil
+            drawableReattachTimer?.invalidate(); drawableReattachTimer = nil
+            isCapturing = false
+            captureMethod = "None"
+            trackingMethod = "None"
+            sourceOwnerPID = 0
             return
+        }
+    }
+
+    /// 창 추적 타이머 (재)생성 — 주기가 배치에 의존하므로 캡처 중 배치가 바뀌면 다시 만들어야
+    /// 한다. 안 하면 시작 시점 배치의 주기(cover 30Hz / 뷰어 15Hz)에 영구 고정 (리뷰 확정).
+    private func restartTrackingTimer() {
+        guard isCapturing else { return }
+        let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
+        trackingTimer?.invalidate()
+        trackingTimer = makeTrackingTimer(hz: trackHz)
+    }
+
+    private func makeTrackingTimer(hz: Double) -> Timer {
+        addCommonTimer(1.0 / hz) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.overlayManager?.updateTracking()
+                // 창 종료/리사이즈 감지 (렌더 틱에서 이관 — overlayManager는 MainActor)
+                guard self.isCapturing else { return }
+                // 최소화/Space 이동 감지 — 워크스페이스 알림만으로는 안 잡혀 좀비 오버레이가 남는다
+                self.refreshOverlayVisibility()
+                if self.hasReceivedFirstFrame, (self.overlayManager?.trackingFailureCount ?? 0) > 30 {
+                    DiagnosticLog.shared.log("[CAPTURE] target window gone (tracking) → stop")
+                    await self.stopCapture()
+                    return
+                }
+                let nowT = CFAbsoluteTimeGetCurrent()
+                if nowT - self.lastResizeCheck >= 0.5 {
+                    self.lastResizeCheck = nowT
+                    if !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
+                       let src = self.overlayManager?.sourcePixelSize {
+                        let mismatch = abs(src.width - self.stablePoolWidth) > 8 || abs(src.height - self.stablePoolHeight) > 8
+                        if mismatch {
+                            self.resizeMismatchCount += 1
+                            if self.resizeMismatchCount >= 2 {
+                                self.resizeMismatchCount = 0
+                                await self.resizeCaptureStream(width: src.width, height: src.height)
+                            }
+                        } else {
+                            self.resizeMismatchCount = 0
+                        }
+                    }
+                    // 전체화면 자동 뷰어(사용자 요청): 소스가 전체화면이면 Cover→Viewer 자동 전환
+                    // (Cover는 소스 전체화면 못 덮어 glass=0; 뷰어=자기 창은 정상 합성). 창 복귀 시 원복.
+                    self.detectFullscreenAutoViewer()
+                }
+            }
         }
     }
 
@@ -694,6 +729,14 @@ public final class AppState {
         // 좀비 렌더 루프를 만들던 것 차단 (리뷰 확정). 진행 중 configurePairEngine도 무효화.
         isCapturing = false
         configureEpoch += 1
+        // 자동 전체화면 뷰어는 이번 캡처 한정 상태 — 원복 안 하면 다음 캡처가 전체화면 뷰어로
+        // 잘못 시작한다 (리뷰 확정). 사용자 설정(upscaleMode)에서 배치를 다시 유도.
+        if autoFsViewer {
+            autoFsViewer = false
+            selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
+        }
+        fsSample = false
+        fsStableCount = 0
         renderDriver.detach()   // 동기 — 반환 후 렌더 틱 없음 보장
         renderSurface = nil
 
@@ -829,6 +872,9 @@ public final class AppState {
         lastVsyncTarget = 0
         sourceIntervalEMA = 0
         hasReceivedFirstFrame = false
+        // Vision 스냅샷은 소스 해상도 shared 텍스처(4K ≈ 33MB) — 캡처가 끝나도 붙들고 있으면
+        // 정지 상태에서 계속 상주한다 (리뷰 확정). 리셋 시 놓아주고 다음 캡처에서 재생성.
+        visionSnapshotTex = nil
         // statsLock 규약(224행): presentedTimes는 렌더가 쓰고 메인(updateStats)이 읽음.
         // 여기만 락 없이 재할당하면 메인의 스냅샷 read와 CoW 버퍼 해제가 겹쳐 UAF 가능 (리뷰 확정).
         statsLock.lock()
@@ -1944,6 +1990,8 @@ public final class AppState {
         overlayUserHidden = false
         overlayHiddenState = false
         refreshOverlayVisibility()
+        // 추적 주기가 배치에 의존 — 재생성 없이는 시작 시점 주기에 영구 고정 (리뷰 확정)
+        restartTrackingTimer()
     }
 
     /// 전체화면 자동 뷰어 — 트래킹 0.5s 폴에서 호출. 2회 연속(=1s) 안정 시에만 1회 전환
@@ -1952,8 +2000,11 @@ public final class AppState {
         guard isCapturing, !retargetInFlight, captureRegion == nil,
               let om = overlayManager else { return }
         let isFS = om.sourceIsFullscreen
-        if isFS == fsSample { fsStableCount += 1 } else { fsSample = isFS; fsStableCount = 0 }
-        guard fsStableCount == 2 else { return }
+        if isFS == fsSample { fsStableCount = min(fsStableCount + 1, 4) } else { fsSample = isFS; fsStableCount = 0 }
+        // `== 2`면 안정 후 딱 한 틱만 참이라, 그 사이 다른 경로(업스케일 토글 등)가 배치를
+        // 되돌려 놓으면 전체화면인데 Cover인 상태에서 영영 복구되지 않는다 (리뷰 확정).
+        // `>= 2`로 상시 재평가 — 아래 두 분기 모두 이미 목표 상태면 즉시 return이라 부하 없음.
+        guard fsStableCount >= 2 else { return }
         if isFS {
             guard selectedOverlayPlacement == .coverSource else { return }
             autoFsViewer = true
@@ -1992,7 +2043,11 @@ public final class AppState {
         let sourceFront = sourceOwnerPID == 0
             || frontPID == sourceOwnerPID
             || frontPID == ProcessInfo.processInfo.processIdentifier
-        let shouldHide = overlayUserHidden || (!sourceFront && !coverKeepVisible)
+        // 소스 창이 최소화(⌘M)되거나 다른 Space로 가면 SCK가 프레임 공급을 멈추므로, 숨기지
+        // 않으면 얼어붙은 마지막 프레임이 floating 레벨로 화면에 남는다 (좀비 오버레이, 리뷰 확정).
+        // coverKeepVisible과 무관하게 강제 — "포커스를 잃어도 유지"의 의도는 가려짐이지 소멸이 아님.
+        let sourceOffScreen = !(overlayManager?.sourceIsOnScreen ?? true)
+        let shouldHide = overlayUserHidden || sourceOffScreen || (!sourceFront && !coverKeepVisible)
         guard shouldHide != overlayHiddenState else { return }
         overlayHiddenState = shouldHide
         overlayManager?.setOverlayHidden(shouldHide)
@@ -2088,17 +2143,17 @@ public final class AppState {
     /// keyCode 0 = 미설정 → 등록 생략.
     func registerHotKeys() {
         var bindings: [HotKeyCenter.Binding] = []
-        if hotCapture.keyCode != 0 {
+        if hotCapture.isSet {
             bindings.append(.init(id: 3, keyCode: hotCapture.keyCode, modifiers: hotCapture.modifiers) { [weak self] in
                 self?.toggleCaptureFocused()
             })
         }
-        if hotInterp.keyCode != 0 {
+        if hotInterp.isSet {
             bindings.append(.init(id: 4, keyCode: hotInterp.keyCode, modifiers: hotInterp.modifiers) { [weak self] in
                 self?.toggleInterpolationHotkey()
             })
         }
-        if hotInfo.keyCode != 0 {
+        if hotInfo.isSet {
             bindings.append(.init(id: 7, keyCode: hotInfo.keyCode, modifiers: hotInfo.modifiers) { [weak self] in
                 self?.toggleInfoOverlay()
             })

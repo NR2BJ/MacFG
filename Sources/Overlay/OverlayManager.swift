@@ -39,6 +39,9 @@ public final class OverlayManager {
     /// 연속 창 추적 실패 횟수 — 대상 창 종료 감지용 (성공 시 0으로 리셋)
     public private(set) var trackingFailureCount: Int = 0
 
+    /// 소스 창이 화면에 보이는지 — 최소화/다른 Space면 false (좀비 Cover 오버레이 방지용)
+    public var sourceIsOnScreen: Bool { windowTracker.windowIsOnScreen }
+
     /// 소스 창의 현재 픽셀 크기 (points × 해당 화면 배율) — 캡처 해상도와 비교해 리사이즈 감지용
     public var sourcePixelSize: (width: Int, height: Int)? {
         guard lastSourceFrame.width > 1, lastSourceFrame.height > 1 else { return nil }
@@ -219,6 +222,11 @@ public final class OverlayManager {
     /// Cover 오버레이 숨김/표시 (창은 유지 — 자동 숨김/수동 토글용).
     /// 표시 복귀 시 occlusion 우회·색 정책·위치를 다시 적용한다.
     /// 뷰어 배치는 사용자가 직접 제어하므로 무시.
+    /// 화면 구성 변경 시 뷰어가 화면 밖에 남지 않도록 보정
+    public func ensureViewerOnScreen() {
+        overlayWindow?.ensureViewerOnScreen()
+    }
+
     public func setOverlayHidden(_ hidden: Bool) {
         guard let overlayWindow, placement == .coverSource else { return }
         if hidden {

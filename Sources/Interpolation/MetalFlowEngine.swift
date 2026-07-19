@@ -128,8 +128,16 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         ensureResources(width: stableB.width, height: stableB.height)
         // 2×t 불변식: 연속 2쌍의 출력이 타임라인 지연버퍼에 동시 생존해도 링이 안 겹치게
         // 쌍당 t 수를 풀의 절반으로 제한 (풀 16이면 8 = 호출측 상한과 일치 → 거동 불변)
-        guard !levels.isEmpty, outputPool.count >= tValues.count * 2, let maskTex,
-              !statsBuffers.isEmpty else { return nil }
+        guard !levels.isEmpty, let maskTex, !statsBuffers.isEmpty else { return nil }
+        // 풀이 예산 축소로 작아진 대형 소스(5K 이상)에서는 t 수가 상한을 넘을 수 있다. 예전엔
+        // 쌍을 통째로 버려(nil) 저fps 콘텐츠의 보간이 영구 0장이 됐다 (리뷰 확정). 버리는 대신
+        // 균등 간격으로 솎아 남은 예산만큼은 보간한다 — 홀 대신 우아한 강등.
+        var tValues = tValues
+        let maxT = max(1, outputPool.count / 2)
+        if tValues.count > maxT {
+            let step = Double(tValues.count) / Double(maxT)
+            tValues = (0..<maxT).map { tValues[min(Int(Double($0) * step), tValues.count - 1)] }
+        }
 
         let statsBuffer = statsBuffers[statsIndex]
         statsIndex = (statsIndex + 1) % statsBuffers.count

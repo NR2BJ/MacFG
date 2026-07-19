@@ -372,6 +372,14 @@ public final class OverlayWindow: NSObject {
         // 트래킹영역이 발화하면 이벤트가 한 번 더 매핑·전달(이중 배달, 실측). 탭이 전담하므로 무력화.
         interactionView?.owner = nil
         relativePointer.enable()
+        // 탭 생성 실패(접근성 미허가 등)면 클릭투과만 켜진 채 포워딩이 없어, 뷰어 위 클릭이
+        // 아래 임의 창으로 새어 나간다 (리뷰 확정). 레거시 postToPid 경로로 되돌린다.
+        guard relativePointer.active else {
+            window.ignoresMouseEvents = false
+            interactionView?.owner = self
+            DiagnosticLog.shared.log("[RELPTR] tap 생성 실패 → 클릭투과 해제 + 레거시 포워딩 복원 (접근성 권한 확인 필요)")
+            return
+        }
         pushPointerGeometry()   // 초기 스냅샷 (이후 sourceFrameNS 갱신마다 push)
     }
 
@@ -454,9 +462,12 @@ public final class OverlayWindow: NSObject {
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+            guard let self else { return }
             CGWarpMouseCursorPosition(returnPos)
-            self?.window.ignoresMouseEvents = false
-            self?.passthroughActive = false
+            // 이 0.22s 사이에 상대커서가 진입했다면 클릭투과는 그쪽이 소유한 상태 — 여기서
+            // 되돌리면 재게시 이벤트가 뷰어에 막혀 뷰어 입력이 통째로 죽는다 (리뷰 확정).
+            if !self.relativePointer.active { self.window.ignoresMouseEvents = false }
+            self.passthroughActive = false
         }
         DiagnosticLog.shared.log("[MOUSE] passthrough click at CG(\(Int(target.x)),\(Int(target.y))) → return(\(Int(returnPos.x)),\(Int(returnPos.y)))")
     }
@@ -540,6 +551,28 @@ public final class OverlayWindow: NSObject {
         guard style == .viewer else { return }
         window.setFrame(frame, display: true)
         refreshSurfaceParams()
+    }
+
+    /// 화면 구성이 바뀌었을 때 뷰어를 화면 안으로 되돌린다 — 뷰어 프레임은 생성 시 1회만
+    /// 설정되므로, 놓여 있던 디스플레이가 분리되거나 해상도가 줄면 창이 화면 밖에 남아
+    /// 복구 경로가 없었다 (리뷰 확정). 이미 화면 안이면 건드리지 않아 사용자 배치를 보존.
+    public func ensureViewerOnScreen() {
+        guard style == .viewer, !window.styleMask.contains(.fullScreen) else { return }
+        let frame = window.frame
+        let visible = (window.screen ?? NSScreen.main)?.visibleFrame
+            ?? NSScreen.screens.first?.visibleFrame
+        guard let visible else { return }
+        // 창의 상당 부분이 어느 화면에도 안 겹치면 재배치
+        let onAnyScreen = NSScreen.screens.contains { $0.visibleFrame.intersects(frame) }
+        guard !onAnyScreen else { return }
+        var f = frame
+        f.size.width = min(f.width, visible.width)
+        f.size.height = min(f.height, visible.height)
+        f.origin.x = visible.midX - f.width / 2
+        f.origin.y = visible.midY - f.height / 2
+        window.setFrame(f, display: true)
+        refreshSurfaceParams()
+        DiagnosticLog.shared.log("[VIEWER] 화면 구성 변경 → 뷰어 창을 화면 안으로 재배치")
     }
 
     /// 창을 확실히 닫는다 (정지 시). 전체화면 상태면 먼저 빠져나와 검정 Space 잔존 방지.

@@ -252,7 +252,10 @@ public final class WindowTracker {
     private func startCGWindowListPolling() {
         trackingMethod = .cgWindowList
         pollingTimer?.invalidate()
-        pollingTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        // 2Hz — 이 폴링이 먹이는 onGeometryChanged에는 소비자가 없다(오버레이/앱은 각자
+        // pollGeometry()를 자기 타이머에서 호출). 옛 60Hz는 메인 스레드에서 CGWindowList를
+        // 초당 60회 두드리는 순수 낭비였다 (리뷰 확정). 상태 보존용으로만 저빈도 유지.
+        pollingTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.pollCGWindowList()
             }
@@ -288,6 +291,15 @@ public final class WindowTracker {
     /// 매 렌더 틱에서 호출 — CGWindowList로 최신 geometry 반환 (경량)
     public func pollGeometry() -> WindowGeometry? {
         return readCGWindowListGeometry()
+    }
+
+    /// 대상 창이 화면에 실제로 보이는지 — 최소화(⌘M)나 다른 Space로 이동하면 false.
+    /// 창은 여전히 존재하므로 windowExists로는 구분되지 않고, SCK도 프레임 공급을 멈춰
+    /// Cover 오버레이가 얼어붙은 프레임으로 화면에 남는다(좀비 오버레이, 리뷰 확정).
+    public var windowIsOnScreen: Bool {
+        guard let infoList = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]],
+              let info = infoList.first else { return false }
+        return (info[kCGWindowIsOnscreen as String] as? Bool) ?? false
     }
 
     /// 대상 창이 아직 존재하는지 (닫힘 감지용 — geometry는 optionIncludingWindow라 닫혀야 nil)

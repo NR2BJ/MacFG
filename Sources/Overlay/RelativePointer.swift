@@ -112,6 +112,18 @@ final class RelativePointer {
 
     // MARK: - 매핑 (순수 함수, 탭 스레드에서 스냅샷으로)
 
+    /// 전역 CG 좌표를 레터박스(영상 표시 영역) 안으로 클램프 — 드래그 up이 블랙바에서
+    /// 떨어져도 시퀀스를 닫을 수 있게 가장자리로 끌어온다.
+    private func clampToLetterbox(_ p: CGPoint, _ g: Geometry) -> CGPoint {
+        let lb = g.letterbox
+        guard lb.width > 1, lb.height > 1 else { return p }
+        // 창 content NS 기준으로 레터박스 경계를 전역 CG로 환산
+        let originX = g.windowFrame.minX + lb.minX
+        let originYTop = g.primaryHeight - (g.windowFrame.minY + lb.maxY)
+        return CGPoint(x: min(max(p.x, originX + 0.5), originX + lb.width - 0.5),
+                       y: min(max(p.y, originYTop + 0.5), originYTop + lb.height - 0.5))
+    }
+
     /// 커서 전역 CG → 소스 전역 CG. frameOverride면 그 프레임 기준(드래그 고정), clickInset면
     /// 소스 프레임 8pt 안쪽(리사이즈 존 회피). 레터박스 밖이면 nil.
     private func mapToSource(_ p: CGPoint, frameOverride: CGRect?, clickInset: Bool, _ g: Geometry) -> CGPoint? {
@@ -173,7 +185,22 @@ final class RelativePointer {
         default:
             clickLike = false
         }
-        let mapped = mapToSource(loc, frameOverride: dragFrameNS, clickInset: clickLike, g)
+        // 드래그 시퀀스(down~up)는 반드시 닫아야 한다 — up이 레터박스 밖(블랙바)에서 떨어지면
+        // 매핑이 nil이라 그대로 소비돼, down을 받은 소스 앱이 버튼이 눌린 상태로 갇힌다
+        // (스크러버가 계속 따라오거나 텍스트 선택 유지, 리뷰 확정). up과 드래그 중 dragged는
+        // 밖이어도 가장자리로 클램프해 배달한다.
+        let inDragSequence = dragFrameNS != nil
+        let mustDeliver: Bool
+        switch type {
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp: mustDeliver = true
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged: mustDeliver = inDragSequence
+        default: mustDeliver = false
+        }
+        var mapped = mapToSource(loc, frameOverride: dragFrameNS, clickInset: clickLike, g)
+        if mapped == nil, mustDeliver {
+            mapped = mapToSource(clampToLetterbox(loc, g), frameOverride: dragFrameNS,
+                                 clickInset: clickLike, g)
+        }
         switch type {
         case .leftMouseUp, .rightMouseUp, .otherMouseUp: dragFrameNS = nil
         default: break

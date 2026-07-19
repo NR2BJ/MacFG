@@ -134,14 +134,19 @@ public final class IOSurfaceCapture: FrameSource, @unchecked Sendable {
             return
         }
 
-        if newSurfaceID != currentSurfaceID {
-            logger.info("IOSurface ID changed: \(self.currentSurfaceID) → \(newSurfaceID)")
-            currentSurfaceID = newSurfaceID
+        // ID가 그대로여도 surface가 비어 있으면 재획득해야 한다 — 일시적 조회 실패로 surface를
+        // nil로 만든 뒤 같은 ID로 복귀하면, "ID 변경"에만 반응하는 옛 조건에서는 영영 재획득이
+        // 안 돼 흡수 상태(영구 프리즈)가 됐다 (리뷰 확정). ID는 lookup 성공 후에 갱신한다.
+        if newSurfaceID != currentSurfaceID || self.surface == nil {
+            if newSurfaceID != currentSurfaceID {
+                logger.info("IOSurface ID changed: \(self.currentSurfaceID) → \(newSurfaceID)")
+            }
             guard let newSurface = IOSurfaceLookup(newSurfaceID) else {
                 self.surface = nil
                 self.texture = nil
-                return
+                return          // currentSurfaceID는 유지 — 다음 폴에서 재시도
             }
+            currentSurfaceID = newSurfaceID
             self.surface = newSurface
             self.texture = makeTexture(from: newSurface, device: device)
         }

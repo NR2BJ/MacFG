@@ -68,8 +68,12 @@ final class RecorderView: NSView {
         if f.contains(.shift)   { mods |= UInt32(shiftKey) }
         guard mods != 0 else { NSSound.beep(); return }   // 전역 훅은 모디파이어 필수
 
+        // 문자/숫자 한 글자만 그대로 쓰고, 나머지는 keyName으로. 기존 조건은 && 우선순위 탓에
+        // `key.isEmpty || (isLetter==false && count != 1)`로 묶여, 화살표(사설영역 문자 U+F700대)나
+        // Space처럼 "한 글자지만 문자가 아닌" 키가 keyName을 못 타고 깨진 글자로 저장됐다 (리뷰 확정).
         let key = (event.charactersIgnoringModifiers ?? "").uppercased()
-        let label = Self.modifierSymbols(f) + (key.isEmpty || key.first!.isLetter == false && key.count != 1 ? Self.keyName(event.keyCode) : key)
+        let isPlainKey = key.count == 1 && (key.first!.isLetter || key.first!.isNumber)
+        let label = Self.modifierSymbols(f) + (isPlainKey ? key : Self.keyName(event.keyCode))
         binding = HotKeyBinding(keyCode: UInt32(event.keyCode), modifiers: mods, label: label)
         onChange?(binding)
         stop()

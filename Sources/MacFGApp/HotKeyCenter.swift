@@ -7,6 +7,10 @@ public struct HotKeyBinding: Codable, Equatable, Sendable {
     public var keyCode: UInt32
     public var modifiers: UInt32
     public var label: String
+    /// 바인딩이 설정돼 있는지 — keyCode만으로 판정하면 A키(kVK_ANSI_A == 0)가 "미설정"
+    /// 센티널과 충돌해 조용히 등록에서 누락된다 (리뷰 확정). 해제는 keyCode·modifiers를
+    /// 모두 0으로 두고, 녹화는 모디파이어를 강제하므로 modifiers가 진짜 판별자다.
+    public var isSet: Bool { modifiers != 0 }
     public init(keyCode: UInt32, modifiers: UInt32, label: String) {
         self.keyCode = keyCode
         self.modifiers = modifiers

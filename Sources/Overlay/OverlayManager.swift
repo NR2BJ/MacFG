@@ -59,10 +59,14 @@ public final class OverlayManager {
 
     /// 소스 창이 자기 화면을 거의(≥95%) 채우면 true — 전체화면 자동 뷰어 전환 판정용.
     /// Cover는 소스 전체화면을 못 덮으므로(glass=0), 전체화면이면 뷰어(자기 창)로 가야 합성된다.
+    /// 소스가 **진짜 전체화면**(자체 Space)인지 — Cover 오버레이가 합성되지 않는 조건.
+    /// 최대화 창과 반드시 구분해야 한다: 최대화는 메뉴바 영역을 비워두므로 화면 높이보다
+    /// 메뉴바만큼 작다(4K 2160pt에서 ~2135pt = 98.8%). 옛 "95% 이상" 임계는 둘을 못 갈라
+    /// 최대화만 해도 뷰어로 자동 전환돼 Cover 모드를 쓸 수 없었다.
     public var sourceIsFullscreen: Bool {
         guard lastSourceFrame.width > 1, let scr = sourceScreen else { return false }
-        return lastSourceFrame.width >= scr.frame.width * 0.95
-            && lastSourceFrame.height >= scr.frame.height * 0.95
+        return lastSourceFrame.width >= scr.frame.width - 2
+            && lastSourceFrame.height >= scr.frame.height - 2
     }
 
     /// 뷰어 창을 사용자가 닫았을 때 (캡처 정지 트리거)

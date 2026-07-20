@@ -252,6 +252,13 @@ public final class RenderSurface: @unchecked Sendable {
             if metalLayer.contentsScale != scale { metalLayer.contentsScale = scale }
             if drawableWrong { metalLayer.drawableSize = CGSize(width: dw, height: dh) }
             CATransaction.commit()
+            // 레이아웃이 바뀔 때만 기록 — 뷰어에 여백이 생기면 어디서 어긋났는지(콘텐츠 경계 vs
+            // 소스 종횡비 vs 드로어블) 한 줄로 특정된다.
+            DiagnosticLog.shared.log(String(
+                format: "[VIEWER-GEO] tex=%dx%d bounds=(%.0f,%.0f %.0fx%.0f) fit=(%.0f,%.0f %.0fx%.0f) drawable=%.0fx%.0f scale=%.1f",
+                textureWidth, textureHeight,
+                bounds.minX, bounds.minY, bounds.width, bounds.height,
+                fit.minX, fit.minY, fit.width, fit.height, dw, dh, scale))
         }
     }
 }

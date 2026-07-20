@@ -44,6 +44,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     public func startCapture(windowID: CGWindowID, device: any MTLDevice, captureRect: CGRect? = nil) async throws {
         self.device = device
         self.captureRect = captureRect
+        self.isDisplayCapture = false   // 새 스트림은 창 캡처로 시작 (전체 재시작 경로 포함)
 
         // 캡처 가능한 창 목록에서 대상 찾기
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -122,6 +123,35 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         DiagnosticLog.shared.log("[SCK-CFG] reconfigure → \(width)x\(height)\(captureRect != nil ? " (region)" : "")")
     }
 
+    /// 창 캡처 ↔ 디스플레이 캡처 무중단 전환.
+    ///
+    /// 소스가 자체 Space 전체화면이면 창 캡처가 합성 전 창 버퍼를 주는데, 그게 화면 크기와
+    /// 다를 수 있다 (실측: 디스코드 전체화면에서 창 3840x2160인데 버퍼 콘텐츠는 3764x2117,
+    /// 나머지는 알파 0). 네이티브로 볼 땐 윈도우서버가 합성하며 맞춰주므로 멀쩡한데, 우리가
+    /// 캡처해 다시 그리면 그 차이가 여백으로 드러난다. 원인(왜 3764인지)은 디스코드/윈도우서버
+    /// 내부라 규명 못 했지만, 전체화면일 땐 소스가 화면 전체를 차지하므로 **디스플레이를 캡처하면
+    /// 합성 결과 그대로** 얻는다 — 크롭 같은 추정 보정 없이 정직하게 보이는 것을 보여준다.
+    ///
+    /// 우리 오버레이/뷰어 창은 반드시 제외해야 한다 (안 그러면 자기 출력을 되먹는 무한 거울).
+    public func updateToDisplayCapture(displayID: CGDirectDisplayID, excludingWindowIDs: [CGWindowID]) async throws {
+        guard let stream else { throw CaptureError.notCapturing }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+            throw CaptureError.windowNotFound
+        }
+        let excluded = content.windows.filter { excludingWindowIDs.contains($0.windowID) }
+        self.captureRect = nil
+        self.captureScale = Self.findScaleFactor(for: display.frame)
+        let w = display.width, h = display.height          // 디스플레이는 이미 픽셀 단위
+        try await stream.updateContentFilter(SCContentFilter(display: display, excludingWindows: excluded))
+        try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
+        isDisplayCapture = true
+        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h), 제외 창 \(excluded.count)개")
+    }
+
+    /// 디스플레이 캡처 중인지 — 전체화면 이탈 시 창 캡처로 되돌릴지 판단용
+    public private(set) var isDisplayCapture = false
+
     /// 캡처 대상 창을 무중단 교체 — 전체화면/PiP가 새 창을 만들 때 재타깃 (updateContentFilter).
     /// captureRect(영역 크롭)는 원 창 기준이라 재타깃 시 무효화하고 새 창 전체를 잡는다.
     public func updateTargetWindow(windowID: CGWindowID) async throws {
@@ -137,6 +167,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         let h = window.frame.height > 0 ? Int(window.frame.height * scaleFactor) : 1080
         try await stream.updateContentFilter(SCContentFilter(desktopIndependentWindow: window))
         try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
+        isDisplayCapture = false
         DiagnosticLog.shared.log("[SCK-RETARGET] → window \(windowID) \(Int(window.frame.width))x\(Int(window.frame.height)) → cfg \(w)x\(h)")
     }
 

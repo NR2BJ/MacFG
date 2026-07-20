@@ -42,6 +42,21 @@ public final class OverlayManager {
     /// 소스 창이 화면에 보이는지 — 최소화/다른 Space면 false (좀비 Cover 오버레이 방지용)
     public var sourceIsOnScreen: Bool { windowTracker.windowIsOnScreen }
 
+    /// MacFG 자신이 띄운 창들의 CGWindowID — 디스플레이 캡처 제외 목록용.
+    /// 오버레이/뷰어뿐 아니라 설정 창 등 이 앱의 모든 창을 포함해야 되먹임이 없다.
+    public var ownWindowIDs: [CGWindowID] {
+        // windowNumber는 Int이고 오프스크린/미실현 창은 음수일 수 있다 — UInt32 변환이
+        // 트랩을 내므로 compactMap으로 안전하게 거른다 (음수를 filter로 막았어도 map에서
+        // 다시 변환하면 경계 사례에서 터진다, 실측 크래시).
+        var ids = NSApplication.shared.windows.compactMap { w -> CGWindowID? in
+            let n = w.windowNumber
+            guard n > 0, n <= Int(UInt32.max) else { return nil }
+            return CGWindowID(n)
+        }
+        if let ow = overlayWindow?.cgWindowID, ow > 0, !ids.contains(ow) { ids.append(ow) }
+        return ids
+    }
+
     /// 소스 창의 현재 픽셀 크기 (points × 해당 화면 배율) — 캡처 해상도와 비교해 리사이즈 감지용
     public var sourcePixelSize: (width: Int, height: Int)? {
         guard lastSourceFrame.width > 1, lastSourceFrame.height > 1 else { return nil }
@@ -221,6 +236,7 @@ public final class OverlayManager {
     /// 렌더 없이 위치 추적만 갱신 (프레임 스킵 시 호출)
     public func updateTracking() {
         pollAndUpdateFrame()
+        overlayWindow?.logViewerGeometryIfChanged()   // 창이 나중에 옮겨지는 경우 포착
     }
 
     /// Cover 오버레이 숨김/표시 (창은 유지 — 자동 숨김/수동 토글용).

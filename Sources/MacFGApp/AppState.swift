@@ -190,6 +190,8 @@ public final class AppState {
 
     // 전체화면 자동 뷰어: 소스가 전체화면이면 Cover→Viewer 자동(수동 토글 불필요), 창 복귀 시 원복.
     @ObservationIgnored private var autoFsViewer = false
+    /// 마지막으로 소스 프레임이 도착한 시각 — 좀비 오버레이(얼어붙은 화면) 판정의 직접 신호.
+    @ObservationIgnored nonisolated(unsafe) var lastFrameArrivalAt: CFAbsoluteTime = 0
     @ObservationIgnored private var fsSample = false
     @ObservationIgnored private var fsStableCount = 0
     /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
@@ -778,7 +780,7 @@ public final class AppState {
         do {
             try await captureManager.updateConfiguration(width: width, height: height)
             pendingShowReset = true   // 리셋은 렌더 스레드 틱에서 (동시 변조 방지)
-            DiagnosticLog.shared.log("[CAPTURE] seamless resize → \(width)x\(height)")
+            DiagnosticLog.shared.log("[CAPTURE] seamless resize → \(width)x\(height) (pool=\(stablePoolWidth)x\(stablePoolHeight) disp=\(captureManager.isDisplayCapture))")
         } catch {
             // updateConfiguration 미지원(IOSurface 폴백)/실패 → 기존 전체 재시작으로 폴백
             DiagnosticLog.shared.log("[CAPTURE] seamless resize failed (\(error)) → full restart")
@@ -1301,6 +1303,7 @@ public final class AppState {
         }
         let previousAcceptedTs = lastAcceptedTimestamp
         let previousAcceptedFingerprint = lastAcceptedFingerprint
+        lastFrameArrivalAt = CFAbsoluteTimeGetCurrent()   // 좀비 오버레이 판정용 (프레임 공급 생존 신호)
         lastAcceptedTimestamp = slot.timestamp
         lastAcceptedFingerprint = slot.contentFingerprint
         performanceMonitor.recordFrameArrival()
@@ -2006,17 +2009,54 @@ public final class AppState {
         // `>= 2`로 상시 재평가 — 아래 두 분기 모두 이미 목표 상태면 즉시 return이라 부하 없음.
         guard fsStableCount >= 2 else { return }
         if isFS {
+            syncCaptureSourceForFullscreen(true)
             guard selectedOverlayPlacement == .coverSource else { return }
             autoFsViewer = true
             selectedOverlayPlacement = .viewerWindow
             updateOverlayPlacement()
             DiagnosticLog.shared.log("[AUTOFS] 소스 전체화면 → viewer 자동 전환")
         } else {
+            syncCaptureSourceForFullscreen(false)
             guard autoFsViewer else { return }
             autoFsViewer = false
             selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
             updateOverlayPlacement()
             DiagnosticLog.shared.log("[AUTOFS] 소스 창 복귀 → \(selectedOverlayPlacement == .coverSource ? "cover" : "viewer") 원복")
+        }
+    }
+
+    /// 전체화면 여부에 따라 캡처 소스를 창↔디스플레이로 맞춘다.
+    ///
+    /// 자체 Space 전체화면에서는 창 캡처가 합성 전 창 버퍼를 주는데 그게 화면 크기와 다를 수
+    /// 있다 (실측: 디스코드 전체화면 창 3840x2160인데 콘텐츠 3764x2117, 나머지 알파 0 — 창
+    /// 모드에선 정상). 네이티브로는 윈도우서버가 합성하며 맞춰줘 멀쩡하지만, 캡처해 다시 그리면
+    /// 여백으로 드러난다. 전체화면이면 소스가 화면 전체를 차지하므로 디스플레이를 캡처해
+    /// **합성 결과 그대로** 가져온다 (추정 크롭 없이 보이는 대로).
+    private func syncCaptureSourceForFullscreen(_ fullscreen: Bool) {
+        guard isCapturing, !isRestartingCapture, !retargetInFlight, captureRegion == nil else { return }
+        guard captureManager.isDisplayCapture != fullscreen else { return }   // 이미 원하는 모드
+        guard let om = overlayManager else { return }
+        retargetInFlight = true
+        Task { @MainActor in
+            defer { retargetInFlight = false }
+            do {
+                if fullscreen {
+                    guard let scr = om.sourceScreen,
+                          let num = scr.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+                    else { return }
+                    try await captureManager.updateToDisplayCapture(
+                        displayID: CGDirectDisplayID(num.uint32Value),
+                        excludingWindowIDs: om.ownWindowIDs)
+                    pendingShowReset = true   // 해상도/소스가 바뀌었으니 스케줄러 재락
+                } else {
+                    // 역방향(디스플레이→창)은 updateContentFilter로는 스트림이 죽는다 —
+                    // 필터 교체는 성공 보고하는데 이후 프레임이 한 장도 안 온다(실측: SCHED 0줄,
+                    // 풀이 옛 크기에 고정돼 리사이즈가 무한 반복). 검증된 전체 재시작 경로 사용.
+                    await restartCaptureStream(reason: "display → window (전체화면 이탈)")
+                }
+            } catch {
+                DiagnosticLog.shared.log("[SCK-DISPLAY] 전환 실패(\(fullscreen ? "→디스플레이" : "→창")): \(error)")
+            }
         }
     }
 
@@ -2046,7 +2086,16 @@ public final class AppState {
         // 소스 창이 최소화(⌘M)되거나 다른 Space로 가면 SCK가 프레임 공급을 멈추므로, 숨기지
         // 않으면 얼어붙은 마지막 프레임이 floating 레벨로 화면에 남는다 (좀비 오버레이, 리뷰 확정).
         // coverKeepVisible과 무관하게 강제 — "포커스를 잃어도 유지"의 의도는 가려짐이지 소멸이 아님.
-        let sourceOffScreen = !(overlayManager?.sourceIsOnScreen ?? true)
+        //
+        // 판정 신호는 **프레임 공급 중단**이다. 처음엔 kCGWindowIsOnscreen을 썼는데, 전체화면
+        // 전환 중 순간적으로 false가 나오면 오버레이가 꺼지고 → 렌더 틱이 조기 반환해 인제스트까지
+        // 멈추고 → 텍스처 풀이 옛 크기에 고정돼 리사이즈가 무한 반복되는 연쇄가 났다(실측).
+        // "화면이 얼어붙는다"의 실제 조건은 프레임이 안 오는 것이므로 그걸 직접 본다 —
+        // 프레임이 흐르는 동안엔 절대 숨지 않으니 보간이 끊길 수 없다.
+        let sourceOffScreen = hasReceivedFirstFrame
+            && lastFrameArrivalAt > 0
+            && CFAbsoluteTimeGetCurrent() - lastFrameArrivalAt > 1.0
+            && !(overlayManager?.sourceIsOnScreen ?? true)
         let shouldHide = overlayUserHidden || sourceOffScreen || (!sourceFront && !coverKeepVisible)
         guard shouldHide != overlayHiddenState else { return }
         overlayHiddenState = shouldHide

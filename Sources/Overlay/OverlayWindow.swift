@@ -151,6 +151,14 @@ public enum UpscaleMode: String, CaseIterable, Identifiable, Sendable {
 public final class OverlayWindow: NSObject {
     public let style: OverlayStyle
     private let window: NSWindow
+
+    /// 이 오버레이/뷰어 창의 CGWindowID — 디스플레이 캡처 시 자기 출력을 되먹지 않도록
+    /// 제외 목록에 넣기 위해 필요 (안 빼면 무한 거울). 미실현 창은 0/음수라 0을 반환.
+    public var cgWindowID: CGWindowID {
+        let n = window.windowNumber
+        guard n > 0, n <= Int(UInt32.max) else { return 0 }
+        return CGWindowID(n)
+    }
     private let metalLayer: CAMetalLayer
     private let device: any MTLDevice
     private let commandQueue: any MTLCommandQueue
@@ -436,6 +444,7 @@ public final class OverlayWindow: NSObject {
     /// 뷰어를 이벤트 투과로 전환 → 커서를 소스 위치로 워프 → 진짜 클릭(세션 탭, 정상 라우팅)
     /// → 커서/투과 복구. 커서가 ~150ms 소스 위치로 깜빡이는 비용으로 100% 정상 배달.
     private var passthroughActive = false
+    private var lastLoggedViewerFrame = ""
     fileprivate func passthroughClick(_ e: NSEvent, button: CGMouseButton) {
         // 재진입 가드 — ignoresMouseEvents 반영 전(윈도우서버 비동기)에 자기 클릭이 뷰어에
         // 되튕겨 재귀 발화하던 것 차단 (실측: 30ms 내 재진입)
@@ -522,6 +531,15 @@ public final class OverlayWindow: NSObject {
     public func refreshSurfaceParams() {
         let bounds = window.contentView?.bounds ?? CGRect(origin: .zero, size: window.frame.size)
         let scale = window.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        if style == .viewer {
+            // 창이 요청한 프레임대로 놓였는지(macOS constrainFrameRect가 줄이거나 옮기지 않았는지)
+            // 확인용 — 뷰어 여백 진단의 출발점.
+            let scr = window.screen?.frame ?? .zero
+            DiagnosticLog.shared.log(String(
+                format: "[VIEWER-WIN] frame=(%.0f,%.0f %.0fx%.0f) content=%.0fx%.0f screen=(%.0f,%.0f %.0fx%.0f) scale=%.1f",
+                window.frame.minX, window.frame.minY, window.frame.width, window.frame.height,
+                bounds.width, bounds.height, scr.minX, scr.minY, scr.width, scr.height, scale))
+        }
         surface.update {
             $0.contentBounds = bounds
             $0.contentsScale = scale
@@ -550,7 +568,36 @@ public final class OverlayWindow: NSObject {
     public func setInitialViewerFrame(_ frame: CGRect) {
         guard style == .viewer else { return }
         window.setFrame(frame, display: true)
+        // macOS는 setFrame을 constrainFrameRect로 제약할 수 있다(메뉴바 아래로 밀기 등).
+        // 요청과 결과가 다르면 그대로 두면 화면 일부가 안 덮인다 — 어긋나면 기록하고,
+        // 화면 전체를 요구한 경우에는 제약을 우회해 다시 설정한다.
+        if abs(window.frame.width - frame.width) > 1 || abs(window.frame.height - frame.height) > 1
+            || abs(window.frame.minX - frame.minX) > 1 || abs(window.frame.minY - frame.minY) > 1 {
+            DiagnosticLog.shared.log(String(
+                format: "[VIEWER-WIN] 요청=(%.0f,%.0f %.0fx%.0f) → 제약됨=(%.0f,%.0f %.0fx%.0f) — 재설정 시도",
+                frame.minX, frame.minY, frame.width, frame.height,
+                window.frame.minX, window.frame.minY, window.frame.width, window.frame.height))
+            window.setFrameOrigin(frame.origin)
+            window.setContentSize(frame.size)
+            window.setFrameOrigin(frame.origin)
+        }
         refreshSurfaceParams()
+    }
+
+    /// 뷰어 창 기하가 바뀌었으면 기록 (추적 틱에서 호출) — setFrame 직후가 아니라 나중에
+    /// 윈도우서버가 창을 옮기거나 줄이는 경우를 잡기 위한 감시.
+    public func logViewerGeometryIfChanged() {
+        guard style == .viewer else { return }
+        let f = window.frame
+        let key = "\(Int(f.minX)),\(Int(f.minY)),\(Int(f.width)),\(Int(f.height))"
+        guard key != lastLoggedViewerFrame else { return }
+        lastLoggedViewerFrame = key
+        let scr = window.screen?.frame ?? .zero
+        DiagnosticLog.shared.log(String(
+            format: "[VIEWER-WIN*] frame=(%.0f,%.0f %.0fx%.0f) content=%.0fx%.0f screen=(%.0f,%.0f %.0fx%.0f)",
+            f.minX, f.minY, f.width, f.height,
+            window.contentView?.bounds.width ?? 0, window.contentView?.bounds.height ?? 0,
+            scr.minX, scr.minY, scr.width, scr.height))
     }
 
     /// 화면 구성이 바뀌었을 때 뷰어를 화면 안으로 되돌린다 — 뷰어 프레임은 생성 시 1회만

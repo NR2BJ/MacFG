@@ -616,6 +616,21 @@ extension OverlayWindow: NSWindowDelegate {
     public func windowWillClose(_ notification: Notification) {
         onUserClose?()
     }
+
+    /// 창 크기가 바뀌면 서피스 파라미터(contentBounds/배율/드로어블)를 다시 읽는다.
+    /// 없으면 contentBounds가 옛 크기에 머물러, 레터박스 fit이 그 작은 영역 안에서 계산되고
+    /// 콘텐츠가 좌하단에 몰린다 — 전체화면 자동 전환(창이 커짐)에서 오른쪽·위쪽 패딩으로 발현.
+    public func windowDidResize(_ notification: Notification) {
+        refreshSurfaceParams()
+        pushPointerGeometry()   // 상대커서 매핑 기준(레터박스)도 함께 갱신
+    }
+
+    /// 전체화면 진입/이탈은 리사이즈 통지가 애니메이션 도중 값으로 올 수 있어 완료 시점에 재갱신
+    public func windowDidEnterFullScreen(_ notification: Notification) { refreshSurfaceParams(); pushPointerGeometry() }
+    public func windowDidExitFullScreen(_ notification: Notification)  { refreshSurfaceParams(); pushPointerGeometry() }
+
+    /// 다른 배율의 화면으로 옮겨가면 contentsScale이 달라진다
+    public func windowDidChangeScreen(_ notification: Notification) { refreshSurfaceParams() }
 }
 
 /// 뷰어 contentView — 호버/클릭/스크롤을 OverlayWindow가 소스로 역매핑·전달하게 넘긴다.

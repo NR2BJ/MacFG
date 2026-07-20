@@ -51,6 +51,10 @@ cat > "$APP/Contents/Info.plist" << PLIST
     <key>CFBundleVersion</key><string>${VERSION}</string>
     <key>CFBundleIconFile</key><string>MacFG</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <!-- 메뉴바 전용 앱 — 없으면 .app 실행 시 Dock 아이콘이 뜬다(앱이 런타임에
+         setActivationPolicy(.accessory)를 부르지만 그 전에 이미 등록됨). 사용자가
+         "메뉴바만" 설정을 끄면 런타임에 .regular로 올려 Dock에 다시 표시된다. -->
+    <key>LSUIElement</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>MIT License</string>

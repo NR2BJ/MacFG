@@ -192,8 +192,20 @@ public final class AppState {
     @ObservationIgnored private var autoFsViewer = false
     /// 마지막으로 소스 프레임이 도착한 시각 — 좀비 오버레이(얼어붙은 화면) 판정의 직접 신호.
     @ObservationIgnored nonisolated(unsafe) var lastFrameArrivalAt: CFAbsoluteTime = 0
+
+    /// GitHub 릴리즈 업데이트 확인 (알림만, 설치는 사용자가)
+    let updateChecker = UpdateChecker()
+
+    /// 소스가 Neural(RIFE) 예산을 넘길 만큼 큰지 — 4K급(≈7MP 이상). UI 경고용.
+    /// 실측(M4): 3840×2160에서 Neural 85ms/프레임(소스 60fps→24fps로 붕괴), MetalFlow 35ms, AppleFI 10ms.
+    var sourceIsLargeForNeural: Bool {
+        let w = stablePoolWidth, h = stablePoolHeight
+        guard w > 0, h > 0 else { return false }
+        return w * h >= 7_000_000
+    }
     @ObservationIgnored private var fsSample = false
-    @ObservationIgnored private var fsStableCount = 0
+    /// 현재 전체화면 상태가 유지되기 시작한 시각 (0=미측정). 시간 기반 디바운스용.
+    @ObservationIgnored private var fsStableSince: CFAbsoluteTime = 0
     /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
     /// 설정되면 resize-reconfigure를 끈다(영역이 창-리사이즈 재구성으로 날아가지 않게).
     @ObservationIgnored nonisolated(unsafe) var captureRegion: CGRect?
@@ -251,6 +263,8 @@ public final class AppState {
         self.interpolationEngine = selectedRenderMode.displayName
         // 정지-UI 프리즈 토글 (A/B·회귀 확인용). 기본 on.
         if ProcessInfo.processInfo.environment["MACFG_NO_UISTATIC"] != nil { UIStaticDetector.enabled = false }
+        // 새 릴리즈 확인 (기본 on, 6시간 주기). 설치는 하지 않고 알리기만 한다.
+        self.updateChecker.startPeriodicCheck()
         // 뷰어 창 X 버튼 → 캡처 정지
         self.overlayManager?.onViewerClosed = { [weak self] in
             Task { @MainActor in
@@ -701,10 +715,19 @@ public final class AppState {
                     await self.stopCapture()
                     return
                 }
+                // 전체화면 감지는 매 틱 — lastSourceFrame 재사용이라 추가 비용 0이고,
+                // 0.5s 게이트 안에 두면 전환이 1s 넘게 늦어 눈에 띄게 버벅인다(실측).
+                // 리사이즈 검사보다 **먼저** 돌려서, 전체화면행이면 아래 창-캡처 리사이즈를
+                // 건너뛴다 — 어차피 디스플레이 캡처로 갈 건데 창 캡처를 4K로 재설정했다 버리는
+                // 중간 단계가 전환 버벅임의 주범이었다.
+                self.detectFullscreenAutoViewer()
+
                 let nowT = CFAbsoluteTimeGetCurrent()
                 if nowT - self.lastResizeCheck >= 0.5 {
                     self.lastResizeCheck = nowT
-                    if !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
+                    let headingFullscreen = self.overlayManager?.sourceIsFullscreen ?? false
+                    if !headingFullscreen,
+                       !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
                        let src = self.overlayManager?.sourcePixelSize {
                         let mismatch = abs(src.width - self.stablePoolWidth) > 8 || abs(src.height - self.stablePoolHeight) > 8
                         if mismatch {
@@ -716,10 +739,9 @@ public final class AppState {
                         } else {
                             self.resizeMismatchCount = 0
                         }
+                    } else if headingFullscreen {
+                        self.resizeMismatchCount = 0
                     }
-                    // 전체화면 자동 뷰어(사용자 요청): 소스가 전체화면이면 Cover→Viewer 자동 전환
-                    // (Cover는 소스 전체화면 못 덮어 glass=0; 뷰어=자기 창은 정상 합성). 창 복귀 시 원복.
-                    self.detectFullscreenAutoViewer()
                 }
             }
         }
@@ -738,7 +760,7 @@ public final class AppState {
             selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
         }
         fsSample = false
-        fsStableCount = 0
+        fsStableSince = 0
         renderDriver.detach()   // 동기 — 반환 후 렌더 틱 없음 보장
         renderSurface = nil
 
@@ -2003,11 +2025,14 @@ public final class AppState {
         guard isCapturing, !retargetInFlight, captureRegion == nil,
               let om = overlayManager else { return }
         let isFS = om.sourceIsFullscreen
-        if isFS == fsSample { fsStableCount = min(fsStableCount + 1, 4) } else { fsSample = isFS; fsStableCount = 0 }
-        // `== 2`면 안정 후 딱 한 틱만 참이라, 그 사이 다른 경로(업스케일 토글 등)가 배치를
-        // 되돌려 놓으면 전체화면인데 Cover인 상태에서 영영 복구되지 않는다 (리뷰 확정).
-        // `>= 2`로 상시 재평가 — 아래 두 분기 모두 이미 목표 상태면 즉시 return이라 부하 없음.
-        guard fsStableCount >= 2 else { return }
+        // 시간 기반 디바운스 — 매 틱(15~30Hz) 호출되므로 샘플 수로 세면 트래킹 주기에 따라
+        // 지연이 달라진다. 전환 애니메이션 중 떨림만 걸러내면 되므로 0.2s면 충분하고,
+        // 옛 "0.5s 게이트 × 2샘플 = 1s 이상"보다 체감 전환이 확연히 빠르다.
+        let nowFS = CFAbsoluteTimeGetCurrent()
+        if isFS != fsSample { fsSample = isFS; fsStableSince = nowFS; return }
+        if fsStableSince == 0 { fsStableSince = nowFS }
+        // 상시 재평가 — 이미 목표 상태면 아래 두 분기가 즉시 return이라 부하 없음.
+        guard nowFS - fsStableSince >= 0.2 else { return }
         if isFS {
             syncCaptureSourceForFullscreen(true)
             guard selectedOverlayPlacement == .coverSource else { return }

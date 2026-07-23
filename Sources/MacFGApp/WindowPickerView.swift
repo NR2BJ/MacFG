@@ -111,6 +111,20 @@ struct WindowPickerView: View {
                 .onChange(of: appState.selectedRenderMode) { appState.updateRenderMode() }
             }
 
+            // 4K에서 Neural은 예산을 크게 넘긴다 — 실측(M4, 3840×2160): Neural 85ms/프레임으로
+            // 소스조차 못 따라가고(60fps→24fps), Metal Flow 35ms, Apple FI 10ms. 해상도별로
+            // 맞는 엔진이 갈리므로 선택을 강요하지 않고 사실만 알린다.
+            if appState.sourceIsLargeForNeural, appState.selectedRenderMode == .rife {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text(L("This source is 4K-class — Neural costs ~85 ms/frame here and can't keep up. Metal Flow (~35 ms) or Apple FI (~10 ms) will be much smoother.",
+                           "이 소스는 4K급이라 Neural은 프레임당 ~85ms로 따라가지 못합니다. Metal Flow(~35ms)나 Apple FI(~10ms)가 훨씬 부드럽습니다.",
+                           "このソースは4K級で、Neuralは1フレーム約85msと追いつけません。Metal Flow(約35ms)かApple FI(約10ms)の方が滑らかです。"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.top, 2)
+            }
+
             field(L("Multiplier", "배율", "倍率"),
                   hint: L("Output frames = source fps × N. Auto fills your refresh rate.",
                           "출력 = 소스 fps × N. Auto는 주사율만큼 채움.",
@@ -328,6 +342,65 @@ struct WindowPickerView: View {
                     Text("日本語").tag("ja")
                 }
                 .labelsHidden().pickerStyle(.menu).fixedSize()
+            }
+
+            field(L("Updates", "업데이트", "アップデート"),
+                  hint: L("Checks GitHub releases. Downloads are manual.",
+                          "GitHub 릴리즈를 확인합니다. 설치는 직접 받아서.",
+                          "GitHubリリースを確認します。インストールは手動です。"),
+                  detail: L("Stable shows finished releases only; Beta also shows prereleases. MacFG never replaces itself — it opens the release page and you swap the app.",
+                            "정식은 완성된 릴리즈만, 베타는 프리릴리즈까지 봅니다. 앱이 스스로 교체하지 않고 릴리즈 페이지를 열어주면 직접 교체합니다.",
+                            "Stableは正式版のみ、Betaはプレリリースも対象。アプリ自身は置き換えず、リリースページを開くので手動で差し替えます。")) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Picker("", selection: Binding(
+                            get: { appState.updateChecker.channel },
+                            set: { appState.updateChecker.channel = $0 }
+                        )) {
+                            Text(L("Stable", "정식", "正式")).tag(ReleaseChannel.stable)
+                            Text(L("Beta", "베타", "ベータ")).tag(ReleaseChannel.beta)
+                        }
+                        .labelsHidden().pickerStyle(.segmented).fixedSize()
+
+                        Toggle(L("Auto", "자동", "自動"), isOn: Binding(
+                            get: { appState.updateChecker.autoCheck },
+                            set: {
+                                appState.updateChecker.autoCheck = $0
+                                if $0 { appState.updateChecker.startPeriodicCheck() }
+                                else { appState.updateChecker.stopPeriodicCheck() }
+                            }))
+                            .toggleStyle(.checkbox)
+
+                        Button(L("Check", "확인", "確認")) {
+                            Task { await appState.updateChecker.check() }
+                        }
+                        .disabled(appState.updateChecker.isChecking)
+                    }
+
+                    if let rel = appState.updateChecker.available {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.circle.fill").foregroundStyle(.green)
+                            Text(L("New: \(rel.tag)", "새 버전: \(rel.tag)", "新版: \(rel.tag)"))
+                                .font(.caption).fontWeight(.medium)
+                            if rel.isPrerelease {
+                                Text(L("beta", "베타", "ベータ"))
+                                    .font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(.orange.opacity(0.2), in: Capsule())
+                            }
+                            Link(L("Open", "열기", "開く"), destination: URL(string: rel.url)!)
+                                .font(.caption)
+                        }
+                    } else {
+                        Text(appState.updateChecker.isChecking
+                             ? L("Checking…", "확인 중…", "確認中…")
+                             : (appState.updateChecker.lastError.map {
+                                    L("Check failed: \($0)", "확인 실패: \($0)", "確認失敗: \($0)") }
+                                ?? L("Up to date (\(appState.updateChecker.currentVersionString))",
+                                     "최신 버전 (\(appState.updateChecker.currentVersionString))",
+                                     "最新版 (\(appState.updateChecker.currentVersionString))")))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
 
             field(L("Developer logging", "개발자 로그", "開発者ログ"),

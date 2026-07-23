@@ -2000,6 +2000,25 @@ public final class AppState {
 
         let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
+
+        // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
+        // "만든 보간 프레임 중 표시 기한을 못 넘겨 버려진 비율". 소스 fps 추정과 무관해,
+        // present 총량 방식이 잘 돌던 L2를 저평가해 L3까지 불필요 강등하던 문제(실측)를 없앤다.
+        //
+        // drawBusy는 손실이 아니다: present 슬롯이 이미 찬 정상 상태(120Hz에 프레임이 다 준비됨)를
+        // 뜻하며, 정상 동작에서도 100~240으로 크다. 이걸 손실로 세면 ratio가 0으로 붕괴한다(실측).
+        // staleDrop(기한 초과 폐기) + capDrop(타임라인 오버플로)만이 진짜 손실이다.
+        // 버스트 소스(브라우저가 프레임을 몰아 보냄)는 staleDrop이 구조적으로 많다 — 우리
+        // 과부하가 아니라 소스가 균일하지 않은 것이라, 강등해도 소용없고 오탐이다. srcInt 지터
+        // 폭(min/max)이 크면 버스트로 보고 손실을 과부하 신호에서 제외한다(1.0 유지). 이 판별은
+        // PLL 케이던스 로직이 쓰는 것과 같은 신호다.
+        let srcSpreadMs = (diagSrcIntMax > 0 && diagSrcIntMin.isFinite) ? (diagSrcIntMax - diagSrcIntMin) * 1000 : 0
+        let bursty = srcSpreadMs > 20
+        let govDropped = diagStaleDropCount + diagCapDropCount
+        let govProduced = diagInterpEncodedCount + diagStaleDropCount + diagCapDropCount
+        pacePresentRatio = (bursty || govProduced <= 8) ? 1.0
+            : max(0, 1.0 - Double(govDropped) / Double(govProduced))
+
         diagResyncCount = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
@@ -2009,15 +2028,7 @@ public final class AppState {
         diagSourceCount = 0
         diagDupSkipCount = 0
         diagTsRejectCount = 0
-        // 거버너용 처리량 비율 — work(파이프라인 지연)이 아니라 "실제로 프레임을 내보냈는가".
-        // 소스 fps×배율과 주사율 중 낮은 쪽이 이론 상한이고, 그 대비 실제 present 비율이
-        // 1에 가까우면 부하와 무관하게 잘 돌고 있는 것이다.
-        if wallSpan > 0.5 {
-            let srcFpsNow = sourceIntervalEMA > 0 ? 1.0 / sourceIntervalEMA : 60.0
-            let mult = max(1, mirrorFrameMultiplier == 0 ? 2 : mirrorFrameMultiplier)
-            let expected = min(srcFpsNow * Double(mult), max(mirrorRefreshRate, 60)) * wallSpan
-            pacePresentRatio = expected > 1 ? min(1.5, Double(diagPresentCount) / expected) : 1.0
-        }
+        _ = wallSpan
         diagPresentCount = 0
         diagInterpPresentCount = 0
         diagPoolExhaustCount = 0

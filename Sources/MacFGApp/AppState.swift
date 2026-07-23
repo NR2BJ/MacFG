@@ -217,8 +217,13 @@ public final class AppState {
         if mirrorInterpolationEnabled != wantInterp { mirrorInterpolationEnabled = wantInterp }
         // ④ 업스케일 체인 — MetalFX(GPU)만 끄고 ANE 2x(GPU-free, 1.68ms 실측)는 유지
         overlayManager?.setUpscaleAllowsMetalFX(loadGovernor.allowsMetalFX)
-        // ⑤ 갭 확장 / t 개수 상한 — 렌더 스레드 미러로 전달
-        gapExpansionAllowed = loadGovernor.allowsGapExpansion
+        // ⑤ 갭 확장 / t 개수 상한 — 렌더 스레드 미러로 전달.
+        // 갭 확장은 거버너가 정상(L0)이어도, 소스가 버스트(srcInt 지터 큼)면 억제한다:
+        // 버스트로 벌어진 갭은 여유가 아니라 몰려온 프레임 사이의 빈 구간이라, 거기 t를 채우면
+        // 절반이 폐기되며 저더(σ↑)만 만든다(4K 버스트 실측). 균일 소스는 지터가 작아 영향 없음.
+        let srcSpreadMs = (diagSrcIntMax > 0 && diagSrcIntMin.isFinite && diagSrcIntMin >= 0)
+            ? (diagSrcIntMax - diagSrcIntMin) * 1000 : 0
+        gapExpansionAllowed = loadGovernor.allowsGapExpansion && srcSpreadMs < 20
         tCountCap = loadGovernor.tCountCap
     }
 
@@ -1588,7 +1593,11 @@ public final class AppState {
                     // 양쪽 양보 구간: A 직후 0.4슬롯 + B 직전 0.6슬롯은 원본이 차지 —
                     // 그리드 위상에 따라 쌍당 2장이 끼며 과생성(1.4장/쌍 → 큐 적체 e2e+30ms 실측)
                     // 되는 것을 차단. 60fps@120Hz에서 유효 창이 정확히 1슬롯 = 쌍당 1장 보장.
-                    while slotTime < snappedTs - displayInterval * 0.6 && tValues.count < 8 {
+                    // 확장 억제 시 이 경로도 상한을 조인다 — 4K 버스트에서 소스가 불균일해 위
+                    // 정수배율 조건을 못 맞추고 이 분기로 빠지면, 벌어진 갭을 슬롯마다 채워 t×6까지
+                    // 나온다. 그게 절반 폐기되며 σ 13ms 저더의 원인(실측). 억제 중엔 2장까지만.
+                    let vsyncCap = gapExpansionAllowed ? 8 : 2
+                    while slotTime < snappedTs - displayInterval * 0.6 && tValues.count < vsyncCap {
                         let t = (slotTime - prev.timestamp) / gap
                         if slotTime > prev.timestamp + displayInterval * 0.4 && t > 0.02 {
                             tValues.append(Float(t))
@@ -2008,16 +2017,17 @@ public final class AppState {
         // drawBusy는 손실이 아니다: present 슬롯이 이미 찬 정상 상태(120Hz에 프레임이 다 준비됨)를
         // 뜻하며, 정상 동작에서도 100~240으로 크다. 이걸 손실로 세면 ratio가 0으로 붕괴한다(실측).
         // staleDrop(기한 초과 폐기) + capDrop(타임라인 오버플로)만이 진짜 손실이다.
-        // 버스트 소스(브라우저가 프레임을 몰아 보냄)는 staleDrop이 구조적으로 많다 — 우리
-        // 과부하가 아니라 소스가 균일하지 않은 것이라, 강등해도 소용없고 오탐이다. srcInt 지터
-        // 폭(min/max)이 크면 버스트로 보고 손실을 과부하 신호에서 제외한다(1.0 유지). 이 판별은
-        // PLL 케이던스 로직이 쓰는 것과 같은 신호다.
-        let srcSpreadMs = (diagSrcIntMax > 0 && diagSrcIntMin.isFinite) ? (diagSrcIntMax - diagSrcIntMin) * 1000 : 0
-        let bursty = srcSpreadMs > 20
+        // 과부하 = "만든 보간 프레임 중 표시 기한을 못 넘겨 폐기된 비율".
+        //
+        // 버스트 소스를 예외 처리했었으나 4K에서 역효과였다: 소스가 버스트면 work가 60ms를
+        // 넘어도 강등을 면제받아, t×6까지 만들어 절반을 버리고 glass σ가 13ms까지 튀었다(실측
+        // 4K 디스플레이 캡처). "프레임 수는 90인데 원본보다 안 부드럽다"의 정체다. 버스트라도
+        // 실제로 처리량이 무너지면 강등해야 한다 — 예외를 제거한다.
         let govDropped = diagStaleDropCount + diagCapDropCount
         let govProduced = diagInterpEncodedCount + diagStaleDropCount + diagCapDropCount
-        pacePresentRatio = (bursty || govProduced <= 8) ? 1.0
-            : max(0, 1.0 - Double(govDropped) / Double(govProduced))
+        pacePresentRatio = govProduced > 8
+            ? max(0, 1.0 - Double(govDropped) / Double(govProduced))
+            : 1.0
 
         diagResyncCount = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0

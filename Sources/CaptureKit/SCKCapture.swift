@@ -39,6 +39,9 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     /// 대상 창 닫힘 등으로 스트림이 비정상 중단됐을 때 (즉시). 우리가 stopCapture하면 호출 안 됨.
     public var onStreamStopped: (@Sendable () -> Void)?
 
+    /// 새 프레임이 큐에 들어왔을 때 (캡처 스레드에서, 락 밖). 소비자가 즉시 drain하도록.
+    public var onFrameAvailable: (@Sendable () -> Void)?
+
     public init() {}
 
     public func startCapture(windowID: CGWindowID, device: any MTLDevice, captureRect: CGRect? = nil) async throws {
@@ -74,6 +77,9 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
                 self.pendingSlots.removeFirst(self.pendingSlots.count - 8)
             }
             self.lock.unlock()
+            // 도착 즉시 알림 — 소비자가 렌더 틱을 기다리지 않고 인제스트를 시작할 수 있게.
+            // 틱을 기다리면 평균 ½틱(~4.2ms)이 그냥 버려진다 (락 밖에서 호출: 재진입 안전).
+            self.onFrameAvailable?()
         }
         self.outputHandler = handler
 

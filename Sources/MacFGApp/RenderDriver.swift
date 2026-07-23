@@ -70,6 +70,22 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
         return runLoop != nil
     }
 
+    /// 렌더 스레드에서 블록 실행 (완료 대기 없음) — 캡처 콜백처럼 "빨리 태우고 빠지는" 경로용.
+    ///
+    /// performSync와 같은 런루프에 올라가므로 **틱과 절대 겹치지 않는다** → 렌더 상태의
+    /// 무락 전제(timeline/prevStable/snap 링 등을 렌더 스레드만 만진다)가 그대로 보존된다.
+    /// 대기하지 않으므로 캡처 스레드를 막지 않고, 실패(런루프 미기동) 시 조용히 버린다 —
+    /// 그 경우 렌더 틱의 기존 drain 경로가 같은 프레임을 가져간다.
+    /// @discardableResult로 "태워졌는지"를 알려 호출측이 폴백을 판단할 수 있게 한다.
+    @discardableResult
+    func performAsync(_ block: @escaping @Sendable () -> Void) -> Bool {
+        lock.lock(); let rl = runLoop; lock.unlock()
+        guard let rl else { return false }
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.defaultMode.rawValue, block)
+        CFRunLoopWakeUp(rl)
+        return true
+    }
+
     /// 렌더 스레드에서 블록 실행 (완료 대기)
     private func performSync(_ block: @escaping () -> Void) {
         lock.lock(); let rl = runLoop; lock.unlock()

@@ -75,6 +75,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private var prevCoarseF: (any MTLTexture)?
     private var prevCoarseB: (any MTLTexture)?
     private var hasTemporalPrior = false
+    /// 직전 쌍의 tsB — 이번 tsA와 같으면 A쪽 피라미드를 재사용할 수 있다 (O1-2 핑퐁)
+    private var lastPairTsB: CFTimeInterval = 0
+    /// A쪽 재사용 허용 (MACFG_NOREUSEA=1로 끄고 A/B 비교)
+    private let reuseA = ProcessInfo.processInfo.environment["MACFG_NOREUSEA"] != "1"
     // 출력 링: 갭 채움으로 쌍당 최대 4장 → 넉넉히 12 (타임라인 cap 12와 정합)
     private var outputPool: [any MTLTexture] = []
     private var outputIndex = 0
@@ -163,16 +167,29 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return nil }
 
+        // O1-2: 연속 쌍이면 A쪽 피라미드는 직전 쌍의 B쪽 결과와 같다 (stableA == 직전 stableB).
+        // 매 쌍 A를 재계산하던 것을 핑퐁 스왑으로 건너뛴다 — 피라미드/zero-mean 스테이지의
+        // 절반 + 4K BGRA 읽기 1회분 절감. 불연속(리셋/드랍/크기변경)이면 정상 계산.
+        let continuous = reuseA && lastPairTsB > 0 && abs(tsA - lastPairTsB) < 1e-6
+        if continuous {
+            swap(&lumaA, &lumaB)   // 직전 B피라미드가 이번 A — 내용 그대로 재사용
+            swap(&zmA, &zmB)
+        }
+
         // 1) 루마 피라미드
         enc.setComputePipelineState(downLumaPSO)
-        enc.setTexture(stableA, index: 0); enc.setTexture(lumaA[0], index: 1)
-        dispatch(enc, levels[0].w, levels[0].h, downLumaPSO)
+        if !continuous {
+            enc.setTexture(stableA, index: 0); enc.setTexture(lumaA[0], index: 1)
+            dispatch(enc, levels[0].w, levels[0].h, downLumaPSO)
+        }
         enc.setTexture(stableB, index: 0); enc.setTexture(lumaB[0], index: 1)
         dispatch(enc, levels[0].w, levels[0].h, downLumaPSO)
         enc.setComputePipelineState(downHalfPSO)
         for l in 1..<L {
-            enc.setTexture(lumaA[l - 1], index: 0); enc.setTexture(lumaA[l], index: 1)
-            dispatch(enc, levels[l].w, levels[l].h, downHalfPSO)
+            if !continuous {
+                enc.setTexture(lumaA[l - 1], index: 0); enc.setTexture(lumaA[l], index: 1)
+                dispatch(enc, levels[l].w, levels[l].h, downHalfPSO)
+            }
             enc.setTexture(lumaB[l - 1], index: 0); enc.setTexture(lumaB[l], index: 1)
             dispatch(enc, levels[l].w, levels[l].h, downHalfPSO)
         }
@@ -181,11 +198,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 재계산하던 것을 프리패스 1회로 대체 — 매치 커널 ALU/레지스터 대폭 절감 (4K 실측 8.3→벤치 참조)
         enc.setComputePipelineState(zeroMeanPSO)
         for l in 0..<L {
-            enc.setTexture(lumaA[l], index: 0); enc.setTexture(zmA[l], index: 1)
-            dispatch(enc, levels[l].w, levels[l].h, zeroMeanPSO)
+            if !continuous {
+                enc.setTexture(lumaA[l], index: 0); enc.setTexture(zmA[l], index: 1)
+                dispatch(enc, levels[l].w, levels[l].h, zeroMeanPSO)
+            }
             enc.setTexture(lumaB[l], index: 0); enc.setTexture(zmB[l], index: 1)
             dispatch(enc, levels[l].w, levels[l].h, zeroMeanPSO)
         }
+        lastPairTsB = tsB
 
         // 2) coarse→fine 매칭 (양방향) + 스무딩.
         // 코스 레벨은 이전 쌍의 flow를 prior로 사용 (시간적 전파 — 프레임 간 벡터 일관성).
@@ -382,6 +402,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         prevCoarseF = tex(cl.w, cl.h, .rg16Float)
         prevCoarseB = tex(cl.w, cl.h, .rg16Float)
         hasTemporalPrior = false
+        lastPairTsB = 0
 
         outputPool = []; statsBuffers = []; outputIndex = 0; statsIndex = 0; slotStamps = []
         // 출력 풀 크기: 호출측이 쌍당 최대 8 t를 보내므로(갭 채움) 연속 2쌍=16장이 타임라인
@@ -412,6 +433,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     public func reset() {
         hasTemporalPrior = false
+        lastPairTsB = 0
     }
 
     public func shutdown() {

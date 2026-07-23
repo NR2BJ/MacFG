@@ -229,6 +229,9 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var renderSurface: RenderSurface?
     /// UI 설정의 렌더용 미러 (메인이 쓰고 렌더가 읽는 racy-but-benign 단순값)
     @ObservationIgnored nonisolated(unsafe) private var mirrorInterpolationEnabled = true
+    /// isCapturing의 렌더 스레드용 미러 — 캡처 콜백이 정지 직후에도 인제스트하지 않도록.
+    /// (isCapturing은 MainActor라 렌더/캡처 스레드에서 못 읽는다)
+    @ObservationIgnored nonisolated(unsafe) private var isCapturingMirror = false
     @ObservationIgnored nonisolated(unsafe) private var mirrorFrameMultiplier = 0
     @ObservationIgnored nonisolated(unsafe) private var mirrorRefreshRate: Double = 120
     /// 숨김→표시 전이 시 렌더 스레드가 자기 틱에서 스케줄러/엔진을 리셋하게 하는 신호
@@ -604,6 +607,23 @@ public final class AppState {
             return
         }
 
+        // O1-1 콜백 구동 인제스트: 프레임이 도착하면 렌더 틱을 기다리지 말고 즉시 렌더 스레드
+        // 런루프에 인제스트를 태운다. 틱을 기다리면 평균 ½틱(~4.2ms)이 그냥 버려지고, 그 지연이
+        // work·e2e에 그대로 실릴 뿐 아니라 paceWorkP90을 올려 적응지연 하한까지 밀어올린다.
+        // performAsync는 틱과 같은 런루프라 절대 겹치지 않음 → 무락 전제 보존.
+        // MACFG_CBINGEST=0이면 기존(틱 drain 전용) 경로로 폴백.
+        if ProcessInfo.processInfo.environment["MACFG_CBINGEST"] != "0" {
+            captureManager.onFrameAvailable = { [weak self] in
+                guard let self else { return }
+                self.renderDriver.performAsync { [weak self] in
+                    guard let self, self.isCapturingMirror else { return }
+                    self.drainAndIngest(maxCount: 4)
+                }
+            }
+        } else {
+            captureManager.onFrameAvailable = nil
+        }
+
         do {
             try await captureManager.startCapture(windowID: windowID, device: device, captureRect: captureRegion)
             captureMethod = captureManager.activeMethod.rawValue
@@ -649,6 +669,7 @@ public final class AppState {
             overlayUserHidden = false
             overlayHiddenState = false
             isCapturing = true
+            isCapturingMirror = true
             // 소스 앱을 최전면으로 활성화 — cover/viewer 공통.
             // 첫 캡처는 보통 MacFG 창이 최전면인 상태(옵션 설정 후 핫키/버튼)라, 소스(브라우저)가
             // 백그라운드로 밀려 렌더 품질이 떨어진다(브라우저 백그라운드 스로틀 — 첫 캡처만 저화질,
@@ -685,6 +706,7 @@ public final class AppState {
             trackingTimer?.invalidate();       trackingTimer = nil
             drawableReattachTimer?.invalidate(); drawableReattachTimer = nil
             isCapturing = false
+            isCapturingMirror = false
             captureMethod = "None"
             trackingMethod = "None"
             sourceOwnerPID = 0
@@ -752,6 +774,8 @@ public final class AppState {
         // handleScreenParametersChange(399행, isCapturing 가드)로 detach된 링크를 재부착해
         // 좀비 렌더 루프를 만들던 것 차단 (리뷰 확정). 진행 중 configurePairEngine도 무효화.
         isCapturing = false
+        isCapturingMirror = false
+        captureManager.onFrameAvailable = nil   // 콜백 인제스트 즉시 차단
         configureEpoch += 1
         // 자동 전체화면 뷰어는 이번 캡처 한정 상태 — 원복 안 하면 다음 캡처가 전체화면 뷰어로
         // 잘못 시작한다 (리뷰 확정). 사용자 설정(upscaleMode)에서 배치를 다시 유도.
@@ -1236,29 +1260,36 @@ public final class AppState {
         // 버스트 캡: 숨김 해제/스트림 재개 직후 한 틱에 8장까지 몰리면 인코딩 CPU가
         // 8ms를 넘겨 다음 vsync 콜백을 삼킴 — 틱당 4장, 나머지는 다음 틱으로 이월
         // (타임스탬프 보존, 표시는 어차피 latencyOffset 뒤라 이월 8ms는 무해)
-        var sawTexture = false
-        var depth = 0
-        pendingIngest.append(contentsOf: captureManager.drainFrames().filter { $0.texture != nil })
-        let ingestNow = min(pendingIngest.count, 4)
-        if ingestNow > 0 {
-            for slot in pendingIngest.prefix(ingestNow) {
-                sawTexture = true
-                depth += 1
-                ingest(slot)
-            }
-            pendingIngest.removeFirst(min(ingestNow, pendingIngest.count))
-            diagDrainDepthSum += depth
-            diagDrainSamples += 1
-            if depth > diagDrainDepthMax { diagDrainDepthMax = depth }
-        }
-
-        if sawTexture {
-            hasReceivedFirstFrame = true
-        }
+        // 콜백 구동 인제스트가 켜져 있으면 대개 여기 올 프레임이 이미 소진돼 no-op이다.
+        // 그래도 남겨두는 이유: 런루프 미기동/블록 유실 시의 폴백이자, 콜백이 없는
+        // IOSurface 폴백 소스의 유일한 경로.
+        drainAndIngest(maxCount: 4)
         // (창 종료/리사이즈 감지는 트래킹 타이머(메인)로 이동 — overlayManager는 MainActor)
 
         adaptPacing()
         maybeLogDiagnostics()
+    }
+
+    /// 대기 중인 캡처 프레임을 인제스트한다. **렌더 스레드 전용** — 틱과 캡처 콜백(performAsync)
+    /// 양쪽에서 불리지만 둘 다 같은 런루프라 직렬화되므로 무락 전제가 유지된다.
+    ///
+    /// maxCount: 한 번에 처리할 최대 장수. 버스트(숨김 해제/스트림 재개 직후 8장 몰림)에서
+    /// 인코딩 CPU가 한 번에 8ms를 넘겨 다음 vsync 콜백을 삼키는 것을 막는다. 나머지는
+    /// pendingIngest에 남아 다음 호출로 이월 (타임스탬프 보존, 표시는 latencyOffset 뒤라 무해).
+    nonisolated private func drainAndIngest(maxCount: Int) {
+        pendingIngest.append(contentsOf: captureManager.drainFrames().filter { $0.texture != nil })
+        let n = min(pendingIngest.count, maxCount)
+        guard n > 0 else { return }
+        var depth = 0
+        for slot in pendingIngest.prefix(n) {
+            depth += 1
+            ingest(slot)
+        }
+        pendingIngest.removeFirst(min(n, pendingIngest.count))
+        diagDrainDepthSum += depth
+        diagDrainSamples += 1
+        if depth > diagDrainDepthMax { diagDrainDepthMax = depth }
+        hasReceivedFirstFrame = true
     }
 
     /// 표시할 항목 선택 + present — targetTimestamp에서 latencyOffset만큼 과거의 콘텐츠.
@@ -1272,6 +1303,10 @@ public final class AppState {
         // 고여 e2e가 +40ms 눌러앉는 것 방지 (실측 75-84ms → 목표 ~55ms).
         // '깊다' 기준은 적응 지연 슬롯만큼 상향 — extra 체제에선 tl 8-9가 정상 깊이인데
         // 이를 적체로 오판해 상시 타이트 드랍하던 것 방지 (staleDrop 8-14/2s 실측 → 완화)
+        // 주의: 배출 판정을 "동시에 기한 지난 항목 수(candidates>=2)"로 바꿔봤으나 버스트에서
+        // 정상적으로 몰려 도착한 프레임까지 적체로 오판해 매 틱 드롭 → staleDrop 39, σ 12.65로
+        // 악화(실측, 기존 대비 4배). 정상 큐 깊이는 latencyOffset×주사율(lat=+4에서 ~7.4)이라
+        // tl 6-7은 적체가 아니라 의도된 버퍼다. 원래 조건 유지.
         let staleCutoff = target - interval * (timeline.count >= 6 + Int(extraLatencySlots) ? 1.2 : 2.5)
         let candidates = timeline.filter { $0.timestamp > lastPresentedTimestamp && $0.timestamp <= target + 0.002 }
         var pick = candidates.first

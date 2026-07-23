@@ -196,6 +196,62 @@ public final class AppState {
     /// GitHub 릴리즈 업데이트 확인 (알림만, 설치는 사용자가)
     let updateChecker = UpdateChecker()
 
+    /// 부하 거버너 — 성능이 예산을 못 맞추면 화질 다이얼을 단계적으로 낮춘다 (O2-1)
+    let loadGovernor = LoadGovernor()
+
+    /// 거버너 레벨을 실제 다이얼에 반영. 레벨이 바뀐 순간에만 실질 작업이 일어난다.
+    func applyGovernorDials() {
+        // ① MetalFlow flow 해상도 상한 — 사용자 설정값과 거버너 상한 중 낮은 쪽.
+        //    엔진 자율 사다리(RIFE)는 건드리지 않는다 (같은 다이얼 이중 조작 = 발진).
+        let base = min(userFlowBase, loadGovernor.flowBaseCap ?? userFlowBase)
+        if MetalFlowEngine.flowBaseLongSide != base {
+            MetalFlowEngine.flowBaseLongSide = base
+            DiagnosticLog.shared.log("[GOV] flowBase → \(Int(base))")
+        }
+        // ② 보간 배율 상한 — 렌더 스레드 미러에 반영 (t 생성 단계에서 소비)
+        let mult = min(frameMultiplier, loadGovernor.multiplierCap ?? frameMultiplier)
+        if mirrorFrameMultiplier != mult { mirrorFrameMultiplier = mult }
+        // ③ 보간 바이패스 — 원본 패스스루. 엔진은 살려둬 복귀가 즉시 되게 한다
+        //    (엔진을 내리면 configurePairEngine 수백 ms + RIFE 사다리 재락 ~1s가 든다).
+        let wantInterp = isInterpolationEnabled && !loadGovernor.bypassInterpolation
+        if mirrorInterpolationEnabled != wantInterp { mirrorInterpolationEnabled = wantInterp }
+        // ④ 업스케일 체인 — MetalFX(GPU)만 끄고 ANE 2x(GPU-free, 1.68ms 실측)는 유지
+        overlayManager?.setUpscaleAllowsMetalFX(loadGovernor.allowsMetalFX)
+    }
+
+    /// 사용자가 고른 flow 해상도 (거버너 상한 계산의 기준값)
+    @ObservationIgnored private var userFlowBase: Double = MetalFlowEngine.flowBaseLongSide
+
+    /// 거버너에 이번 창의 부하 신호를 먹인다 — 전부 기존 계측이라 추가 비용 없음.
+    /// 거버너는 화질 다이얼만 만지고 페이싱(extraLatencySlots)은 건드리지 않는다.
+    nonisolated private func feedLoadGovernor() {
+        let refresh = max(mirrorRefreshRate, 60)
+        let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
+        let signals = LoadGovernor.Signals(
+            workP90Ms: paceWorkP90,
+            workAvgMs: paceWorkAvg,
+            sourceIntervalMs: interval * 1000.0,
+            tickHz: lastTickHz,
+            refreshHz: refresh,
+            missCount: paceMissCount,
+            presentRatio: pacePresentRatio)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.loadGovernor.update(signals)
+            self.applyGovernorDials()
+        }
+    }
+
+    /// GPU 코어 수 추정 — 정확한 API가 없어 이름으로 등급만 가른다 (시딩용, 오차 허용).
+    /// 틀려도 피해는 "처음 몇 초 보수적 화질"이고 실측 신호가 곧 정정한다.
+    nonisolated static func gpuCoreCountEstimate(_ device: any MTLDevice) -> Int {
+        let n = device.name
+        if n.contains("Ultra") { return 48 }
+        if n.contains("Max")   { return 32 }
+        if n.contains("Pro")   { return 16 }
+        return 10   // 베이스 M 시리즈 (M1 8, M4 10 — 저사양 판정 경계에 걸치게)
+    }
+
     /// 소스가 Neural(RIFE) 예산을 넘길 만큼 큰지 — 4K급(≈7MP 이상). UI 경고용.
     /// 실측(M4): 3840×2160에서 Neural 85ms/프레임(소스 60fps→24fps로 붕괴), MetalFlow 35ms, AppleFI 10ms.
     var sourceIsLargeForNeural: Bool {
@@ -643,6 +699,13 @@ public final class AppState {
             // 먹고 그 miss로 적응 지연이 +4까지 불필요하게 램프 (리뷰 지적, 로그 확인).
             _ = captureManager.drainFrames()
             resetScheduler()
+            // 거버너 시딩 — 기기 등급 + 소스 크기로 보수적 시작값. 정착값은 실측이 정한다.
+            loadGovernor.reset()
+            loadGovernor.seedForDevice(
+                gpuCoreCount: Self.gpuCoreCountEstimate(device),
+                memoryGB: Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0,
+                sourcePixels: stablePoolWidth * stablePoolHeight)
+            applyGovernorDials()
             pendingShowReset = false
             attachRenderDriver()
 
@@ -1055,6 +1118,13 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var paceCleanWindows = 0
     /// work(캡처→타임라인 등재) 지연 p90 [ms] — 적응 지연의 실측 하한 근거
     @ObservationIgnored nonisolated(unsafe) private var paceWorkP90: Double = 0
+    /// 최근 진단 창의 실제 틱 레이트 — 거버너의 "렌더 루프 굶주림" 신호
+    @ObservationIgnored nonisolated(unsafe) private var lastTickHz: Double = 0
+    /// 이번 창의 work 평균 — 거버너 복귀 판정용 (감쇠 없는 즉응 신호)
+    @ObservationIgnored nonisolated(unsafe) private var paceWorkAvg: Double = 0
+    /// 이번 창의 present 처리량 / 이론 상한 (1.0 = 목표 달성). 거버너의 주신호 —
+    /// work는 파이프라인 "지연"이라 15ms여도 240프레임을 다 뽑을 수 있어 과부하 판정에 부적합.
+    @ObservationIgnored nonisolated(unsafe) private var pacePresentRatio: Double = 1.0
     @ObservationIgnored nonisolated(unsafe) private var lastPaceAdjustTick = 0
     /// 이 틱까지는 miss 무시 — 캡처 시작/리셋 직후 케이던스 락 과도기의 miss로
     /// 깨끗한 소스까지 +4 램프되는 것 방지 (무지터 소스 e2e 57→91ms 낭비 실측)
@@ -1066,6 +1136,10 @@ public final class AppState {
         guard diagTick - lastPaceAdjustTick >= 240 else { return }
         lastPaceAdjustTick = diagTick
         defer { paceMissCount = 0 }
+        // 거버너 급전은 **아래 조기 반환들보다 먼저** — 특히 바이패스(L3)에선
+        // mirrorInterpolationEnabled가 false라 아래 게이트에서 반환되는데, 그러면 거버너가
+        // 신호를 못 받아 영영 L3에 갇힌다(실측: 부하 종료 후 60초간 복귀 실패).
+        feedLoadGovernor()
         if adaptDisabled { extraLatencySlots = 0; return }      // A/B: 적응 지연 완전 차단
         // 저지연 모드(보간 OFF, 인터랙티브) — 적응 지연 램프 차단. 스무딩보다 반응성 우선
         // (램프하면 저지연 오프셋을 도로 상쇄해 텍스트 드래그가 다시 밀림, 실측 lat=+3).
@@ -1084,6 +1158,7 @@ public final class AppState {
         let requiredExtra = paceWorkP90 > 0
             ? min(maxSlots, max(0.0, ((paceWorkP90 + 2.0 - baseMs) / slotMs).rounded(.up)))
             : 0.0
+
         if extraLatencySlots < requiredExtra {
             extraLatencySlots = requiredExtra
             paceCleanWindows = 0
@@ -1828,7 +1903,9 @@ public final class AppState {
 
         // 틱 레이트: 240틱의 실제 벽시계 소요 — 2.0s면 무손실 120Hz, 2.05s면 ~117Hz(틱 유실)
         let nowWall = CFAbsoluteTimeGetCurrent()
-        let tickHz = diagLastLogWall > 0 ? 240.0 / (nowWall - diagLastLogWall) : 0
+        let wallSpan = diagLastLogWall > 0 ? nowWall - diagLastLogWall : 0
+        let tickHz = wallSpan > 0 ? 240.0 / wallSpan : 0
+        lastTickHz = tickHz   // 거버너 신호용 (다음 창에서 읽음)
         diagLastLogWall = nowWall
         let tickCPUAvg = diagTickCPUSum / 240.0
         let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f)", tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax)
@@ -1849,6 +1926,7 @@ public final class AppState {
             let sorted = workLats.sorted()
             let p90 = sorted[min(sorted.count - 1, (sorted.count * 9) / 10)]
             paceWorkP90 = max(p90, paceWorkP90 * 0.9)
+            paceWorkAvg = avgWork   // 거버너 복귀용 즉응 신호 (p90은 감쇠 10%/2s라 복귀가 30s+)
         }
         let cuts = mailbox.drainSceneCutCount()
 
@@ -1902,6 +1980,15 @@ public final class AppState {
         diagSourceCount = 0
         diagDupSkipCount = 0
         diagTsRejectCount = 0
+        // 거버너용 처리량 비율 — work(파이프라인 지연)이 아니라 "실제로 프레임을 내보냈는가".
+        // 소스 fps×배율과 주사율 중 낮은 쪽이 이론 상한이고, 그 대비 실제 present 비율이
+        // 1에 가까우면 부하와 무관하게 잘 돌고 있는 것이다.
+        if wallSpan > 0.5 {
+            let srcFpsNow = sourceIntervalEMA > 0 ? 1.0 / sourceIntervalEMA : 60.0
+            let mult = max(1, mirrorFrameMultiplier == 0 ? 2 : mirrorFrameMultiplier)
+            let expected = min(srcFpsNow * Double(mult), max(mirrorRefreshRate, 60)) * wallSpan
+            pacePresentRatio = expected > 1 ? min(1.5, Double(diagPresentCount) / expected) : 1.0
+        }
         diagPresentCount = 0
         diagInterpPresentCount = 0
         diagPoolExhaustCount = 0
@@ -1975,6 +2062,10 @@ public final class AppState {
         lines.append(L("Output", "출력", "出力") + ": \(Int(outputFPS)) fps · \(engine)")
         lines.append(L("Latency", "지연", "遅延") + ": \(Int(latencyMs)) ms")
         lines.append(L("Upscale", "업스케일", "アップスケール") + ": " + (upscaleStatus ?? L("Off", "끔", "オフ")))
+        // 거버너가 개입 중이면 알린다 — 화질이 낮아진 이유를 사용자가 알 수 있어야 한다
+        if let gov = loadGovernor.statusText {
+            lines.append("⚠︎ " + gov)
+        }
         overlayManager?.setInfoOverlay(lines.joined(separator: "\n"))
     }
 

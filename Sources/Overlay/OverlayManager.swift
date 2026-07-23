@@ -128,6 +128,30 @@ public final class OverlayManager {
     public func setUpscaleMode(_ mode: UpscaleMode) {
         upscaleMode = mode
         overlayWindow?.upscaleMode = mode
+        applyUpscaleGate()
+    }
+
+    /// 부하 거버너의 MetalFX 게이트 — false면 GPU를 쓰는 MetalFX 단계만 끈다.
+    /// ANE 2x는 GPU-free(1.68ms 실측)라 유지해 체감 손실을 최소화한다.
+    private var allowsMetalFX = true
+    public func setUpscaleAllowsMetalFX(_ allow: Bool) {
+        guard allowsMetalFX != allow else { return }
+        allowsMetalFX = allow
+        applyUpscaleGate()
+    }
+
+    private func applyUpscaleGate() {
+        let effective: UpscaleMode
+        if allowsMetalFX {
+            effective = upscaleMode
+        } else {
+            switch upscaleMode {
+            case .metalfx:     effective = .off   // MetalFX 단독 → 끔
+            case .aneMetalfx:  effective = .ane   // 체인에서 MetalFX만 제거
+            default:           effective = upscaleMode
+            }
+        }
+        overlayWindow?.upscaleMode = effective
     }
 
     /// CAS 샤프닝 강도 (0=끔) — 업스케일과 독립, 창 재생성에도 유지

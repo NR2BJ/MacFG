@@ -217,7 +217,14 @@ public final class AppState {
         if mirrorInterpolationEnabled != wantInterp { mirrorInterpolationEnabled = wantInterp }
         // ④ 업스케일 체인 — MetalFX(GPU)만 끄고 ANE 2x(GPU-free, 1.68ms 실측)는 유지
         overlayManager?.setUpscaleAllowsMetalFX(loadGovernor.allowsMetalFX)
+        // ⑤ 갭 확장 / t 개수 상한 — 렌더 스레드 미러로 전달
+        gapExpansionAllowed = loadGovernor.allowsGapExpansion
+        tCountCap = loadGovernor.tCountCap
     }
+
+    /// 거버너 미러 (렌더 스레드에서 읽음) — 갭 확장 허용 / t 개수 상한
+    @ObservationIgnored nonisolated(unsafe) private var gapExpansionAllowed = true
+    @ObservationIgnored nonisolated(unsafe) private var tCountCap: Int?
 
     /// 사용자가 고른 flow 해상도 (거버너 상한 계산의 기준값)
     @ObservationIgnored private var userFlowBase: Double = MetalFlowEngine.flowBaseLongSide
@@ -1541,7 +1548,14 @@ public final class AppState {
                     // 갭이 크면(드랍) 스텝 비례로 늘려 M배 케이던스 유지.
                     // M×fps가 주사율을 넘는 초과분은 표시 불가라 생성도 안 함.
                     let interval = sourceIntervalEMA > 0 ? sourceIntervalEMA : gap
-                    let steps = max(1.0, (gap / interval).rounded())
+                    var steps = max(1.0, (gap / interval).rounded())
+                    // 갭 확장 억제: steps>1은 "소스가 느리다"가 아니라 **프레임을 잃었다**는 뜻이다
+                    // (소스가 진짜 느리면 EMA가 따라가 steps=1이 된다). 여유가 있을 때 구멍을 메우는
+                    // 건 옳지만, 부하로 잃은 것이면 잃은 만큼 더 만들어 부하를 키우는 자기강화가 된다:
+                    // 드롭 → 갭 2배 → 3장 생성 → 4K 워프 3회 + ANE 3회 → work 50-65ms → 더 드롭.
+                    // 실측(4K 디스플레이 캡처): t×3 anchors=3, present 124/240, staleDrop 103.
+                    // 그래서 거버너가 개입 중이면 확장을 접고 기본 배율만 만든다.
+                    if !gapExpansionAllowed { steps = 1 }
                     let maxUseful = max(1, Int((interval / displayInterval).rounded()))
                     let m = min(mirrorFrameMultiplier, maxUseful)
                     let count = min(m * Int(steps) - 1, 8)
@@ -1559,7 +1573,11 @@ public final class AppState {
                     // 그리드에 놓으면 두 클럭이 드리프트하며 표시 간격이 (슬롯±δ)로 교대해
                     // content wobble ±4ms를 만든다(실측 ±3.7). 균등분할이면 S·I 모두 소스 그리드
                     // 위 정확히 등간격 → 혼합 그리드 wobble 원천 소멸.
-                    let n = Int((gap / displayInterval).rounded())
+                    // Auto 배율(frameMultiplier=0)이 타는 경로. 갭이 커질수록 t가 비례해 늘어나므로
+                    // 위 멀티플라이어 경로와 같은 자기강화 위험이 있다 — 부하 중엔 갭이 드롭 때문에
+                    // 커진 것이라 더 만들면 더 잃는다. 확장 억제 시 표시 슬롯 2개분(=1장)만.
+                    let nRaw = Int((gap / displayInterval).rounded())
+                    let n = gapExpansionAllowed ? nRaw : min(nRaw, 2)
                     tValues = (1..<n).map { Float($0) / Float(n) }
                 } else if lastVsyncTarget > 0 {
                     // 비정수 조합(60→144 = 쌍당 2.4슬롯 등)은 vsync 그리드 정렬 유지 —
@@ -1581,6 +1599,17 @@ public final class AppState {
                 // 폴백은 큰 갭 + 불운한 그리드 위상일 때만. 작은 갭(≤1.5슬롯)은 소스 두 장이
                 // 이미 인접 슬롯을 채우므로 [0.5] 폴백이 잉여 프레임 → 큐 적체(e2e +40ms 실측)
                 if tValues.isEmpty && gap > displayInterval * 1.5 { tValues = [0.5] }
+                // 거버너 t 상한 — **세 생성 경로 공통**. 경로별로 걸면 Auto 배율(=0)처럼
+                // 다른 분기를 타는 설정에서 그냥 새어나간다(실측: 캡을 첫 분기에만 걸었더니
+                // 강등 후에도 t×5·t×6이 계속 나옴). 균등 간격으로 솎아 케이던스는 보존.
+                if let cap = tCountCap, tValues.count > cap {
+                    if cap <= 0 {
+                        tValues = []
+                    } else {
+                        let stride = Double(tValues.count) / Double(cap)
+                        tValues = (0..<cap).map { tValues[min(Int(Double($0) * stride), tValues.count - 1)] }
+                    }
+                }
                 if tValues.isEmpty {
                     diagSkipContentFast += 1
                 }

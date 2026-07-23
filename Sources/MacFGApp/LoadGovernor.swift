@@ -197,6 +197,20 @@ public final class LoadGovernor {
         }
     }
 
+    /// 잃은 프레임만큼 보간을 더 만드는 "갭 확장"을 허용할지.
+    /// 여유가 있을 때만 구멍을 메우는 게 맞다 — 부하 중엔 확장이 부하를 키워 더 잃게 만든다.
+    public var allowsGapExpansion: Bool { level == .full }
+
+    /// 쌍당 보간 프레임 수 상한. nil이면 제한 없음.
+    public var tCountCap: Int? {
+        switch level {
+        case .full:   return nil
+        case .light:  return 2
+        case .heavy:  return 1
+        case .bypass: return 0
+        }
+    }
+
     /// MetalFX 공간 업스케일을 쓸 수 있는지 (ANE 2x는 GPU-free라 계속 유지).
     public var allowsMetalFX: Bool { level == .full }
 

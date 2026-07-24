@@ -40,6 +40,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.
     public nonisolated(unsafe) static var occlusionDirectional: Bool = false
 
+    /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.
+    public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFRADIUS"], let v = Int32(s), (1...8).contains(v) { return v }
+        return 3
+    }()
+
     /// 모션 부드러움 0(예리)~1(부드러움), 0.5=현재 기본. 취향 슬라이더 — flow의 예리함↔매끄러움 축.
     /// 하단: flow raw(디테일↑, shimmer 가능). 상단: flow 박스+워프블러(에러 완만, AppleFI 느낌).
     public nonisolated(unsafe) static var motionSmoothness: Float = 0.5
@@ -220,7 +226,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             let isCoarsest = (l == L - 1)
             let useTemporal = isCoarsest && hasTemporalPrior
             var params = MatchParams(
-                searchRadius: isCoarsest ? 3 : 1,
+                // 최상위(코스) 탐색 반경 — 여기서 잡는 최대 변위가 곧 "빠른 시점 회전을 따라갈 수 있는
+                // 한계"다. 코스 레벨은 가장 작아서(4K/flow1440 기준 22×12px) 반경을 넓혀도 비용이
+                // 거의 안 는다(후보 수는 (2r+1)²이지만 픽셀 수가 1/4096). MACFG_MFRADIUS로 실측 스윕.
+                searchRadius: isCoarsest ? Self.coarseSearchRadius : 1,
                 hasPrior: (useTemporal || !isCoarsest) ? 1 : 0,
                 refine: l == 0 ? 1 : 0,  // 서브픽셀 refine은 최종 레벨만 (비용 40%↓)
                 priorScale: isCoarsest ? 1.0 : 2.0

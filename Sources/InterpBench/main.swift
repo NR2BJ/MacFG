@@ -48,6 +48,7 @@ struct BenchConfig {
     var flowBase: Double? = nil
     var occDirectional = false
     var smoothness: Float? = nil
+    var boundary: Float? = nil     // MetalFlow 폴백 블렌드 폭 (0=crisp … 1=soft)
     var pairDir: String? = nil      // 품질 A/B: 삼중항 디렉터리
     var pairEngine: String = "metalflow"
     var flowShort: Int? = nil       // RIFE flow 단변 (288/360/432)
@@ -67,6 +68,7 @@ struct BenchConfig {
             case "--flow-base": if let v = args.popFirst() { config.flowBase = Double(v) }
             case "--occ-dir": config.occDirectional = true
             case "--smoothness": if let v = args.popFirst() { config.smoothness = Float(v) }
+            case "--boundary": if let v = args.popFirst() { config.boundary = Float(v) }
             case "--pair-dir": if let v = args.popFirst() { config.pairDir = v }
             case "--engine": if let v = args.popFirst() { config.pairEngine = v }
             case "--flow-short": if let v = args.popFirst() { config.flowShort = Int(v) }
@@ -411,6 +413,42 @@ func loadTexture(path: String, device: any MTLDevice) -> (any MTLTexture)? {
 }
 
 /// 전체 프레임 PSNR (그리드 서브샘플) — 실프레임 비교용
+/// 블렌드 기준선 PSNR — (A+B)/2 vs GT. 모션보상 없이 두 프레임을 섞기만 한 것.
+/// 엔진이 이걸 못 넘으면 "flow가 실제로 버는 게 없다"는 뜻이고, 크게 넘으면 모션보상이 작동 중이며
+/// 남은 오차는 워프로 만들 수 없는 것(가려짐 해제·신규 픽셀)이라는 해석이 선다.
+func computeBlendPSNR(device: any MTLDevice, queue: any MTLCommandQueue,
+                      texA: any MTLTexture, texB: any MTLTexture, gt: any MTLTexture) -> Double {
+    func readAll(_ tex: any MTLTexture) -> [UInt8] {
+        let w = tex.width, h = tex.height
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        desc.storageMode = .shared; desc.usage = [.shaderRead]
+        guard let shared = device.makeTexture(descriptor: desc), let cb = queue.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else { return [] }
+        blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1), to: shared, destinationSlice: 0,
+                  destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        var b = [UInt8](repeating: 0, count: w * h * 4)
+        shared.getBytes(&b, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        return b
+    }
+    let a = readAll(texA), b = readAll(texB), g = readAll(gt)
+    guard !a.isEmpty, a.count == b.count, a.count == g.count else { return 0 }
+    var sum = 0.0; var n = 0
+    var i = 0
+    while i + 2 < a.count {
+        for c in 0..<3 {
+            let blend = (Double(a[i + c]) + Double(b[i + c])) * 0.5
+            let d = blend - Double(g[i + c])
+            sum += d * d; n += 1
+        }
+        i += 4 * 7   // 그리드 서브샘플 (computePSNRFull과 동급 근사)
+    }
+    guard n > 0 else { return 0 }
+    let mse = sum / Double(n)
+    return mse <= 0 ? 99 : 10 * log10(255 * 255 / mse)
+}
+
 func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: any MTLTexture, texB: any MTLTexture) -> Double {
     func readAll(_ tex: any MTLTexture) -> [UInt8] {
         let w = tex.width, h = tex.height
@@ -459,6 +497,26 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
     for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
     guard frames.count >= 3 else { print("❌ 로드 실패"); return }
     print("  해상도 \(frames[0].width)x\(frames[0].height)")
+
+    // ── 기준선: 보간을 아예 안 했을 때. 이게 없으면 엔진 점수의 의미를 알 수 없다.
+    //  hold  = 직전 프레임 A를 그대로 표시 (프레임 홀드 = 보간 끔과 동등)
+    //  엔진 PSNR이 hold보다 높아야 "보간이 실제로 벌었다"고 말할 수 있고,
+    //  그 차이(gain)가 콘텐츠 난이도와 무관한 진짜 비교 지표다.
+    var holdPSNRs: [Double] = []
+    for i in 0..<(frames.count - 2) {
+        holdPSNRs.append(computePSNRFull(device: device, queue: queue, texA: frames[i], texB: frames[i + 1]))
+    }
+    let holdAvg = holdPSNRs.isEmpty ? 0 : holdPSNRs.reduce(0, +) / Double(holdPSNRs.count)
+    let holdMin = holdPSNRs.min() ?? 0
+    print("  \("hold(보간없음)".padding(toLength: 16, withPad: " ", startingAt: 0)) avg=\(String(format: "%.2f", holdAvg))dB  min=\(String(format: "%.2f", holdMin))dB   ← 기준선①")
+    var blendPSNRs: [Double] = []
+    for i in 0..<(frames.count - 2) {
+        blendPSNRs.append(computeBlendPSNR(device: device, queue: queue,
+                                           texA: frames[i], texB: frames[i + 2], gt: frames[i + 1]))
+    }
+    let blendAvg = blendPSNRs.isEmpty ? 0 : blendPSNRs.reduce(0, +) / Double(blendPSNRs.count)
+    let blendMin = blendPSNRs.min() ?? 0
+    print("  \("blend(A+B)/2".padding(toLength: 16, withPad: " ", startingAt: 0)) avg=\(String(format: "%.2f", blendAvg))dB  min=\(String(format: "%.2f", blendMin))dB   ← 기준선② (모션보상 없음)")
 
     var allEngines: [(String, any PairInterpolationEngine)] = [("metalflow", MetalFlowEngine())]
     if AppleFIEngine.isSupported { allEngines.append(("applefi", AppleFIEngine())) }
@@ -573,6 +631,7 @@ func main() async {
     if let base = config.flowBase { MetalFlowEngine.flowBaseLongSide = base }
     MetalFlowEngine.occlusionDirectional = config.occDirectional
     if let sm = config.smoothness { MetalFlowEngine.motionSmoothness = sm }
+    if let bs = config.boundary { MetalFlowEngine.boundarySoftness = bs }
 
     guard let device = MTLCreateSystemDefaultDevice() else {
         print("❌ Metal not available"); return

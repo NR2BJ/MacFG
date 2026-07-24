@@ -79,6 +79,22 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         return 0.3   // 실측 최적 (전 7세트: avg +0.141 / 빠른셋 +0.197 / 최악값 평균 +0.051)
     }()
 
+    /// 합성 신뢰도 결합 (0 = confF만 — 기존, 1 = max(confF,confB)). 한쪽 방향만 일관해도
+    /// 그 워프는 쓸 만한데 기존엔 순방향 신뢰도만 봐서 통째로 폴백(=blend)으로 버렸다.
+    /// dirBlend(방향별 tBlend)와 분리한 축 — 그쪽은 반복패턴 aliasing 리스크가 있어 따로 다룬다.
+    public nonisolated(unsafe) static var confMax: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFCONFMAX"], let v = Float(s), v >= 0, v <= 1 { return v }
+        return 0.5   // 실측 최적 (전 7세트 avg +0.121 / 빠른셋 +0.150 / 최악값 +0.016).
+                     // 1.0(완전 max)은 이득이 더 작고 최악값을 깎는다 — 한 방향만 확신할 때
+                     // 그걸 100% 신뢰하면 틀릴 때 크게 틀리기 때문. 절반 결합이 안전점.
+    }()
+
+    /// 신뢰도 곡선 감마 (1 = 선형). <1이면 중간 신뢰도에서 워프 비중↑(폴백=blend 의존↓).
+    public nonisolated(unsafe) static var confGamma: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFCONFGAMMA"], let v = Float(s), v > 0 { return v }
+        return 1.0
+    }()
+
     /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.
     public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
         if let s = ProcessInfo.processInfo.environment["MACFG_MFRADIUS"], let v = Int32(s), (1...8).contains(v) { return v }
@@ -406,6 +422,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var fadeHi: Float
         var flowBlur: Float
         var useUIMask: Float = 0
+        var confMax: Float = MetalFlowEngine.confMax
+        var confGamma: Float = MetalFlowEngine.confGamma
     }
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -517,7 +535,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; };
     struct FinalizeParams { float confLo; float confHi; float confRel; };
-    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -813,7 +831,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float dirFactor = (denom > 1e-4) ? (wb / denom) : t;
         float tBlend = mix(t, dirFactor, fabs(confF - confB) * p.dirBlend);
         half3 interp = mix(w0, w1, half(tBlend));
-        half conf = half(mix(confF, max(confF, confB), p.dirBlend));
+        float cRaw = mix(confF, max(confF, confB), max(p.dirBlend, p.confMax));
+        half conf = half(p.confGamma == 1.0 ? cRaw : pow(cRaw, p.confGamma));
 
         // 저신뢰 폴백: A/B 원본 크로스페이드. 폭(fadeLo~fadeHi)이 smoothness 슬라이더:
         // 좁으면(예리) 단일 프레임에 가까워 저더, 넓으면(부드러움) 부드러운 블렌드(약간 고스트).

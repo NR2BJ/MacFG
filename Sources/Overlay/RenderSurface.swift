@@ -97,7 +97,8 @@ public final class RenderSurface: @unchecked Sendable {
             if p.isViewer, p.upscaleMode != .off {
                 let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
-                if targetW > texture.width || targetH > texture.height {
+                // 소스≈타깃(≤8% 차)이면 SR 무효인데 비용만 큼 — 블릿 샘플러에 맡기고 건너뜀 (활성 경로와 동일)
+                if targetW > Int(Double(texture.width) * 1.08) || targetH > Int(Double(texture.height) * 1.08) {
                     var cur = source
                     // 1) ANE 신경망 2x (모드가 ane/aneMetalfx이고 소스 ≤960)
                     if p.upscaleMode == .ane || p.upscaleMode == .aneMetalfx,
@@ -152,12 +153,18 @@ public final class RenderSurface: @unchecked Sendable {
             if p.isViewer, p.upscaleMode != .off {
                 let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
                 let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
+                // 소스≈타깃(수% 차)이면 SR 체인(ANE+MetalFX)은 사실상 무효인데 매 틱 큰 비용을 낸다
+                // (실측: 3755→3808 = 1.4% 확대인데 4K SR을 매 틱 → present-바운드로 120Hz 틱을
+                // ~104Hz로 조임). 그 미세 스케일은 최종 블릿 샘플러가 처리하면 충분하므로, 목표가
+                // **의미있게 클 때(≥8%)만** SR을 건다. 진짜 확대(540p→4K 등)는 그대로 발동.
+                let wantUpscale = targetW > Int(Double(texture.width) * 1.08)
+                              || targetH > Int(Double(texture.height) * 1.08)
                 // 캡처 소스 크기가 바뀔 때마다 로깅 — 첫 캡처의 저해상도 드롭 순간 포착용
                 if dbgLastTexW != texture.width || dbgLastTexH != texture.height {
                     dbgLastTexW = texture.width; dbgLastTexH = texture.height
-                    DiagnosticLog.shared.log("[UPSCALE-DBG] source \(texture.width)x\(texture.height) → target \(targetW)x\(targetH) drawable=\(drawable.texture.width)x\(drawable.texture.height) drawableSize=\(Int(metalLayer.drawableSize.width))x\(Int(metalLayer.drawableSize.height)) engage=\(targetW > texture.width || targetH > texture.height) mode=\(p.upscaleMode)")
+                    DiagnosticLog.shared.log("[UPSCALE-DBG] source \(texture.width)x\(texture.height) → target \(targetW)x\(targetH) drawable=\(drawable.texture.width)x\(drawable.texture.height) drawableSize=\(Int(metalLayer.drawableSize.width))x\(Int(metalLayer.drawableSize.height)) engage=\(wantUpscale) mode=\(p.upscaleMode)")
                 }
-                if targetW > texture.width || targetH > texture.height {
+                if wantUpscale {
                     var cur = source
                     if p.upscaleMode == .ane || p.upscaleMode == .aneMetalfx,
                        texture.width <= NeuralUpscaler.maxInput, texture.height <= NeuralUpscaler.maxInput,

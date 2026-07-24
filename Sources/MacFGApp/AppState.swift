@@ -1450,7 +1450,14 @@ public final class AppState {
         // 주의: staleDrop을 paceMiss로 세지 않는다 — 이 드롭은 큐 잉여 트림이라 지연을 늘려도
         // 안 사라지고(lat=+4에서도 지속 실측), miss로 세면 감쇠가 영영 막혀 e2e만 부푼다
         // (73→101ms 실측). 지연 부족(지각 도착)은 drain의 lateBar가 따로 센다.
-        if let current = pick, current.timestamp < staleCutoff, candidates.count > 1 {
+        // stale-skip은 **진짜 백로그(깊은 큐)일 때만**. 얕은데(tl 2~6) 늦게 온 프레임을 버리면
+        // 다음 틱에 보여줄 게 없어 구멍(max-hold 83ms 실측)이 된다 — work(45~87ms)가 지연 버퍼를
+        // 초과해 프레임이 66~91ms 늦게 도착하는 버스트 소스에서 stale-drop이 오히려 스타베이션을
+        // 키웠다([STALE] 실측: tl=cand=2~4로 얕은데 age 76ms 드롭). 늦은 프레임은 버리기보다
+        // +1vsync 늦게라도 표시하는 게 구멍보다 낫다(주석 1437 원래 의도 복원). 깊을 때(의도된 버퍼
+        // 깊이 3+적응슬롯 초과)만 한 장 건너뛰어 백로그 배출.
+        let deepBacklog = timeline.count > 3 + Int(extraLatencySlots)
+        if let current = pick, current.timestamp < staleCutoff, candidates.count > 1, deepBacklog {
             pick = candidates[1]
             diagStaleDropCount += 1
             if diagStaleSampleCount < 4 {   // [진단] 드롭 원인 규명용 샘플

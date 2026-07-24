@@ -148,7 +148,9 @@ public final class AutoFlowScaler {
         }
 
         // 상승: 4창(≈8s) 연속 달성 + 엔진 여유. 천천히 (탐침 비용을 드물게)
-        if goodWindows >= 4, idx < ceilingIdx, share < 0.5, now - lastChangeAt > 8.0 {
+        // engineMs>0 필수 — 보간이 안 도는 구간(비활성/엔진 전환/종료)에선 EMA가 0이라 share=0이
+        // 되어 "여유"로 오판, 근거 없이 올라간다(실측 "↑ 960 — 엔진 0% 점유"). 데이터 없으면 유지.
+        if goodWindows >= 4, idx < ceilingIdx, engineMs > 0.05, share < 0.5, now - lastChangeAt > 8.0 {
             lastAscendIdx = idx + 1
             lastAscendAt = now
             idx += 1

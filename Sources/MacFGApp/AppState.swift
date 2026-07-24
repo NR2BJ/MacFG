@@ -2256,6 +2256,17 @@ public final class AppState {
         lines.append(L("Output", "출력", "出力") + ": \(Int(outputFPS)) fps · \(engine)")
         lines.append(L("Latency", "지연", "遅延") + ": \(Int(latencyMs)) ms")
         lines.append(L("Upscale", "업스케일", "アップスケール") + ": " + (upscaleStatus ?? L("Off", "끔", "オフ")))
+        // flow 해상도 — 두 엔진 다 부하에 따라 스스로 움직이므로(MetalFlow=자동 스케일러,
+        // RIFE=자체 사다리) 지금 어디에 있는지 보여준다. 화질이 변한 이유가 보이게.
+        if mirrorInterpolationEnabled {
+            if selectedRenderMode == .metalFlow {
+                let auto = autoFlowScaler.manualOverride
+                    ? L("manual", "수동", "手動") : L("auto", "자동", "自動")
+                lines.append("Flow: \(Int(MetalFlowEngine.flowBaseLongSide))p (\(auto))")
+            } else if selectedRenderMode == .rife, let r = pairEngine as? RIFEEngine, r.currentFlowShort > 0 {
+                lines.append("Flow: \(r.currentFlowShort)p (\(L("auto", "자동", "自動")))")
+            }
+        }
         // 거버너가 개입 중이면 알린다 — 화질이 낮아진 이유를 사용자가 알 수 있어야 한다
         if let gov = loadGovernor.statusText {
             lines.append("⚠︎ " + gov)

@@ -164,6 +164,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 거버너용 — 최근 predict p90 [ms]. compute 과부하(강등 정당성) 판정 신호.
     public var recentPredictP90Ms: Double { predictMsStats().p90 }
 
+    /// 현재 사다리가 쓰는 flow 단변 [px] — 정보 오버레이 표시용 (적응 상태 가시화)
+    public var currentFlowShort: Int { slotLock.withLock { currentShort } }
+
     /// 슬롯 고갈 비율 EMA (0~1) — 전 슬롯이 predict 중 = compute가 배달을 못 따라감.
     /// encodePair마다 갱신(가벼움). 거버너가 recentExhaustFrac로 읽어 강등 게이트에 쓴다.
     private let exhaustEMA = OSAllocatedUnfairLock(initialState: 0.0)

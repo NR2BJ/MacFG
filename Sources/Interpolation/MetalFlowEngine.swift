@@ -62,9 +62,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private var finalizePSO: (any MTLComputePipelineState)?
     private var warpPSO: (any MTLComputePipelineState)?
 
-    // 피라미드 리소스 (소스 크기 의존)
+    // 피라미드 리소스 (소스 크기 + flow base 의존)
     private var srcWidth = 0
     private var srcHeight = 0
+    /// 현재 피라미드를 만들 때 쓴 flowBaseLongSide — 이 값이 바뀌면 재구축(자동 스케일/거버너 캡 반영)
+    private var builtFlowBase: Double = 0
     private var levels: [(w: Int, h: Int)] = []
     private var lumaA: [any MTLTexture] = []
     private var lumaB: [any MTLTexture] = []
@@ -364,15 +366,21 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     private func ensureResources(width: Int, height: Int) {
         guard let device else { return }
-        guard width != srcWidth || height != srcHeight || levels.isEmpty else { return }
+        // flowBaseLongSide 변경도 재구축 트리거 — 예전엔 소스 크기만 봐서, 세션 중 flow 해상도를
+        // 바꿔도(거버너 캡·자동 스케일러) 피라미드가 옛 해상도 그대로였다 = 다이얼이 통째로 무효.
+        // 자동 flow 스케일이 성립하려면 이 반영이 전제.
+        let baseNow = Self.flowBaseLongSide
+        guard width != srcWidth || height != srcHeight || levels.isEmpty
+                || abs(baseNow - builtFlowBase) > 0.5 else { return }
         srcWidth = width
         srcHeight = height
+        builtFlowBase = baseNow
 
         // flow base: 긴 변 기준 flow 밀도 (이미지가 아니라 모션 지도의 해상도 —
         // 워프는 항상 풀해상도 원본 픽셀이므로 출력 선명도와 무관, 모션 경계 정밀도만 좌우).
         // 픽셀당 5x5 SAD 매칭이라 base²가 비용 지배: 1900 실측 77ms / 480 실측 ~3ms.
         let longSide = max(width, height)
-        let s = min(1.0, Self.flowBaseLongSide / Double(longSide))
+        let s = min(1.0, baseNow / Double(longSide))   // 재구축 트리거와 동일 스냅샷 사용
         var bw = Int(Double(width) * s), bh = Int(Double(height) * s)
         bw = max(bw & ~1, 64); bh = max(bh & ~1, 64)
 

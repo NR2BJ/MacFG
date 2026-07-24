@@ -201,6 +201,10 @@ public final class AppState {
     @ObservationIgnored private let stageLock = NSLock()
     /// UI 정적 검출 스트라이드 카운터 — 매 6프레임만 4K 검출 갱신 (백로그 증폭 방지)
     @ObservationIgnored nonisolated(unsafe) private var uiDetectFrame = 0
+    /// 보간 엔진(cb2)의 GPU 실행시간 EMA [ms] — 자동 flow 스케일러 입력
+    @ObservationIgnored nonisolated(unsafe) private var engineGpuMsEMA: Double = 0
+    /// 기기 시딩 대기 — 소스 해상도가 정해지는 첫 프레임에서 1회 수행
+    @ObservationIgnored nonisolated(unsafe) private var seedPending = true
 
     private let captureManager = CaptureManager()
     // U2 전체화면 재타깃: 사용자가 고른 원 창 / 현재 실제 캡처 중인 창(전체화면 시 전환).
@@ -218,12 +222,16 @@ public final class AppState {
 
     /// 부하 거버너 — 성능이 예산을 못 맞추면 화질 다이얼을 단계적으로 낮춘다 (O2-1)
     let loadGovernor = LoadGovernor()
+    /// MetalFlow flow 해상도 자동 조절 — 기기별로 목표 프레임을 맞출 때까지 실측 수렴
+    let autoFlowScaler = AutoFlowScaler()
 
     /// 거버너 레벨을 실제 다이얼에 반영. 레벨이 바뀐 순간에만 실질 작업이 일어난다.
     func applyGovernorDials() {
-        // ① MetalFlow flow 해상도 상한 — 사용자 설정값과 거버너 상한 중 낮은 쪽.
+        // ① MetalFlow flow 해상도 — 자동 스케일러가 기기 성능에 맞춰 정한 값(수동 지정 시 그 값)에
+        //    거버너 상한을 씌운 것. 거버너는 상한만 내리고, 그 안에서 스케일러가 움직인다.
         //    엔진 자율 사다리(RIFE)는 건드리지 않는다 (같은 다이얼 이중 조작 = 발진).
-        let base = min(userFlowBase, loadGovernor.flowBaseCap ?? userFlowBase)
+        let desired = autoFlowScaler.manualOverride ? userFlowBase : autoFlowScaler.current
+        let base = min(desired, loadGovernor.flowBaseCap ?? desired)
         if MetalFlowEngine.flowBaseLongSide != base {
             MetalFlowEngine.flowBaseLongSide = base
             DiagnosticLog.shared.log("[GOV] flowBase → \(Int(base))")
@@ -297,9 +305,16 @@ public final class AppState {
             presentRatio: pacePresentRatio,
             predictP90Ms: rife?.recentPredictP90Ms ?? 0,
             slotExhaustFrac: rife?.recentExhaustFrac ?? 0)
+        // 자동 flow 스케일러 입력 — 달성도는 "틱이 주사율을 내는가"와 "낸 프레임을 지키는가" 중
+        // 나쁜 쪽(둘 다 목표 프레임 미달의 증상). 엔진 GPU 비중이 근거로 함께 들어간다.
+        let tickRatio = refresh > 0 && lastTickHz > 1 ? min(1.0, lastTickHz / refresh) : 1.0
+        let achieved = min(tickRatio, max(0, min(1.0, pacePresentRatio)))
+        let engineMs = engineGpuMsEMA
+        let budgetMs = interval * 1000.0
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.loadGovernor.update(signals)
+            self.autoFlowScaler.update(achievedRatio: achieved, engineMs: engineMs, budgetMs: budgetMs)
             self.applyGovernorDials()
         }
     }
@@ -671,8 +686,9 @@ public final class AppState {
         if let fIdx = args.firstIndex(of: "--flow-base"), fIdx + 1 < args.count,
            let base = Double(args[fIdx + 1]), base >= 120, base <= 2048 {
             MetalFlowEngine.flowBaseLongSide = base
-            userFlowBase = base   // 거버너 기준값도 갱신 — 안 하면 init default(1440)로 되돌림
-            DiagnosticLog.shared.log("[AUTO] flowBaseLongSide=\(Int(base))")
+            userFlowBase = base   // 거버너 기준값도 갱신 — 안 하면 기본값으로 되돌림
+            autoFlowScaler.manualOverride = true   // 명시 지정 = 자동 조절 중지 (측정/실험용)
+            DiagnosticLog.shared.log("[AUTO] flowBaseLongSide=\(Int(base)) (자동 스케일 OFF)")
         }
         if args.contains("--occ-directional") {
             MetalFlowEngine.occlusionDirectional = true
@@ -763,12 +779,12 @@ public final class AppState {
             // 먹고 그 miss로 적응 지연이 +4까지 불필요하게 램프 (리뷰 지적, 로그 확인).
             _ = captureManager.drainFrames()
             resetScheduler()
-            // 거버너 시딩 — 기기 등급 + 소스 크기로 보수적 시작값. 정착값은 실측이 정한다.
+            // 거버너/스케일러 시딩은 소스 해상도를 아는 첫 프레임 시점(acquireStableTexture)에서
+            // 한다 — 여기선 stablePool이 아직 없어 크기가 0이라 "4K 무거움" 판정이 불가능하다.
             loadGovernor.reset()
-            loadGovernor.seedForDevice(
-                gpuCoreCount: Self.gpuCoreCountEstimate(device),
-                memoryGB: Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0,
-                sourcePixels: stablePoolWidth * stablePoolHeight)
+            autoFlowScaler.softReset()
+            engineGpuMsEMA = 0
+            seedPending = true
             applyGovernorDials()
             pendingShowReset = false
             attachRenderDriver()
@@ -1767,6 +1783,12 @@ public final class AppState {
         let stageEnterRef = tStageEnter
         let rawCaptureTsRef = rawCaptureTs
         cb2.addCompletedHandler { [weak self] cb2Buf in
+            // 엔진 GPU 비용 EMA — 자동 flow 스케일러의 입력(우리 몫이 예산의 몇 %인지).
+            // 완료 핸들러에서 double 2개 읽기라 상시 켜도 비용 없음.
+            if let self {
+                let g = (cb2Buf.gpuEndTime - cb2Buf.gpuStartTime) * 1000.0
+                if g > 0, g < 200 { self.engineGpuMsEMA = self.engineGpuMsEMA <= 0 ? g : self.engineGpuMsEMA * 0.9 + g * 0.1 }
+            }
             if let self, self.stageDbg {
                 let cb2Gpu = (cb2Buf.gpuEndTime - cb2Buf.gpuStartTime) * 1000.0
                 let capIngest = (stageEnterRef - rawCaptureTsRef) * 1000.0
@@ -2013,6 +2035,21 @@ public final class AppState {
             stablePool = []
             stablePoolWidth = width
             stablePoolHeight = height
+            // 기기 시딩은 **여기서** — 캡처 시작 시점엔 풀이 아직 없어 소스 크기가 0이라
+            // 거버너·스케일러가 "4K 무거운 소스" 판정을 아예 못 했다(기존 버그: 로그 "소스 0MP").
+            // 첫 프레임에서 실제 해상도가 정해지는 이 지점이 유일하게 정확한 시딩 시점.
+            if seedPending {
+                seedPending = false
+                let px = width * height
+                let cores = Self.gpuCoreCountEstimate(device)
+                let memGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.loadGovernor.seedForDevice(gpuCoreCount: cores, memoryGB: memGB, sourcePixels: px)
+                    self.autoFlowScaler.seed(gpuCoreCount: cores, sourcePixels: px)
+                    self.applyGovernorDials()
+                }
+            }
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
             desc.usage = [.shaderRead]

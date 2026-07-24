@@ -657,7 +657,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                 tPhase: t,
                 useDiffTex: useDiffTex,
                 useUIMask: uiMaskTex != nil ? 1 : 0)
-            enc.setBytes(&wp, length: MemoryLayout<WarpParams>.size, index: 0)
+            enc.setBytes(&wp, length: MemoryLayout<WarpParams>.stride, index: 0)
             enc.setBuffer(slot.confBuf, offset: 0, index: 1)
             dispatch(enc, width: output.width, height: output.height, pso: warpPSO)
             enc.endEncoding()

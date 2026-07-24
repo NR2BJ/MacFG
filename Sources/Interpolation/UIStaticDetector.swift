@@ -17,7 +17,11 @@ public final class UIStaticDetector {
     private var pso: (any MTLComputePipelineState)?
     private var meanTex: [any MTLTexture] = []   // ping-pong EMA(hp)
     private var sqTex: [any MTLTexture] = []      // ping-pong EMA(hp²)
-    private var maskTex: (any MTLTexture)?
+    // 마스크도 ping-pong — cb1(blit+detector)을 copy 큐로 분리하면(O1-3), 다음 프레임 update가
+    // 마스크를 쓰는 동안 이번 프레임 cb2(warp, work 큐)가 같은 마스크를 읽어 cross-queue 하자드가
+    // 난다. 2버퍼로 번갈아 써서 읽는 버퍼와 쓰는 버퍼를 분리.
+    private var maskTex: [any MTLTexture] = []
+    private var maskCur = 0
     private var cur = 0
     private var w = 0, h = 0
     private var needsReset = true
@@ -54,7 +58,10 @@ public final class UIStaticDetector {
     public nonisolated(unsafe) static var strength: Float = 1.0  // 마스크 최대 프리즈 강도
 
     /// 워프가 샘플할 마스크 (없으면 nil). 워밍업 전(<8프레임)엔 nil 반환해 초기 노이즈 회피.
-    public var mask: (any MTLTexture)? { (Self.enabled && frames >= 8) ? maskTex : nil }
+    /// 직전 update가 쓴 버퍼(maskCur)를 반환 — 다음 update는 반대 버퍼에 써서 하자드 회피.
+    public var mask: (any MTLTexture)? {
+        (Self.enabled && frames >= 8 && maskCur < maskTex.count) ? maskTex[maskCur] : nil
+    }
 
     public init(device: any MTLDevice) { self.device = device }
 
@@ -67,7 +74,7 @@ public final class UIStaticDetector {
     /// 해상도 세팅/재세팅 — 소스 크기의 1/2(텍스트 보존 + 저비용).
     private func ensure(srcW: Int, srcH: Int) {
         let mw = max(64, srcW / 2), mh = max(64, srcH / 2)
-        guard mw != w || mh != h || maskTex == nil else { return }
+        guard mw != w || mh != h || maskTex.isEmpty else { return }
         w = mw; h = mh
         func tex(_ fmt: MTLPixelFormat, _ usage: MTLTextureUsage) -> (any MTLTexture)? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: mw, height: mh, mipmapped: false)
@@ -76,7 +83,8 @@ public final class UIStaticDetector {
         }
         meanTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
         sqTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
-        maskTex = tex(.r16Float, [.shaderRead, .shaderWrite])
+        maskTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
+        maskCur = 0
         // boost: CPU 업로드용 shared r8 ping-pong (GPU가 이전 장을 읽는 중에도 안전)
         func sharedTex() -> (any MTLTexture)? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: mw, height: mh, mipmapped: false)
@@ -99,8 +107,10 @@ public final class UIStaticDetector {
     public func update(source: any MTLTexture, into cb: any MTLCommandBuffer) {
         guard Self.enabled, let pso else { return }
         ensure(srcW: source.width, srcH: source.height)
-        guard meanTex.count == 2, sqTex.count == 2, let maskTex,
+        guard meanTex.count == 2, sqTex.count == 2, maskTex.count == 2,
               let enc = cb.makeComputeCommandEncoder() else { return }
+        // 이번엔 반대 마스크 버퍼에 쓴다 — 직전 프레임 워프가 아직 옛 버퍼를 읽는 중일 수 있음.
+        let maskWrite = 1 - maskCur
         // 텍스트 박스 갱신 확인 — 새 제출 또는 TTL 만료 시 CPU 비트맵 그려 ping-pong 업로드
         boxLock.lock()
         let stamp = boxesStamp
@@ -138,7 +148,7 @@ public final class UIStaticDetector {
         enc.setTexture(sqTex[prev], index: 2)
         enc.setTexture(meanTex[next], index: 3)
         enc.setTexture(sqTex[next], index: 4)
-        enc.setTexture(maskTex, index: 5)
+        enc.setTexture(maskTex[maskWrite], index: 5)
         enc.setTexture(boostTex[boostCur], index: 6)
         var p = SIMD4<Float>(Self.alpha, Self.clo, Self.chi, needsReset ? 1 : 0)
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
@@ -148,6 +158,7 @@ public final class UIStaticDetector {
         enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1), threadsPerThreadgroup: tg)
         enc.endEncoding()
         cur = next
+        maskCur = maskWrite   // 방금 쓴 버퍼가 이제 유효 마스크
         needsReset = false
         frames += 1
     }

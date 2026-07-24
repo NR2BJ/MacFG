@@ -182,6 +182,11 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var workQueue: (any MTLCommandQueue)?
     /// present 전용 큐 (틱당 ~0.3ms 렌더패스만)
     @ObservationIgnored nonisolated(unsafe) private var presentQueue: (any MTLCommandQueue)?
+    /// cb1(stable blit + UI 검출) 전용 copy 큐 (O1-3) — workQueue에서 분리하면 cb2(warp)의
+    /// predict 이벤트 대기가 다음 프레임 blit을 head-of-line 블로킹하던 것을 없애 파이프라인
+    /// 중첩(predict↔warp)을 복원. MACFG_SPLITQ=1로 활성(검증 전 기본 OFF — 동시성 변경).
+    @ObservationIgnored nonisolated(unsafe) private var copyQueue: (any MTLCommandQueue)?
+    @ObservationIgnored private let splitQueueEnabled = ProcessInfo.processInfo.environment["MACFG_SPLITQ"] == "1"
     private let captureManager = CaptureManager()
     // U2 전체화면 재타깃: 사용자가 고른 원 창 / 현재 실제 캡처 중인 창(전체화면 시 전환).
     private var originalCaptureWindowID: CGWindowID = 0
@@ -339,6 +344,7 @@ public final class AppState {
         self.device = device
         self.workQueue = device.makeCommandQueue()
         self.presentQueue = device.makeCommandQueue()
+        self.copyQueue = device.makeCommandQueue()
         self.overlayManager = OverlayManager(device: device)
         self.interpolationEngine = selectedRenderMode.displayName
         // 정지-UI 프리즈 토글 (A/B·회귀 확인용). 기본 on.
@@ -1465,9 +1471,11 @@ public final class AppState {
         // 타임스탬프를 콘텐츠 케이던스 그리드에 스냅 (양자화 지터 제거)
         let snappedTs = snapTimestamp(raw: slot.timestamp, rawDelta: delta)
 
-        guard let workQueue,
+        // cb1(blit+검출)은 splitQ면 copy 큐, 아니면 workQueue(기존). cb2(warp)는 항상 workQueue.
+        let cb1Queue = (splitQueueEnabled ? copyQueue : nil) ?? workQueue
+        guard let workQueue, let cb1Queue,
               let stable = acquireStableTexture(width: sourceTexture.width, height: sourceTexture.height),
-              let cb = workQueue.makeCommandBuffer() else {
+              let cb = cb1Queue.makeCommandBuffer() else {
             diagPoolExhaustCount += 1
             // 이 프레임은 수용 실패 — 상태를 되돌려 다음 프레임이 정상 쌍(연속성 유지)을 만들게 함.
             // 지문도 함께 롤백 — 안 하면 드롭된 콘텐츠와 동일한 후속 프레임이 '중복'으로
@@ -1525,6 +1533,9 @@ public final class AppState {
         }
         if let ev = stableReadyEvent {
             (pairEngine as? RIFEEngine)?.noteInputReady(event: ev, value: readyValue)
+            // splitQ면 cb1이 다른 큐(copy)라 in-order 보장이 없다 — cb2 워프가 stable/마스크를
+            // 읽기 전에 cb1 완료를 명시적으로 기다린다. 미분리(기본)면 같은 큐 in-order라 불필요.
+            if splitQueueEnabled { cb2.encodeWaitForEvent(ev, value: readyValue) }
         }
         // 이하 보간/핸들러는 cb2에 인코딩
 

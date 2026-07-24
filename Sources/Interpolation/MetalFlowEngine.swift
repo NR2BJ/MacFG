@@ -30,7 +30,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// flow 밀도 (긴 변 목표). 앱 시작 시 1회 설정(--flow-base) 후 읽기 전용 — 락 불필요.
     /// 4K 쌍당 실측 (M4): gather 최적화 전 8.3ms → 후 5.6ms (base 960). 1080p 3.7ms.
     /// 960 = 60fps 예산(16.7ms) 내 최대 밀도 — 기본값. 1280은 30fps 이하 콘텐츠용 여지.
-    public nonisolated(unsafe) static var flowBaseLongSide: Double = 960
+    // 기본 1440 (구 960) — MetalFlow(고전 광학흐름)는 4K에서도 flow를 1440p로 6.2ms에 돌린다
+    // (RIFE 신경 predict 288p=12ms의 절반, 예산 대폭 여유). flow 해상도가 높을수록 **빠른 모션의
+    // 큰 변위**를 잘 잡아 저더가 준다 — RIFE는 predict 비용 때문에 288p에 갇혀 빠른 4K 모션이
+    // 부들거리는데, MetalFlow는 그 캡이 없다. 소스보다 크면 min(1.0, base/long)로 소스 res에 캡.
+    public nonisolated(unsafe) static var flowBaseLongSide: Double = 1440
 
     /// 오클루전 방향별 워프 (실험, --occ-directional): 가림/드러남 영역에서 보이는 쪽 단방향 워프.
     /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.

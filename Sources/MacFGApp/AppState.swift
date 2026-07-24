@@ -669,6 +669,7 @@ public final class AppState {
         if let fIdx = args.firstIndex(of: "--flow-base"), fIdx + 1 < args.count,
            let base = Double(args[fIdx + 1]), base >= 120, base <= 2048 {
             MetalFlowEngine.flowBaseLongSide = base
+            userFlowBase = base   // 거버너 기준값도 갱신 — 안 하면 init default(1440)로 되돌림
             DiagnosticLog.shared.log("[AUTO] flowBaseLongSide=\(Int(base))")
         }
         if args.contains("--occ-directional") {

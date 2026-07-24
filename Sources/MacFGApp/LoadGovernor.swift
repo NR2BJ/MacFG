@@ -188,16 +188,28 @@ public final class LoadGovernor {
         }
     }
 
-    /// RIFE 보간 프레임 워프 해상도 배율 (LSFG Resolution Scale). RIFE의 4K 병목은 flow가
-    /// 아니라 풀해상도 워프라, flowBase(MetalFlow 전용)로는 안 줄어든다. 이게 RIFE의 실질
-    /// 중간 강등 다이얼 — 이게 없으면 RIFE는 full↔bypass 사이에 손잡이가 없어 곧장 바이패스로
-    /// 떨어진다("보간 꺼짐"의 원인). 보간 프레임만 줄이고 원본은 4K 유지 → 화질 손실 최소.
-    public var warpScale: Double {
+    /// RIFE 보간 프레임 워프 해상도 배율 (LSFG Resolution Scale). **rifeFlowCap이 대체함 → 중립(1.0).**
+    /// 처음엔 이게 RIFE의 중간 강등 다이얼이라 봤으나, 단계 계측이 그 전제를 반박했다:
+    /// 4K에서 워프(cb2 GPU)는 1.5ms뿐이고 지배 비용은 predict(288p 7.6ms)다. warpScale 0.67은
+    /// 0.75ms 아끼려 보간 프레임을 44% 픽셀로 흐리는 나쁜 거래 — 반면 rifeFlowCap은 flow 해상도로
+    /// predict를 직접 깎아(240=6.2/180=3.1ms) 훨씬 크게 벌고 원본 해상도 워프는 유지한다.
+    /// 다이얼은 남겨두되(측정/회귀용) 전 레벨 1.0으로 무력화한다.
+    public var warpScale: Double { 1.0 }
+
+    /// RIFE flow(=predict) 해상도 상한 [short px]. nil이면 사다리 자율(제한 없음).
+    ///
+    /// **RIFE의 진짜 중간 강등 다이얼.** 단계 계측으로 확정: 4K work의 지배 비용은 predict
+    /// (flow 288p=7.6ms)지 워프(cb2 GPU 1.5ms)가 아니다 — 즉 warpScale(1.5→0.75ms)은 거의
+    /// 무의미하고, flowBase(MetalFlow 전용)는 RIFE에 무관하다. flow 해상도를 낮추면 predict가
+    /// 해상도²로 줄어(240=6.2 / 216=5.0 / 180=3.1ms 실측) 실질 부하가 빠진다. 이게 있으면
+    /// RIFE는 full→bypass로 추락하지 않고 288→240→216→180으로 완만히 내려가 **보간을 유지**한다
+    /// (원본 패스스루보다 항상 낫다). LSFG의 "Performance 모드(가벼운 모델)"를 해상도 티어로 구현.
+    public var rifeFlowCap: Int? {
         switch level {
-        case .full:   return 1.0
-        case .light:  return 0.67   // 워프 비용 ~0.45
-        case .heavy:  return 0.5    // 워프 비용 ~0.25
-        case .bypass: return 0.5
+        case .full:   return nil    // 사다리 자율 (288 시작, 저fps면 승격)
+        case .light:  return 240
+        case .heavy:  return 216
+        case .bypass: return 180    // bypass 대신 최저 flow — 보간 유지
         }
     }
 

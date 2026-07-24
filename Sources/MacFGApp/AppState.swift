@@ -187,6 +187,19 @@ public final class AppState {
     /// 중첩(predict↔warp)을 복원. MACFG_SPLITQ=1로 활성(검증 전 기본 OFF — 동시성 변경).
     @ObservationIgnored nonisolated(unsafe) private var copyQueue: (any MTLCommandQueue)?
     @ObservationIgnored private let splitQueueEnabled = ProcessInfo.processInfo.environment["MACFG_SPLITQ"] == "1"
+
+    /// 단계별 지연 분해 계측 (MACFG_STAGEDBG=1). 라이브 work(50~80ms)가 큐 대기인지 GPU 실행인지
+    /// 가른다: capIngest(캡처→인제스트 = SCK/큐 대기), cb1(blit+검출 GPU), cb2(warp GPU),
+    /// work(캡처→cb2완료 총). GPU 시간은 cb.gpuStart/EndTime(대기 제외 순수 실행). 부하와 무관하게
+    /// **비율**이 병목을 드러낸다. 완료 핸들러가 임의 스레드라 stageLock으로 누적.
+    @ObservationIgnored private let stageDbg = ProcessInfo.processInfo.environment["MACFG_STAGEDBG"] == "1"
+    @ObservationIgnored nonisolated(unsafe) private var stgCapIngest = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var stgCb1Gpu = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var stgCb2Gpu = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var stgWork = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var stgCount = 0
+    @ObservationIgnored private let stageLock = NSLock()
+
     private let captureManager = CaptureManager()
     // U2 전체화면 재타깃: 사용자가 고른 원 창 / 현재 실제 캡처 중인 창(전체화면 시 전환).
     private var originalCaptureWindowID: CGWindowID = 0
@@ -222,12 +235,29 @@ public final class AppState {
                 DiagnosticLog.shared.log("[GOV] RIFE warpScale → \(String(format: "%.2f", wscale))")
             }
         }
+        // ①-b RIFE flow(predict) 상한 — RIFE의 **진짜** 중간 강등 다이얼. 단계 계측으로 확정:
+        //    4K work의 지배 비용은 predict(288p=7.6ms)지 워프(1.5ms)가 아니다. flow 해상도를
+        //    낮추면 predict가 해상도²로 준다(240=6.2/216=5.0/180=3.1ms). 사다리는 이 상한 아래에서
+        //    자율 동작(이중 조작 아님 — 거버너는 상한만 내리고 사다리가 그 안에서 움직인다).
+        let flowCap = loadGovernor.rifeFlowCap ?? 1_000_000
+        if RIFEEngine.flowCapShort != flowCap {
+            RIFEEngine.flowCapShort = flowCap
+            DiagnosticLog.shared.log("[GOV] RIFE flowCap → \(flowCap >= 1_000_000 ? "none" : "\(flowCap)p")")
+        }
+        // ③ 보간 바이패스 — 원본 패스스루. 단, **RIFE는 바이패스하지 않는다**: 180p flow로
+        //    predict를 3.1ms까지 낮춰 보간을 유지한다(원본 패스스루보다 항상 낫다 — 사용자 피드백
+        //    "원본이 더 나을 정도"의 정면 해소). sub-model 단이 없는 MetalFlow/AppleFI만 바이패스.
+        //    엔진은 살려둬 복귀가 즉시 되게 한다(엔진 내리면 configurePairEngine 수백 ms + 재락 ~1s).
+        let rifeKeepsInterp = selectedRenderMode == .rife && RIFEEngine.modelAvailable(short: 180)
+        // RIFE가 bypass에서도 보간을 유지하려면 배율/t 상한도 bypass값(1/0 = 보간 없음)이 아니라
+        // heavy값(2/1)이어야 한다 — 안 그러면 t가 0개라 encodePair가 빈 tValues로 nil을 뱉어
+        // (engFail) 보간이 실질적으로 꺼진다. flowCap이 이미 부하를 흡수하므로 heavy로 충분.
+        let bypassButRife = rifeKeepsInterp && loadGovernor.level == .bypass
         // ② 보간 배율 상한 — 렌더 스레드 미러에 반영 (t 생성 단계에서 소비)
-        let mult = min(frameMultiplier, loadGovernor.multiplierCap ?? frameMultiplier)
+        let effMultCap = bypassButRife ? 2 : loadGovernor.multiplierCap
+        let mult = min(frameMultiplier, effMultCap ?? frameMultiplier)
         if mirrorFrameMultiplier != mult { mirrorFrameMultiplier = mult }
-        // ③ 보간 바이패스 — 원본 패스스루. 엔진은 살려둬 복귀가 즉시 되게 한다
-        //    (엔진을 내리면 configurePairEngine 수백 ms + RIFE 사다리 재락 ~1s가 든다).
-        let wantInterp = isInterpolationEnabled && !loadGovernor.bypassInterpolation
+        let wantInterp = isInterpolationEnabled && !(loadGovernor.bypassInterpolation && !rifeKeepsInterp)
         if mirrorInterpolationEnabled != wantInterp { mirrorInterpolationEnabled = wantInterp }
         // ④ 업스케일 체인 — MetalFX(GPU)만 끄고 ANE 2x(GPU-free, 1.68ms 실측)는 유지
         overlayManager?.setUpscaleAllowsMetalFX(loadGovernor.allowsMetalFX)
@@ -238,7 +268,7 @@ public final class AppState {
         let srcSpreadMs = (diagSrcIntMax > 0 && diagSrcIntMin.isFinite && diagSrcIntMin >= 0)
             ? (diagSrcIntMax - diagSrcIntMin) * 1000 : 0
         gapExpansionAllowed = loadGovernor.allowsGapExpansion && srcSpreadMs < 20
-        tCountCap = loadGovernor.tCountCap
+        tCountCap = bypassButRife ? 1 : loadGovernor.tCountCap
     }
 
     /// 거버너 미러 (렌더 스레드에서 읽음) — 갭 확장 허용 / t 개수 상한
@@ -1471,6 +1501,11 @@ public final class AppState {
         // 타임스탬프를 콘텐츠 케이던스 그리드에 스냅 (양자화 지터 제거)
         let snappedTs = snapTimestamp(raw: slot.timestamp, rawDelta: delta)
 
+        // 단계 계측 진입 시각 — capIngest(캡처→인제스트 큐 대기) 산출용. slot.timestamp는 SCK
+        // 호스트 클럭(mach)이라 CACurrentMediaTime과 동일 기준.
+        let tStageEnter = stageDbg ? CACurrentMediaTime() : 0
+        let rawCaptureTs = slot.timestamp
+
         // cb1(blit+검출)은 splitQ면 copy 큐, 아니면 workQueue(기존). cb2(warp)는 항상 workQueue.
         let cb1Queue = (splitQueueEnabled ? copyQueue : nil) ?? workQueue
         guard let workQueue, let cb1Queue,
@@ -1523,6 +1558,13 @@ public final class AppState {
         let readyValue = stableReadyCounter
         if let ev = stableReadyEvent {
             cb.encodeSignalEvent(ev, value: readyValue)
+        }
+        if stageDbg {
+            cb.addCompletedHandler { [weak self] b in
+                guard let self else { return }
+                let g = (b.gpuEndTime - b.gpuStartTime) * 1000.0
+                self.stageLock.lock(); self.stgCb1Gpu += g; self.stageLock.unlock()
+            }
         }
         cb.commit()
         guard let cb2 = workQueue.makeCommandBuffer() else {
@@ -1701,7 +1743,31 @@ public final class AppState {
         let cutEvaluator = interpResult?.sceneCutEvaluator
         let startTs = pairStartTs
         let gapRef = pairGap
-        cb2.addCompletedHandler { _ in
+        let stageEnterRef = tStageEnter
+        let rawCaptureTsRef = rawCaptureTs
+        cb2.addCompletedHandler { [weak self] cb2Buf in
+            if let self, self.stageDbg {
+                let cb2Gpu = (cb2Buf.gpuEndTime - cb2Buf.gpuStartTime) * 1000.0
+                let capIngest = (stageEnterRef - rawCaptureTsRef) * 1000.0
+                let workNow = (CACurrentMediaTime() - stageEnterRef) * 1000.0
+                self.stageLock.lock()
+                self.stgCapIngest += capIngest
+                self.stgCb2Gpu += cb2Gpu
+                self.stgWork += workNow
+                self.stgCount += 1
+                let n = self.stgCount
+                if n >= 120 {
+                    let ci = self.stgCapIngest / Double(n), c1 = self.stgCb1Gpu / Double(n)
+                    let c2 = self.stgCb2Gpu / Double(n), wk = self.stgWork / Double(n)
+                    self.stgCapIngest = 0; self.stgCb1Gpu = 0; self.stgCb2Gpu = 0; self.stgWork = 0; self.stgCount = 0
+                    self.stageLock.unlock()
+                    DiagnosticLog.shared.log(String(format:
+                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f work=%.1f (대기=%.1f) ms/frame (n=120)",
+                        ci, c1, c2, wk, max(0, wk - ci - c1 - c2)))
+                } else {
+                    self.stageLock.unlock()
+                }
+            }
             // 장면 전환이면 보간 프레임 폐기 — 무관한 두 샷 사이의 모핑 프레임 방지
             let isSceneCut = cutEvaluator?() ?? false
             var entries: [TimelineEntry] = []

@@ -53,6 +53,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     static let ladderTiers = [288, 360, 432, 540]
     public nonisolated(unsafe) static var ladderMaxShort: Int = 540
 
+    /// 전체 티어 — 승격용 288+에 더해 **거버너 강등용 sub-288**(180/216/240)을 포함.
+    /// predict 실측(CPU_AND_NE): 180=3.1 / 216=5.0 / 240=6.2 / 288=7.6ms. 288 아래는 부하
+    /// 보호용 하강 구간으로, 거버너 flowCapShort가 상한을 내릴 때만 진입한다. parity flow 오차
+    /// 180=0.04 / 216=0.06px로 무손실 수준 (flow는 4K로 13~18배 업스케일되니 열화 미미).
+    static let descentTiers = [180, 216, 240, 288, 360, 432, 540]
+
+    /// 거버너가 내리는 flow 해상도 상한 [short px]. 사다리는 이 이하에서만 동작한다.
+    /// 큰 기본값 = 무제한(사다리 자율). 부하 시 거버너가 240→216→180으로 낮춰 predict를 줄인다
+    /// (bypass 대신). 사다리의 자연 바닥(288)보다 낮아질 수 있는 유일한 경로.
+    public nonisolated(unsafe) static var flowCapShort: Int = 1_000_000
+
     /// 모델 파일 존재 여부 (엔진 등록 가드용)
     public static func modelAvailable(short: Int) -> Bool {
         modelSourceURL(short: short) != nil
@@ -224,7 +235,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // GPU predict는 업스케일/표시와 경쟁해 부들부들을 만들어(실측) 앱 경로에서 배제.
         // 벤치(adaptiveLadder=false): flowShortSide/useGPU 그대로 (고정 조건 비교).
         let ladder = Self.adaptiveLadder && Self.modelAvailable(short: 288)
-        let short = ladder ? min(288, Self.flowShortSide) : Self.flowShortSide
+        // 시작도 거버너 상한 존중 (4K+저사양 시딩이 240으로 시작할 수 있음). 상한 이하 최대 티어.
+        let startCap = min(288, Self.flowShortSide, Self.flowCapShort)
+        let short = ladder ? (Self.descentTiers.last(where: { $0 <= startCap && Self.modelAvailable(short: $0) }) ?? 288) : Self.flowShortSide
         let startGPU = ladder ? false : Self.useGPU
         let (model, w, h) = try await Self.loadModel(short: short, gpu: startGPU)
         self.model = model
@@ -306,6 +319,18 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// GPU 150%+ 포화 → tick 108Hz 붕괴 실측). 중앙값이 간격의 35%↓(예: 24fps 소스)면 원복.
     private func maybeAdapt(gapS: Double, exhausted: Bool) {
         guard Self.adaptiveLadder else { return }
+
+        // 거버너 상한 즉시 반영 — 예산 창(180쌍)·10s 쿨다운을 우회한다(부하 보호는 빨라야 하고,
+        // 거버너 자체가 히스테리시스(2창 강등)라 스위칭이 잦지 않다). 사다리 자연 바닥(288)보다
+        // 낮게 내려가는 유일한 경로. ANE 모드에서만(GPU는 아래 별도 이전 로직이 처리).
+        if !currentGPU, currentShort > Self.flowCapShort,
+           let target = Self.descentTiers.last(where: { $0 <= Self.flowCapShort && Self.modelAvailable(short: $0) }),
+           target != currentShort,
+           CFAbsoluteTimeGetCurrent() - lastSwitchAt > 2.0 {
+            kickSwitch(short: target, gpu: false, reason: "거버너 상한 →\(target)p")
+            return
+        }
+
         ladderPairs += 1
         if exhausted { ladderExhausts += 1 }
         gapMsEMA = gapMsEMA == 0 ? gapS * 1000 : gapMsEMA * 0.9 + gapS * 1000 * 0.1
@@ -331,7 +356,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             kickSwitch(short: 288, gpu: false,
                        reason: "과부하 강등 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
         } else if !overloaded,
-                  let next = Self.ladderTiers.first(where: { $0 > currentShort && $0 <= Self.ladderMaxShort && Self.modelAvailable(short: $0) }) {
+                  let next = Self.ladderTiers.first(where: { $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort) && Self.modelAvailable(short: $0) }) {
             // 한 티어씩 승격 — 다음 해상도 예상 비용(면적비 = (next/cur)²)이 갭 여유 안일 때만.
             // 288→360 ×1.56, 360→432 ×1.44, 432→540 ×1.56 (실측 부합). 여유 없으면 자연히 안 올라감.
             let factor = Double(next * next) / Double(currentShort * currentShort)

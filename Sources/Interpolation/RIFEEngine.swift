@@ -161,6 +161,14 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             return (s[s.count / 2], s[min(s.count - 1, (s.count * 9) / 10)], s.last!)
         }
     }
+    /// 거버너용 — 최근 predict p90 [ms]. compute 과부하(강등 정당성) 판정 신호.
+    public var recentPredictP90Ms: Double { predictMsStats().p90 }
+
+    /// 슬롯 고갈 비율 EMA (0~1) — 전 슬롯이 predict 중 = compute가 배달을 못 따라감.
+    /// encodePair마다 갱신(가벼움). 거버너가 recentExhaustFrac로 읽어 강등 게이트에 쓴다.
+    private let exhaustEMA = OSAllocatedUnfairLock(initialState: 0.0)
+    public var recentExhaustFrac: Double { exhaustEMA.withLock { $0 } }
+
     /// 딜리버리 진단: 슬롯 고갈(전 슬롯 predict 중 = 못 따라감) 카운트
     private var diagDelivPairs = 0
     private var diagDelivExhaust = 0
@@ -426,6 +434,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             return nil
         }
         maybeAdapt(gapS: tsB - tsA, exhausted: acquired == nil)
+        exhaustEMA.withLock { $0 = $0 * 0.95 + (acquired == nil ? 1.0 : 0.0) * 0.05 }  // 거버너 compute 신호
         // 딜리버리 진단 — 슬롯 고갈률(못 따라감) + predict 분포/모드를 ~3s마다 로그
         diagDelivPairs += 1
         if acquired == nil { diagDelivExhaust += 1 }

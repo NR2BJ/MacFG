@@ -283,6 +283,8 @@ public final class AppState {
     nonisolated private func feedLoadGovernor() {
         let refresh = max(mirrorRefreshRate, 60)
         let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
+        // compute 과부하 신호 — RIFE일 때만 유효(비-RIFE는 0 → 거버너가 기존 presentRatio 판정 사용).
+        let rife = pairEngine as? RIFEEngine
         let signals = LoadGovernor.Signals(
             workP90Ms: paceWorkP90,
             workAvgMs: paceWorkAvg,
@@ -290,7 +292,9 @@ public final class AppState {
             tickHz: lastTickHz,
             refreshHz: refresh,
             missCount: paceMissCount,
-            presentRatio: pacePresentRatio)
+            presentRatio: pacePresentRatio,
+            predictP90Ms: rife?.recentPredictP90Ms ?? 0,
+            slotExhaustFrac: rife?.recentExhaustFrac ?? 0)
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.loadGovernor.update(signals)

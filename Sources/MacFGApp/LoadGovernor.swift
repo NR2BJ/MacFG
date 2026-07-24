@@ -70,8 +70,14 @@ public final class LoadGovernor {
         public let missCount: Int
         /// present 처리량 / 이론 상한 (1.0=목표 달성). **주 과부하 신호.**
         public let presentRatio: Double
+        /// RIFE predict p90 [ms] — **compute 과부하 판정**. 0이면 신호 없음(비-RIFE 엔진).
+        /// presentRatio는 배달 지터/present 포화로도 떨어지는데, 그건 flow 해상도를 낮춰도
+        /// 안 고쳐진다. predict가 예산에 근접해야 진짜 compute 과부하 → 강등이 유효.
+        public let predictP90Ms: Double
+        /// RIFE 슬롯 고갈 비율 (0~1) — 전 슬롯이 predict 중 = compute가 배달을 못 따라감.
+        public let slotExhaustFrac: Double
 
-        public init(workP90Ms: Double, workAvgMs: Double, sourceIntervalMs: Double, tickHz: Double, refreshHz: Double, missCount: Int, presentRatio: Double) {
+        public init(workP90Ms: Double, workAvgMs: Double, sourceIntervalMs: Double, tickHz: Double, refreshHz: Double, missCount: Int, presentRatio: Double, predictP90Ms: Double = 0, slotExhaustFrac: Double = 0) {
             self.workP90Ms = workP90Ms
             self.workAvgMs = workAvgMs
             self.sourceIntervalMs = sourceIntervalMs
@@ -79,6 +85,8 @@ public final class LoadGovernor {
             self.refreshHz = refreshHz
             self.missCount = missCount
             self.presentRatio = presentRatio
+            self.predictP90Ms = predictP90Ms
+            self.slotExhaustFrac = slotExhaustFrac
         }
     }
 
@@ -96,8 +104,15 @@ public final class LoadGovernor {
         // tickHz == 0은 "아직 측정 전"이지 굶주림이 아니다 — 이 구분을 안 하면 캡처 시작
         // 첫 창마다 강등됐다가 10초 뒤 복귀하는 헛왕복이 매번 일어난다(실측 전 런 강등=2).
         let tickStarved = s.refreshHz > 0 && s.tickHz > 1 && s.tickHz < s.refreshHz * 0.85
-        let shortfall = s.presentRatio < 0.85
-        let budget = min(max(s.sourceIntervalMs * 0.8, 8.0), 33.0)   // 로그 표시용
+        let budget = min(max(s.sourceIntervalMs * 0.8, 8.0), 33.0)
+        // **강등은 compute 과부하 증거가 있을 때만.** presentRatio는 배달 지터/present 포화로도
+        // 떨어지는데, 그 원인은 flow 해상도를 낮춰도 안 고쳐진다(실측: predict 5ms 여유인데
+        // presentRatio 49%로 216p까지 헛강등 → 매 전환 ~1.7s 소스온리 끊김 + 화질 손실만 유발,
+        // 매끄러움 회복은 사실 적응 지연 램프가 만든 것). compute 신호(predict p90/슬롯 고갈)가
+        // 있을 때(=RIFE)는 그게 예산에 근접해야 강등; 신호 없으면(비-RIFE) 기존 presentRatio 판정.
+        let hasComputeSignal = s.predictP90Ms > 0
+        let computeOverloaded = s.predictP90Ms >= budget * 0.85 || s.slotExhaustFrac >= 0.5
+        let shortfall = s.presentRatio < 0.85 && (!hasComputeSignal || computeOverloaded)
 
         if shortfall || tickStarved {
             badWindows += 1

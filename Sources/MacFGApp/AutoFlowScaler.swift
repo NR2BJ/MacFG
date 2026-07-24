@@ -33,7 +33,11 @@ public final class AutoFlowScaler {
     public var manualOverride = false
 
     private var idx: Int = 5                       // rungs[5] = 1440
-    private var ceilingIdx: Int = rungs.count - 1  // 학습된 천장
+    /// 학습된 천장. 초기값 = 1440(idx 5) — **실프레임 측정 근거**: 실제 4K 덤프 4세트 × flow 640~2160
+    /// 삼중항 PSNR에서 해상도에 따른 화질 변화가 ±0.5dB 안이고 방향도 콘텐츠마다 갈렸다(중립).
+    /// 반면 비용은 4K에서 960≈6ms → 1728≈8.9ms → 2160≈10.3ms로 확실히 는다. 즉 그 위로 올리는 건
+    /// GPU만 쓰고 화질은 0이므로 탐침 자체를 막고, 남는 여유는 틱 안정성/발열/저사양 여유로 남긴다.
+    private var ceilingIdx: Int = 5
     private var goodWindows = 0
     private var badWindows = 0
     private var lastChangeAt: CFAbsoluteTime = 0

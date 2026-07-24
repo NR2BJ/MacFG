@@ -40,6 +40,45 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.
     public nonisolated(unsafe) static var occlusionDirectional: Bool = false
 
+    /// 서브픽셀 정련을 적용할 최종 레벨 수 (기본 1 = 최종 레벨만). 늘리면 상위 레벨의 정수 반올림
+    /// 오차를 더 이른 단계에서 줄여 하위 전파가 정확해질 수 있다(비용: 레벨당 4 gather).
+    public nonisolated(unsafe) static var refineLevels: Int = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFREFINE"], let v = Int(s), (1...7).contains(v) { return v }
+        return 1
+    }()
+
+    /// 하위(정련) 레벨 탐색 반경 (기본 1). prior가 빗나갔을 때 각 레벨이 되잡을 수 있는 폭.
+    public nonisolated(unsafe) static var fineSearchRadius: Int32 = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFFINE"], let v = Int32(s), (1...3).contains(v) { return v }
+        return 1
+    }()
+
+    /// 평활 페널티 계수 (기본 0.017). 크면 prior에서 안 움직이려 하고(안정), 작으면 잘 따라감(디테일).
+    public nonisolated(unsafe) static var matchPenalty: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFPENALTY"], let v = Float(s), v >= 0, v <= 0.2 { return v }
+        return 0.017
+    }()
+
+    /// 순환 일관성 신뢰도 문턱 [px] — conf = 1 - smoothstep(lo, hi, cycleError).
+    /// 이 게이트가 닫히면(conf≈0) 워프 대신 폴백으로 빠져 **flow 계산이 결과에 반영되지 않는다**.
+    /// 빠른 콘텐츠에서 순환 오차가 hi를 넘으면 화면 대부분이 폴백이 되므로 실측으로 잡아야 한다.
+    public nonisolated(unsafe) static var confLo: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFCYCLO"], let v = Float(s), v >= 0 { return v }
+        return 2.5
+    }()
+    public nonisolated(unsafe) static var confHi: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFCYCHI"], let v = Float(s), v > 0 { return v }
+        return 8.0
+    }()
+
+    /// 순환 오차 문턱의 **모션 비례분** (0 = 절대 px 문턱만). 문턱 = lo + rel·|flow|.
+    /// 같은 3px 순환 오차라도 50px 모션에선 정상, 2px 모션에선 쓰레기다 — 절대 문턱 하나로는
+    /// 빠른 콘텐츠(과도하게 폐기)와 느린 콘텐츠(엉터리 flow 통과)를 동시에 맞출 수 없다.
+    public nonisolated(unsafe) static var confRel: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFCYCREL"], let v = Float(s), v >= 0 { return v }
+        return 0.3   // 실측 최적 (전 7세트: avg +0.141 / 빠른셋 +0.197 / 최악값 평균 +0.051)
+    }()
+
     /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.
     public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
         if let s = ProcessInfo.processInfo.environment["MACFG_MFRADIUS"], let v = Int32(s), (1...8).contains(v) { return v }
@@ -229,10 +268,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 // 최상위(코스) 탐색 반경 — 여기서 잡는 최대 변위가 곧 "빠른 시점 회전을 따라갈 수 있는
                 // 한계"다. 코스 레벨은 가장 작아서(4K/flow1440 기준 22×12px) 반경을 넓혀도 비용이
                 // 거의 안 는다(후보 수는 (2r+1)²이지만 픽셀 수가 1/4096). MACFG_MFRADIUS로 실측 스윕.
-                searchRadius: isCoarsest ? Self.coarseSearchRadius : 1,
+                searchRadius: isCoarsest ? Self.coarseSearchRadius : Self.fineSearchRadius,
                 hasPrior: (useTemporal || !isCoarsest) ? 1 : 0,
-                refine: l == 0 ? 1 : 0,  // 서브픽셀 refine은 최종 레벨만 (비용 40%↓)
-                priorScale: isCoarsest ? 1.0 : 2.0
+                refine: l < Self.refineLevels ? 1 : 0,   // 서브픽셀 정련 레벨 수 (기본 1=최종만)
+                priorScale: isCoarsest ? 1.0 : 2.0,
+                penalty: Self.matchPenalty
             )
             // forward: A→B (zero-mean 루마로 매칭)
             enc.setComputePipelineState(matchPSO)
@@ -289,6 +329,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         enc2.setTexture(flowB[0], index: 3)
         enc2.setTexture(maskTex, index: 4)
         enc2.setBuffer(statsBuffer, offset: 0, index: 0)
+        var fp = FinalizeParams(confLo: Self.confLo, confHi: Self.confHi, confRel: Self.confRel)
+        enc2.setBytes(&fp, length: MemoryLayout<FinalizeParams>.stride, index: 1)
         dispatch(enc2, levels[0].w, levels[0].h, finalizePSO)
 
         // 4) 풀해상도 워프 + 합성 — flow는 한 번 계산, t별로 워프만 반복 (장당 ~1ms)
@@ -353,7 +395,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var hasPrior: Int32
         var refine: Int32
         var priorScale: Float
+        var penalty: Float
     }
+
+    private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float }
     private struct WarpParams {
         var t: Float
         var dirBlend: Float
@@ -470,7 +515,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; };
+    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; };
+    struct FinalizeParams { float confLo; float confHi; float confRel; };
     struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
@@ -593,7 +639,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 if (cache9) sad9[oy + 1][ox + 1] = rawSad;
                 // 평활 페널티 — 애매(평탄) 영역에서 벡터가 prior에서 멋대로 점프하는
                 // 노이즈 억제 (shimmer의 주범). 36탭 SAD 스케일 기준 (25탭 0.012 × 36/25).
-                half sad = rawSad + 0.017h * half(length(float2(ox, oy)));
+                half sad = rawSad + half(p.penalty) * half(length(float2(ox, oy)));
                 if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
             }
         }
@@ -661,6 +707,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         texture2d<float, access::sample> flowB [[texture(3)]],
         texture2d<float, access::write> mask [[texture(4)]],
         device atomic_uint* hist [[buffer(0)]],
+        constant FinalizeParams& fp [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = mask.get_width(), h = mask.get_height();
@@ -680,8 +727,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float cycB = length(b + flowF.sample(s, uvB).rg);
         // 실영상 압축 노이즈에서 순환 오차 ~2px는 정상 — 과민하면 화면 대부분이
         // 원본 폴백(60fps 스텝)으로 빠져 '프레임레이트 낮아 보임' (실측 보고)
-        float confF = 1.0 - smoothstep(2.5, 8.0, cycF);
-        float confB = 1.0 - smoothstep(2.5, 8.0, cycB);
+        // 문턱을 모션 크기에 비례해 늘림 — 큰 변위에서 순환 오차가 커지는 건 정상이다.
+        float relF = fp.confRel * length(f), relB = fp.confRel * length(b);
+        float confF = 1.0 - smoothstep(fp.confLo + relF, fp.confHi + relF, cycF);
+        float confB = 1.0 - smoothstep(fp.confLo + relB, fp.confHi + relB, cycB);
 
         // 광도 검증(brightness constancy): flow를 따라간 곳의 밝기가 다르면 그 방향 기각.
         // 순환 일관성만으론 "일관되게 틀린" flow(반복 패턴 aliasing)를 못 걸러냄 —

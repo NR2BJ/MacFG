@@ -199,6 +199,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var stgWork = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCount = 0
     @ObservationIgnored private let stageLock = NSLock()
+    /// UI 정적 검출 스트라이드 카운터 — 매 6프레임만 4K 검출 갱신 (백로그 증폭 방지)
+    @ObservationIgnored nonisolated(unsafe) private var uiDetectFrame = 0
 
     private let captureManager = CaptureManager()
     // U2 전체화면 재타깃: 사용자가 고른 원 창 / 현재 실제 캡처 중인 창(전체화면 시 전환).
@@ -1550,7 +1552,14 @@ public final class AppState {
 
         // 시간축 정지-UI 검출 갱신 — blit 직후 같은 cb1(소스 준비됨, 순서 보장). 누적 마스크는
         // cb1 완료(=stableReady) 후 유효 → cb2 워프가 stableReady 대기 후 읽으므로 안전.
-        uiDetector?.update(source: stable, into: cb)
+        // **스트라이드(매 6프레임)**: 이 4K 갱신이 cb1 GPU +3ms인데, workQueue 백로그가 그걸
+        // +11ms work로 증폭한다(진단 확정). UI 정적 영역은 초 단위로 지속하므로 매 프레임 갱신은
+        // 낭비 — 갱신 안 하면 직전 누적 마스크가 그대로 유효(maskTex 미재기록). MetalFlow 4K에서
+        // work 40→목표↓의 최대 단일 레버.
+        uiDetectFrame &+= 1
+        if uiDetector != nil, uiDetectFrame % 6 == 0 {
+            uiDetector?.update(source: stable, into: cb)
+        }
         // Vision 텍스트 검출 (~2초 주기) — cb1에 스냅샷 blit, 완료 후 백그라운드에서 검출
         scheduleVisionTextDetection(source: stable, cb: cb)
 

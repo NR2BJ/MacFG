@@ -2601,6 +2601,14 @@ public final class AppState {
 
     /// 실프레임 덤프 무장 (⌃⌥⌘D) — 다음 N개 고유 소스 프레임을 PNG로 저장.
     func startFrameDump(count: Int = 12) {
+        // 캡처 중이 아니면 무장해봐야 프레임이 안 들어와 빈 디렉터리만 남는다(실제로 겪음 —
+        // 단축키는 먹고 디렉터리도 생기는데 0장이라 원인을 로그에서야 알 수 있었다).
+        // 조용히 실패하지 말고 즉시 알린다.
+        guard isCapturing else {
+            DiagnosticLog.shared.log("[FRAMEDUMP] ⚠︎ 캡처 중이 아님 — 덤프 취소 (캡처를 먼저 시작할 것)")
+            NSSound(named: "Funk")?.play()   // 실패는 다른 소리로 구분
+            return
+        }
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd-HHmmss"
         let stamp = fmt.string(from: Date())

@@ -102,27 +102,6 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     }
 
     /// 공용 스트림 설정 — startCapture와 updateConfiguration이 공유
-    /// 디스플레이 캡처 시 처리 해상도 상한 (long-side px). 0 = 무제한(디스플레이 원본).
-    /// 근거: 보간 화질은 소스 콘텐츠 해상도가 상한이라, 1080p 영상을 전체화면(4K 디스플레이)한 걸
-    /// 4K로 통째 캡처·blit·워프·present하면 픽셀만 4배지 화질 이득은 0이다. 캡처를 캡 해상도로
-    /// 다운스케일하면 파이프라인 전체가 그만큼 가벼워지고, present가 드로어블(4K)로 업스케일하므로
-    /// 최종 출력 크기는 그대로. 창 캡처(창=콘텐츠 실크기)에는 적용하지 않는다.
-    static let displayCapLongSide: Int = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_CAPCAP"], let v = Int(s), v >= 0 { return v }
-        return 0
-    }()
-
-    /// long-side가 캡을 넘으면 종횡비 유지하며 캡 해상도로 축소 (짝수 정렬). 캡 0/이내면 원본 유지.
-    static func capDisplayDims(_ w: Int, _ h: Int) -> (Int, Int) {
-        let cap = displayCapLongSide
-        let long = max(w, h)
-        guard cap > 0, long > cap else { return (w, h) }
-        let s = Double(cap) / Double(long)
-        let cw = max(2, (Int((Double(w) * s).rounded())) & ~1)
-        let ch = max(2, (Int((Double(h) * s).rounded())) & ~1)
-        return (cw, ch)
-    }
-
     private static func makeConfig(width: Int, height: Int, sourceRect: CGRect? = nil) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.width = max(width, 2)
@@ -169,13 +148,11 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         let excluded = content.windows.filter { excludingWindowIDs.contains($0.windowID) }
         self.captureRect = nil
         self.captureScale = Self.findScaleFactor(for: display.frame)
-        let dw = display.width, dh = display.height        // 디스플레이는 이미 픽셀 단위
-        let (w, h) = Self.capDisplayDims(dw, dh)            // 처리 해상도 캡 (1080p 콘텐츠 4K 낭비 방지)
+        let w = display.width, h = display.height          // 디스플레이는 이미 픽셀 단위
         try await stream.updateContentFilter(SCContentFilter(display: display, excludingWindows: excluded))
         try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
         isDisplayCapture = true
-        let capNote = (w != dw || h != dh) ? " (cap \(dw)x\(dh)→\(w)x\(h))" : ""
-        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h)\(capNote), 제외 창 \(excluded.count)개")
+        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h), 제외 창 \(excluded.count)개")
     }
 
     /// 디스플레이 캡처 중인지 — 전체화면 이탈 시 창 캡처로 되돌릴지 판단용

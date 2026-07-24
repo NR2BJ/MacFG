@@ -188,6 +188,19 @@ public final class LoadGovernor {
         }
     }
 
+    /// RIFE 보간 프레임 워프 해상도 배율 (LSFG Resolution Scale). RIFE의 4K 병목은 flow가
+    /// 아니라 풀해상도 워프라, flowBase(MetalFlow 전용)로는 안 줄어든다. 이게 RIFE의 실질
+    /// 중간 강등 다이얼 — 이게 없으면 RIFE는 full↔bypass 사이에 손잡이가 없어 곧장 바이패스로
+    /// 떨어진다("보간 꺼짐"의 원인). 보간 프레임만 줄이고 원본은 4K 유지 → 화질 손실 최소.
+    public var warpScale: Double {
+        switch level {
+        case .full:   return 1.0
+        case .light:  return 0.67   // 워프 비용 ~0.45
+        case .heavy:  return 0.5    // 워프 비용 ~0.25
+        case .bypass: return 0.5
+        }
+    }
+
     /// 보간 배율 상한. nil이면 제한 없음.
     public var multiplierCap: Int? {
         switch level {

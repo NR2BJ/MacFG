@@ -34,6 +34,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
     /// flow 콘텐츠 단변 — 288/360/432 (Models/rife{N}.mlpackage 필요)
     public nonisolated(unsafe) static var flowShortSide: Int = 360
+
+    /// 보간 프레임 워프 해상도 배율 (LSFG Resolution Scale). 1.0=풀해상도. <1이면 I프레임만
+    /// 그만큼 줄여 워프하고 present에서 4K로 업스케일 — 4K 60fps 워프 병목의 최대 지렛대.
+    /// MACFG_WARPSCALE로 A/B. 거버너가 부하 시 자동 설정(setWarpScale).
+    public nonisolated(unsafe) static var warpScale: Double =
+        ProcessInfo.processInfo.environment["MACFG_WARPSCALE"].flatMap { Double($0) } ?? 1.0
     /// CoreML 유닛 — true=GPU(전 사이즈 최속), false=ANE(느리지만 GPU를 비움) — 벤치 전용 노브
     public nonisolated(unsafe) static var useGPU: Bool = true
     /// 앱 적응 사다리(ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
@@ -409,7 +415,16 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         guard let (slot, model, mW0, mH0) = acquired else { return nil }
         let signalValue = slot.useCount
 
-        ensureOutputPool(width: stableB.width, height: stableB.height)
+        // LSFG식 감소 해상도 워프: 보간 프레임(I)만 절반 해상도로 워프하고 present에서 4K로
+        // 업스케일(공짜 — present는 어차피 텍스처를 드로어블에 샘플러로 그림). 원본(S)은 4K 그대로.
+        // 워프가 4K 원본을 절반 밀도로 샘플 → dispatch/샘플/ALU ¼. LSFG "Resolution Scale 50%"와
+        // 동일 원리. 예전 warpcap 실패는 출력만 줄이고 flow는 4K로 올려 순변경 0이었음 — 여기선
+        // flowScale이 output 기준(639행)이라 flow도 함께 절반으로 내려간다.
+        // 60fps 4K 워프가 진짜 병목(predict 7.6ms인데 work 50ms)이라 여기가 최대 지렛대.
+        let ws = Self.warpScale
+        let ow = ws < 0.999 ? max(640, Int(Double(stableB.width) * ws) & ~1) : stableB.width
+        let oh = ws < 0.999 ? max(360, Int(Double(stableB.height) * ws) & ~1) : stableB.height
+        ensureOutputPool(width: ow, height: oh)
         // 쌍당 6장 예산(풀 16의 오버런 여유 유지) 초과 시 prefix가 아닌 균등 스트라이드로
         // 선택 — prefix(6)는 뒤쪽 t(B 직전)를 뭉텅이로 버려 저fps 콘텐츠에서 매 쌍 25~35ms
         // 홀드(반복 케이던스 단절)를 만들었다 (감사 확정). 스트라이드는 구멍을 쌍 전체에 분산.

@@ -208,6 +208,15 @@ public final class AppState {
             MetalFlowEngine.flowBaseLongSide = base
             DiagnosticLog.shared.log("[GOV] flowBase → \(Int(base))")
         }
+        // RIFE 워프 해상도 배율 (LSFG식) — RIFE의 실질 중간 강등 다이얼. env 수동 오버라이드가
+        // 있으면 그걸 존중(측정용), 없으면 거버너가 설정.
+        if ProcessInfo.processInfo.environment["MACFG_WARPSCALE"] == nil {
+            let wscale = loadGovernor.warpScale
+            if abs(RIFEEngine.warpScale - wscale) > 0.001 {
+                RIFEEngine.warpScale = wscale
+                DiagnosticLog.shared.log("[GOV] RIFE warpScale → \(String(format: "%.2f", wscale))")
+            }
+        }
         // ② 보간 배율 상한 — 렌더 스레드 미러에 반영 (t 생성 단계에서 소비)
         let mult = min(frameMultiplier, loadGovernor.multiplierCap ?? frameMultiplier)
         if mirrorFrameMultiplier != mult { mirrorFrameMultiplier = mult }

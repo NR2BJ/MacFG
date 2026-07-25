@@ -48,6 +48,10 @@ public final class AutoFlowScaler {
     private var lastAscendIdx: Int = -1
     private var lastAscendAt: CFAbsoluteTime = 0
 
+    /// 시계 주입 — 변경 최소간격/동결 같은 시간 기반 히스테리시스를 테스트에서 결정적으로 돌리기 위함.
+    /// 실사용에선 실제 시각을 쓴다.
+    public var nowProvider: () -> CFAbsoluteTime = { CFAbsoluteTimeGetCurrent() }
+
     public init() {
         let env = ProcessInfo.processInfo.environment
         enabled = env["MACFG_AUTOFLOW"] != "0"
@@ -70,7 +74,7 @@ public final class AutoFlowScaler {
         current = Self.rungs[idx]
         lastReason = "기기 시딩 (GPU \(gpuCoreCount)코어, 소스 \(sourcePixels / 1_000_000)MP)"
         DiagnosticLog.shared.log("[AUTOFLOW] 시작 \(Int(current)) — \(lastReason)")
-        lastChangeAt = CFAbsoluteTimeGetCurrent()
+        lastChangeAt = nowProvider()
         goodWindows = 0; badWindows = 0; uselessDescents = 0
         achievedBeforeDescent = -1
     }
@@ -82,7 +86,7 @@ public final class AutoFlowScaler {
     @discardableResult
     public func update(achievedRatio: Double, engineMs: Double, budgetMs: Double) -> Double {
         guard enabled, !manualOverride, budgetMs > 0 else { return current }
-        let now = CFAbsoluteTimeGetCurrent()
+        let now = nowProvider()
 
         // 엔진이 예산에서 차지하는 비중 — 하강이 유효할 수 있는지의 근거.
         // 25% 미만이면 flow를 반으로 줄여도 전체가 거의 안 변한다 → 화질만 손해.
@@ -171,6 +175,6 @@ public final class AutoFlowScaler {
     public func softReset() {
         goodWindows = 0; badWindows = 0; uselessDescents = 0
         achievedBeforeDescent = -1
-        lastChangeAt = CFAbsoluteTimeGetCurrent()
+        lastChangeAt = nowProvider()
     }
 }

@@ -390,12 +390,9 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             defer { self.switching.withLock { $0 = false } }
             do {
                 let (newModel, w, h) = try await Self.loadModel(short: short, gpu: gpu)
-                // 인플라이트 predict/warp 완료 대기 (슬롯 전부 반납까지, 최대 2s)
-                for _ in 0..<40 {
-                    let allFree = self.slotLock.withLock { self.slots.allSatisfy { !$0.busy } }
-                    if allFree { break }
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                }
+                // 인플라이트 완료를 기다리지 않는다 — 진행 중인 쌍의 워커 클로저가 자기 Slot과
+                // 모델을 강참조하므로, self.slots 배열을 교체해도 그 버퍼는 ARC가 살려둔다.
+                // (예전엔 최대 2s 대기 = 전환 지연의 대부분. 대기 동안 위 게이트가 보간을 막았다)
                 let newSlots = try Self.buildSlots(device: device, modelW: w, modelH: h)
                 self.slotLock.withLock {
                     self.model = newModel
@@ -428,7 +425,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     ) -> PairEncodeResult? {
         guard let packQueue, let packPSO, let unpackPSO, let warpPSO,
               !tValues.isEmpty, tsB > tsA else { return nil }
-        if switching.withLock({ $0 }) { return nil }   // 사다리 전환 중 — 소스만 표시 (~1s)
+        // 전환 중에도 **구 모델/슬롯으로 계속 보간한다.** 아래 acquired 스냅샷이 slotLock 안에서
+        // (slot, model, modelW, modelH)를 원자적으로 집으므로, 교체 순간까지는 일관된 구 세트를
+        // 보고 그 다음 쌍부터 새 세트를 본다. 예전엔 여기서 nil을 반환해 전환 내내(~1s) 소스만
+        // 표시됐고(engFail 스파이크), 자동 스케일러 도입으로 전환이 잦아져 더 자주 드러났다.
 
         // 슬롯+모델 원자 스냅샷 — 사다리 스왑(모델·크기·슬롯 동시 교체)과 일관성 보장
         let acquired: (Slot, MLModel, Int, Int)? = slotLock.withLock {
@@ -521,7 +521,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let ringRef = predictMsRing
         let loggerRef = logger
         let anchorsRef = anchors
-        packCB.addCompletedHandler { [weak model] _ in
+        // model을 **강참조**로 캡처 — 사다리 교체로 self.model이 바뀌어도 이 쌍은 자기 모델로 완주한다.
+        // 약참조였을 땐 교체 직후 워커가 guard에 걸려 그 쌍이 50/50 강등으로 떨어졌다(전환 티).
+        // 순환 없음(모델은 클로저를 참조하지 않음), 전환 순간 두 모델이 잠깐 공존하는 비용만 든다.
+        packCB.addCompletedHandler { [model] _ in
             workerRef.async {
                 defer { slot.event.signaledValue = signalValue }
                 // predict를 못 채우는 앵커는 flow=0/mask=0으로 명시 클리어 — unpack이 50/50
@@ -532,7 +535,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                         memset(slot.maskBufs[i].contents(), 0, slot.maskBufs[i].length)
                     }
                 }
-                guard let model, !cancelledRef.withLock({ $0 }) else {
+                // 모델은 이제 강참조라 항상 유효 — 취소(shutdown)만 확인한다
+                guard !cancelledRef.withLock({ $0 }) else {
                     degradeAnchors(0..<anchorsRef.count)
                     return
                 }

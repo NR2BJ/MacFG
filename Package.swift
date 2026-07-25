@@ -44,6 +44,11 @@ let package = Package(
             path: "Sources/Monitoring"
         ),
         // MARK: - Benchmark
+        .testTarget(
+            name: "MacFGTests",
+            dependencies: ["Monitoring"],
+            path: "Tests/MacFGTests"
+        ),
         .executableTarget(
             name: "InterpBench",
             dependencies: ["Interpolation"],

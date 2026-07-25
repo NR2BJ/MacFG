@@ -63,6 +63,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         item.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "MacFG")
         item.button?.target = self
         item.button?.action = #selector(togglePopover(_:))
+        // **고유 autosaveName 필수** — 지정하지 않으면 macOS가 익명 슬롯(Item-N)을 배정하는데,
+        // 제어센터가 그 슬롯들을 전부 "숨김"으로 기록해 두면(실측: Item-0~Item-103 전부 0)
+        // 아이콘이 영영 안 보인다. 시스템 설정 메뉴막대에 같은 앱이 여러 개로 뜨는 것도 같은 원인.
+        // 이름을 주면 자기 항목("MacFG")을 갖고 표시 상태가 그 이름으로 저장된다.
+        item.autosaveName = "MacFG"
         item.isVisible = true      // 숨김으로 기록돼 있던 상태를 매 실행 되돌린다
         statusItem = item
 

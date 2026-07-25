@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Monitoring
 
 /// 사용자 지정 가능한 단축키 (keyCode + Carbon 모디파이어 마스크 + 표시용 라벨).
 /// UserDefaults에 Codable로 저장.
@@ -60,6 +61,10 @@ public final class HotKeyCenter {
             if status == noErr {
                 hotKeyRefs.append(ref)
                 actions[b.id] = b.action
+            } else {
+                // 조용히 무시하면 "단축키가 안 먹는다"의 원인을 알 수 없다 — 다른 앱이 이미
+                // 같은 조합을 선점했거나(-9878 eventHotKeyExistsErr) 권한 문제일 수 있다.
+                DiagnosticLog.shared.log("[HOTKEY] 등록 실패 id=\(b.id) keyCode=\(b.keyCode) mods=\(b.modifiers) status=\(status)")
             }
         }
     }

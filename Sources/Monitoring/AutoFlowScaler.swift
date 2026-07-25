@@ -26,6 +26,8 @@ public final class AutoFlowScaler {
     public private(set) var current: Double = 1440
     /// 마지막 전이 사유 (로그/UI용)
     public private(set) var lastReason: String = ""
+    /// 현재 학습된 천장 (긴 변 px) — 진단 표시 및 테스트 관측용.
+    public var learnedCeiling: Double { Self.rungs[ceilingIdx] }
 
     private let enabled: Bool
     private let debug: Bool
@@ -38,6 +40,11 @@ public final class AutoFlowScaler {
     /// 반면 비용은 4K에서 960≈6ms → 1728≈8.9ms → 2160≈10.3ms로 확실히 는다. 즉 그 위로 올리는 건
     /// GPU만 쓰고 화질은 0이므로 탐침 자체를 막고, 남는 여유는 틱 안정성/발열/저사양 여유로 남긴다.
     private var ceilingIdx: Int = 5
+    /// 학습 천장의 절대 상한 — 위 근거대로 그 위는 비용만 늘고 화질 이득이 0이라 탐침 자체를 막는다.
+    /// 천장은 이 값까지만 **회복**할 수 있다(넘어서 오르지 않는다).
+    private let maxCeilingIdx: Int = 5
+    /// 천장 칸에서 연속 달성한 창 수 — 천장 회복의 근거.
+    private var goodAtCeiling = 0
     private var goodWindows = 0
     private var badWindows = 0
     private var lastChangeAt: CFAbsoluteTime = 0
@@ -75,8 +82,34 @@ public final class AutoFlowScaler {
         lastReason = "기기 시딩 (GPU \(gpuCoreCount)코어, 소스 \(sourcePixels / 1_000_000)MP)"
         DiagnosticLog.shared.log("[AUTOFLOW] 시작 \(Int(current)) — \(lastReason)")
         lastChangeAt = nowProvider()
-        goodWindows = 0; badWindows = 0; uselessDescents = 0
+        goodWindows = 0; badWindows = 0; uselessDescents = 0; goodAtCeiling = 0
         achievedBeforeDescent = -1
+    }
+
+    /// 두 신호를 하나의 달성도로 합친다 — 호출자가 쓰기 전에 반드시 통과시켜야 하는 관문.
+    ///
+    /// - tickRatio: 디스플레이에 실제로 프레임을 낸 비율 (틱Hz / 주사율). **진짜 배달 성적**.
+    /// - keepRatio: 만든 보간 프레임 중 살아남은 비율 (1 - 폐기율).
+    ///
+    /// keepRatio를 그대로 달성도로 쓰면 안 된다. 폐기(staleDrop)는 배달 실패가 아니라
+    /// **필요보다 많이 만들어 늦은 걸 버린 낭비**다. 틱이 주사율을 온전히 내는 동안에도 폐기가
+    /// 7%만 넘으면 달성도가 하강 문턱(0.93) 밑으로 떨어졌고, flow를 내리면 GPU 시간이 줄어
+    /// 폐기가 **조금** 개선되므로 "하강이 유효했다"고 판정돼 다시 내려간다 — 자기강화 하강이다.
+    /// 실측(4K/M4): 프레임은 120으로 멀쩡한데 flow만 1200→480까지 단조 하강했다.
+    /// 그래서 폐기는 정말 심각할 때(생산의 1/5 이상을 버릴 때)만 미달 신호로 인정한다.
+    /// (순수 함수 — feedLoadGovernor가 렌더 스레드에서 부르므로 nonisolated)
+    public nonisolated static func combinedAchieved(tickRatio: Double, keepRatio: Double) -> Double {
+        let tick = max(0, min(1.0, tickRatio))
+        let keep = max(0, min(1.0, keepRatio))
+        return keep < 0.80 ? min(tick, keep) : tick
+    }
+
+    /// "하강이 무효였으니 원복" 시 되돌아갈 칸. **max(ceilingIdx, idx)가 핵심**:
+    /// 천장이 현재 칸보다 낮으면(Pro/Max 시딩은 천장 위에서 출발한다) min(idx+2, ceilingIdx)가
+    /// 현재보다 아래를 가리켜, "원복"이라 로그하면서 실제로는 화질을 더 깎는다.
+    /// 원복은 정의상 **올라가거나 제자리**여야 한다.
+    public nonisolated static func restoreIndex(from idx: Int, ceilingIdx: Int) -> Int {
+        min(idx + 2, max(ceilingIdx, idx))
     }
 
     /// 2초 창마다 호출. 반환값이 바뀌면 호출자가 엔진에 반영한다.
@@ -110,7 +143,10 @@ public final class AutoFlowScaler {
                 uselessDescents += 1
                 if uselessDescents >= 2 {
                     // 두 번 내렸는데 목표가 안 올랐다 = 병목이 flow가 아니다. 원위치 + 동결.
-                    let restore = min(idx + 2, ceilingIdx)
+                    // **max(ceilingIdx, idx) 필수**: 천장이 학습으로 현재 칸보다 낮아져 있으면
+                    // min(idx+2, ceilingIdx)가 현재보다 **아래**를 가리켜, "원복"이라 로그하면서
+                    // 실제로는 더 내려가 버린다(실측: 1200→480 단조 하강의 절반이 이 경로였다).
+                    let restore = Self.restoreIndex(from: idx, ceilingIdx: ceilingIdx)
                     if restore != idx {
                         idx = restore
                         current = Self.rungs[idx]
@@ -134,6 +170,21 @@ public final class AutoFlowScaler {
             goodWindows += 1; badWindows = 0
         } else {
             badWindows = 0; goodWindows = 0   // 중간지대 유지
+        }
+
+        // 천장 회복 — 천장 학습은 내려가기만 해서, 일시적 과부하 한 번이 세션 전체의 화질 상한을
+        // 영구히 깎았다(실측: 4K에서 1200으로 시작해 480까지 흘러내린 뒤 복귀 불가. 상승 조건이
+        // idx < ceilingIdx라 천장이 바닥이면 영영 못 오른다). 천장 칸에서 충분히 오래 안정적이면
+        // 한 칸 돌려주어 다시 탐침할 기회를 준다. 상한(maxCeilingIdx)은 넘지 않는다.
+        if hitting, idx >= ceilingIdx, ceilingIdx < maxCeilingIdx {
+            goodAtCeiling += 1
+            if goodAtCeiling >= 15 {          // ≈30s 연속 달성
+                ceilingIdx += 1
+                goodAtCeiling = 0
+                DiagnosticLog.shared.log("[AUTOFLOW] 천장 회복 → \(Int(Self.rungs[ceilingIdx]))")
+            }
+        } else if !hitting {
+            goodAtCeiling = 0
         }
 
         guard now >= frozenUntil else { return current }
@@ -173,7 +224,7 @@ public final class AutoFlowScaler {
 
     /// 캡처 재시작 시 — 학습을 유지하되 카운터만 리셋 (같은 기기면 정착값이 유효)
     public func softReset() {
-        goodWindows = 0; badWindows = 0; uselessDescents = 0
+        goodWindows = 0; badWindows = 0; uselessDescents = 0; goodAtCeiling = 0
         achievedBeforeDescent = -1
         lastChangeAt = nowProvider()
     }

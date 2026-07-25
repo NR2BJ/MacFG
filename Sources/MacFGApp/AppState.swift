@@ -317,7 +317,8 @@ public final class AppState {
         // 자동 flow 스케일러 입력 — 달성도는 "틱이 주사율을 내는가"와 "낸 프레임을 지키는가" 중
         // 나쁜 쪽(둘 다 목표 프레임 미달의 증상). 엔진 GPU 비중이 근거로 함께 들어간다.
         let tickRatio = refresh > 0 && lastTickHz > 1 ? min(1.0, lastTickHz / refresh) : 1.0
-        let achieved = min(tickRatio, max(0, min(1.0, pacePresentRatio)))
+        // 합성 규칙과 그 근거는 AutoFlowScaler.combinedAchieved 참조 (단위 테스트로 고정돼 있다).
+        let achieved = AutoFlowScaler.combinedAchieved(tickRatio: tickRatio, keepRatio: pacePresentRatio)
         let engineMs = engineGpuMsEMA
         let budgetMs = interval * 1000.0
         Task { @MainActor [weak self] in
@@ -2286,17 +2287,24 @@ public final class AppState {
 
     /// 2026-07-25 MetalFlow 화질 변경(모션비례 신뢰도 / 역방향 결합 / 정적 문턱)을 통째로 껐다 켠다.
     /// 실사용 아티팩트가 이 변경 탓인지 같은 장면에서 즉시 A/B 하기 위한 진단용 토글.
-    @ObservationIgnored private var qualityChangesOn = true
+    /// MetalFlow 7/25 화질 변경 A/B 단계 (비트: 1=conf 계열, 2=static 계열).
+    /// 셋을 묶어 ON/OFF만 하면 "부드러움↑ / 텍스트 흔들림↑"이 동시에 움직여 범인을 못 가린다.
+    /// 3(둘 다)에서 시작해 0(이전 동작) → 1(conf만) → 2(static만) → 3 으로 순환한다.
+    @ObservationIgnored private var qualityStage = 3
     func toggleMetalFlowQualityChanges() {
-        qualityChangesOn.toggle()
-        if qualityChangesOn {
-            MetalFlowEngine.confRel = 0.3; MetalFlowEngine.confMax = 0.5
-            MetalFlowEngine.staticLo = 0.004; MetalFlowEngine.staticHi = 0.02
-        } else {
-            MetalFlowEngine.confRel = 0.0; MetalFlowEngine.confMax = 0.0
-            MetalFlowEngine.staticLo = 0.008; MetalFlowEngine.staticHi = 0.04
-        }
-        let msg = qualityChangesOn ? "화질 변경 ON (7/25 신규)" : "화질 변경 OFF (이전 동작)"
+        qualityStage = (qualityStage + 1) % 4
+        // conf 계열 — 모션 비례 신뢰도 문턱 + 방향 혼합 상한. 가려짐/큰 변위에서 flow를 살린다.
+        let conf = (qualityStage & 1) != 0
+        // static 계열 — 정적 판정 문턱 조임. staticness = 1-smoothstep(statLo, statHi, 프레임차)라
+        // 조이면 정적 판정이 **줄어**, 압축 노이즈로 차이가 미세하게 뜨는 정적 UI 텍스트까지
+        // 워프 대상이 된다(= 텍스트 흔들림). 반대로 느슨하면 실제로 움직이는 픽셀이 원본에
+        // 고정돼 부분 저더가 생긴다. 이 축이 "부드러움 ↔ 텍스트 안정"의 거래다.
+        let stat = (qualityStage & 2) != 0
+        MetalFlowEngine.confRel = conf ? 0.3 : 0.0
+        MetalFlowEngine.confMax = conf ? 0.5 : 0.0
+        MetalFlowEngine.staticLo = stat ? 0.004 : 0.008
+        MetalFlowEngine.staticHi = stat ? 0.02 : 0.04
+        let msg = ["0 이전 동작 (둘 다 OFF)", "1 conf만", "2 static만", "3 7/25 신규 (둘 다)"][qualityStage]
         DiagnosticLog.shared.log("[HOTKEY] MetalFlow \(msg)")
         qualityToggleStatus = msg
         refreshInfoOverlay()

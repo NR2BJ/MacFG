@@ -83,6 +83,68 @@ struct AutoFlowScalerTests {
         #expect(s.current == fixed, "수동 지정 시 자동 조절이 개입하면 안 된다")
     }
 
+    /// **실측 회귀**: 틱이 주사율을 온전히 내고 있으면 폐기가 좀 있어도 하강하지 않는다.
+    /// 4K/M4에서 "프레임은 120으로 멀쩡한데 flow만 1200→480으로 흘러내린" 사건의 원인.
+    /// 폐기(staleDrop)는 배달 실패가 아니라 과잉 생산의 낭비라, 화질을 팔아 고칠 문제가 아니다.
+    @Test func fullTickRateWithSomeWasteDoesNotDescend() {
+        let (s, tick) = makeScaler()
+        let start = s.current
+        for _ in 0..<20 {
+            tick()
+            // 틱은 120/120 = 1.0인데 생산분의 12%가 기한 초과로 폐기되는 상황
+            let achieved = AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 0.88)
+            s.update(achievedRatio: achieved, engineMs: 6.0, budgetMs: 16.7)  // share 36% = 근거 통과
+        }
+        #expect(s.current >= start, "틱이 100%면 폐기가 있어도 화질을 내리면 안 된다")
+    }
+
+    /// 합성 규칙 자체의 경계 — 심각한 폐기는 여전히 미달로 인정해야 한다(안전장치를 죽이지 않았는지).
+    @Test func severeWasteStillCountsAsMissing() {
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 0.88) == 1.0,
+                "가벼운 폐기는 무시")
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 0.50) == 0.50,
+                "생산의 절반을 버리면 미달로 인정")
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 0.60, keepRatio: 1.0) == 0.60,
+                "틱 자체가 모자라면 그건 진짜 배달 실패")
+    }
+
+    /// **원복은 절대 아래로 가면 안 된다.** 천장이 현재 칸보다 낮은 상태(Pro/Max 시딩은 천장
+    /// 위에서 출발한다)에서 옛 식 min(idx+2, ceilingIdx)는 현재보다 **아래**를 가리켜,
+    /// "원복"이라 로그하면서 실제로는 화질을 더 깎았다.
+    @Test func restoreNeverMovesDownward() {
+        // 천장이 현재보다 낮은 경우 — 옛 식은 5를 돌려줘 7→5로 두 칸 강등했다
+        #expect(AutoFlowScaler.restoreIndex(from: 7, ceilingIdx: 5) == 7,
+                "천장이 현재보다 낮으면 원복은 제자리여야 한다 (내려가면 안 됨)")
+        #expect(AutoFlowScaler.restoreIndex(from: 6, ceilingIdx: 5) == 6, "한 칸 차이도 마찬가지")
+        // 정상 경우 — 천장 안에서 두 칸 되돌린다
+        #expect(AutoFlowScaler.restoreIndex(from: 2, ceilingIdx: 5) == 4, "여유가 있으면 두 칸 원복")
+        #expect(AutoFlowScaler.restoreIndex(from: 4, ceilingIdx: 5) == 5, "천장을 넘지는 않는다")
+    }
+
+    /// **천장은 회복 가능해야 한다.** 천장 학습은 내려가기만 해서, 일시적 과부하 한 번이
+    /// 세션 전체의 화질 상한을 영구히 깎았다 — 상승 조건이 `idx < ceilingIdx`라 천장이 눌리면
+    /// 부하가 완전히 걷혀도 영영 못 오른다.
+    @Test func ceilingRecoversAfterSustainedGoodWindows() {
+        let s = AutoFlowScaler()
+        var t: CFAbsoluteTime = 1_000_000
+        s.nowProvider = { t }
+        s.seed(gpuCoreCount: 10, sourcePixels: 8_000_000)   // idx 4 (1200), 천장 5 (1440)
+
+        // 1단계 — 올린 직후 실패시켜 천장을 학습(깎이게) 한다.
+        //   상승 게이트 8s / 하강 게이트 3s를 통과하도록 4초씩 진행하고,
+        //   상승 후 20초 안에 실패해야 천장 학습이 걸린다.
+        for _ in 0..<6 { t += 4; s.update(achievedRatio: 1.0, engineMs: 5.0, budgetMs: 16.7) }
+        let ceilingBefore = s.learnedCeiling
+        for _ in 0..<3 { t += 4; s.update(achievedRatio: 0.60, engineMs: 9.0, budgetMs: 16.7) }
+        #expect(s.learnedCeiling < ceilingBefore, "올린 직후 실패하면 천장이 깎여야 한다 (전제)")
+        let pressed = s.learnedCeiling
+
+        // 2단계 — 부하가 완전히 걷힌 채로 오래 안정적이면 천장이 되돌아와야 한다.
+        for _ in 0..<40 { t += 4; s.update(achievedRatio: 1.0, engineMs: 3.0, budgetMs: 16.7) }
+        #expect(s.learnedCeiling > pressed,
+                "부하가 걷혔는데도 천장이 눌린 채면 세션 내내 화질 상한이 갇힌다")
+    }
+
     /// 사다리 밖으로 나가지 않는다 (경계 안전)
     @Test func staysWithinLadderBounds() {
         let (s, tick) = makeScaler()

@@ -2590,7 +2590,13 @@ public final class AppState {
             })
         }
         if hotInfo.isSet {
-            bindings.append(.init(id: 7, keyCode: hotInfo.keyCode, modifiers: hotInfo.modifiers) { [weak self] in
+            // ⌃⌥⌘M — 설정 창 열기. 메뉴바 아이콘이 보조 모니터에 있거나 macOS가 숨겨버려 접근이
+        // 막히는 경우가 실제로 있었다(2026-07-25). 아이콘과 무관한 진입점을 항상 열어둔다.
+        bindings.append(.init(id: 9, keyCode: UInt32(kVK_ANSI_M),
+                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+            self?.openSettingsWindow()
+        })
+        bindings.append(.init(id: 7, keyCode: hotInfo.keyCode, modifiers: hotInfo.modifiers) { [weak self] in
                 self?.toggleInfoOverlay()
             })
         }

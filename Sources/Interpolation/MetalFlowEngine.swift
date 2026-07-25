@@ -95,6 +95,27 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         return 1.0
     }()
 
+    /// 광도 검증 문턱 (기본 0.04~0.14) — flow를 따라간 곳의 밝기 차로 그 방향을 기각하는 2차 방어선.
+    /// 압축 노이즈가 큰 스트리밍에선 정상 워프까지 기각할 수 있어 실측 대상.
+    public nonisolated(unsafe) static var photoLo: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFPHOTOLO"], let v = Float(s), v >= 0 { return v }
+        return 0.04
+    }()
+    public nonisolated(unsafe) static var photoHi: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFPHOTOHI"], let v = Float(s), v > 0 { return v }
+        return 0.14
+    }()
+    /// 정적 판정 문턱 (기본 0.008~0.04) — 크면 정적 판정이 줄어(움직이는 걸 덜 고정), 작으면 늘어난다.
+    public nonisolated(unsafe) static var staticLo: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFSTATLO"], let v = Float(s), v >= 0 { return v }
+        return 0.004   // 구 0.008 — 실측: 정적 판정이 과해 움직이는 픽셀까지 원본 고정(=부분 저더)
+    }()
+    public nonisolated(unsafe) static var staticHi: Float = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFSTATHI"], let v = Float(s), v > 0 { return v }
+        return 0.02    // 전 7세트 avg +0.099 / 최악 -0.020. 더 조이면(0.002/0.01) +0.120이나
+                       // 최악 비용 2배 + 정적 UI 안정성은 PSNR이 부분적으로만 잡으므로 보수적 선택
+    }()
+
     /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.
     public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
         if let s = ProcessInfo.processInfo.environment["MACFG_MFRADIUS"], let v = Int32(s), (1...8).contains(v) { return v }
@@ -345,7 +366,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         enc2.setTexture(flowB[0], index: 3)
         enc2.setTexture(maskTex, index: 4)
         enc2.setBuffer(statsBuffer, offset: 0, index: 0)
-        var fp = FinalizeParams(confLo: Self.confLo, confHi: Self.confHi, confRel: Self.confRel)
+        var fp = FinalizeParams(confLo: Self.confLo, confHi: Self.confHi, confRel: Self.confRel,
+                                photoLo: Self.photoLo, photoHi: Self.photoHi, statLo: Self.staticLo, statHi: Self.staticHi)
         enc2.setBytes(&fp, length: MemoryLayout<FinalizeParams>.stride, index: 1)
         dispatch(enc2, levels[0].w, levels[0].h, finalizePSO)
 
@@ -414,7 +436,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var penalty: Float
     }
 
-    private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float }
+    private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float; var photoLo: Float; var photoHi: Float; var statLo: Float; var statHi: Float }
     private struct WarpParams {
         var t: Float
         var dirBlend: Float
@@ -534,7 +556,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     using namespace metal;
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; };
-    struct FinalizeParams { float confLo; float confHi; float confRel; };
+    struct FinalizeParams { float confLo; float confHi; float confRel; float photoLo; float photoHi; float statLo; float statHi; };
     struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
@@ -757,10 +779,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float lb = float(lumB.sample(s, uv).r);
         float errF = fabs(float(lumB.sample(s, uvF).r) - la);
         float errB = fabs(float(lumA.sample(s, uvB).r) - lb);
-        confF *= 1.0 - smoothstep(0.04, 0.14, errF);
-        confB *= 1.0 - smoothstep(0.04, 0.14, errB);
+        confF *= 1.0 - smoothstep(fp.photoLo, fp.photoHi, errF);
+        confB *= 1.0 - smoothstep(fp.photoLo, fp.photoHi, errB);
         float d = fabs(la - lb);
-        float staticness = 1.0 - smoothstep(0.008, 0.04, d);
+        float staticness = 1.0 - smoothstep(fp.statLo, fp.statHi, d);
 
         mask.write(float4(confF, staticness, confB, 0), gid);
 

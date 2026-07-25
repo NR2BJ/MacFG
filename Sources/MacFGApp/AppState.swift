@@ -2289,8 +2289,10 @@ public final class AppState {
     /// 실사용 아티팩트가 이 변경 탓인지 같은 장면에서 즉시 A/B 하기 위한 진단용 토글.
     /// MetalFlow 7/25 화질 변경 A/B 단계 (비트: 1=conf 계열, 2=static 계열).
     /// 셋을 묶어 ON/OFF만 하면 "부드러움↑ / 텍스트 흔들림↑"이 동시에 움직여 범인을 못 가린다.
-    /// 3(둘 다)에서 시작해 0(이전 동작) → 1(conf만) → 2(static만) → 3 으로 순환한다.
-    @ObservationIgnored private var qualityStage = 3
+    /// **기본값 1 (conf만)** — 4K 실프레임 3세트 측정 결과 static 조임은 PSNR을 거의 못 벌면서
+    /// (+0.070dB) 흔들림 비용은 제일 크게(-0.442dB) 치러 되돌렸다. 자세한 근거는
+    /// MetalFlowEngine.staticLo 주석 참조. 1 → 2 → 3 → 0 → 1 로 순환한다.
+    @ObservationIgnored private var qualityStage = 1
     func toggleMetalFlowQualityChanges() {
         qualityStage = (qualityStage + 1) % 4
         // conf 계열 — 모션 비례 신뢰도 문턱 + 방향 혼합 상한. 가려짐/큰 변위에서 flow를 살린다.

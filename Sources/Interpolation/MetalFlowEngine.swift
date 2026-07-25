@@ -105,15 +105,28 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         if let s = ProcessInfo.processInfo.environment["MACFG_MFPHOTOHI"], let v = Float(s), v > 0 { return v }
         return 0.14
     }()
-    /// 정적 판정 문턱 (기본 0.008~0.04) — 크면 정적 판정이 줄어(움직이는 걸 덜 고정), 작으면 늘어난다.
+    /// 정적 판정 문턱 — 조이면 정적 판정이 **줄어**(움직이는 걸 덜 고정), 느슨하면 늘어난다.
+    ///
+    /// **0.008/0.04로 되돌렸다(2026-07-25 실측).** 한때 0.004/0.02로 조였고 삼중항 PSNR은
+    /// 실제로 올랐지만, 그 측정은 **텍스트 흔들림을 잴 수 없었다** — PSNR은 t=0.5에서 정답과의
+    /// *공간* 정확도인데 흔들림은 *시간* 현상이다. staticDev 지표(정지 픽셀이 원본에서 벗어난
+    /// 정도, InterpBench --quality-ab)를 만들어 4K 실프레임 3세트로 재보니:
+    ///
+    ///        축          PSNR 이득    staticDev 비용   효율
+    ///        conf 계열   +0.237 dB    -0.150 dB       1.58
+    ///        static 조임 +0.070 dB    -0.442 dB       0.16   ← 10배 나쁜 거래
+    ///
+    /// 조이면 압축 노이즈로 차이가 미세하게 뜨는 정적 UI 텍스트까지 "움직이는 픽셀"로 분류돼
+    /// 워프를 먹는다. 세 세트 모두 같은 순서였고 사용자의 지각 판정과도 일치했다.
+    /// (흔들림은 **주변 움직임이 정지 요소의 flow를 오염시킬 때** 생긴다 — 정지 영역이 움직임과
+    ///  떨어져 있으면 그곳 flow는 0이라 워프해도 원본과 같다.)
     public nonisolated(unsafe) static var staticLo: Float = {
         if let s = ProcessInfo.processInfo.environment["MACFG_MFSTATLO"], let v = Float(s), v >= 0 { return v }
-        return 0.004   // 구 0.008 — 실측: 정적 판정이 과해 움직이는 픽셀까지 원본 고정(=부분 저더)
+        return 0.008
     }()
     public nonisolated(unsafe) static var staticHi: Float = {
         if let s = ProcessInfo.processInfo.environment["MACFG_MFSTATHI"], let v = Float(s), v > 0 { return v }
-        return 0.02    // 전 7세트 avg +0.099 / 최악 -0.020. 더 조이면(0.002/0.01) +0.120이나
-                       // 최악 비용 2배 + 정적 UI 안정성은 PSNR이 부분적으로만 잡으므로 보수적 선택
+        return 0.04
     }()
 
     /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.

@@ -1,50 +1,118 @@
 import SwiftUI
 import AppKit
+import Monitoring
 
+/// 메뉴바 상주 앱.
+///
+/// **왜 SwiftUI MenuBarExtra를 쓰지 않는가 (2026-07-25 실측):**
+/// MenuBarExtra는 앱의 유일한 Scene이 되는데, macOS가 그 상태항목 씬을 파괴하기로 결정하면
+/// (아이콘이 "숨김"으로 기록됐거나 메뉴바가 포화일 때) SwiftUI 구현이 그대로 `NSApplication.terminate:`를
+/// 호출해 **앱이 시작 직후 조용히 종료**된다. 실제로 그 상태에 빠져 앱이 아예 실행 불가가 됐고,
+/// 스택으로 확인했다:
+///     -[NSSceneStatusItem scene:handleActions:] → -[NSApplication terminate:] → applicationShouldTerminate
+/// 크래시도 로그도 없이 exit(0)이라 원인 파악이 어려웠다. 사용자 설정
+/// (`NSStatusItem VisibleCC Item-0`)을 1로 되돌리거나 재부팅해도 복구되지 않았다.
+/// 그래서 상태항목을 **직접 만들어 소유**한다 — 씬 생명주기에 종속되지 않아 이 실패 모드가 사라진다.
 @main
 struct MacFGApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        // 메뉴바 상주 팝오버 (Tailscale/AlDente 스타일) — 아이콘 클릭 시 설정/대시보드가
-        // 바로 아래로 펼쳐진다. 별도 창 없음 → 빨간 닫기 버튼으로 종료되는 문제 자체가 사라짐.
-        MenuBarExtra {
-            WindowPickerView(appState: delegate.appState)
-                .onAppear { delegate.appState.popoverVisible = true }
-                .onDisappear { delegate.appState.popoverVisible = false }
-        } label: {
-            // 캡처 중이면 배지 아이콘으로 상태 표시 (관찰 뷰)
-            MenuBarLabel(appState: delegate.appState)
-        }
-        .menuBarExtraStyle(.window)
+        // 표시되지 않는 빈 씬 — SwiftUI App은 Scene이 최소 하나 필요하다.
+        // 실제 UI는 AppDelegate가 소유한 NSStatusItem + NSPopover가 담당한다.
+        Settings { EmptyView() }
     }
 }
 
-/// 메뉴바 아이콘 — 캡처 상태를 반영
-private struct MenuBarLabel: View {
-    @Bindable var appState: AppState
-    var body: some View {
-        Image(systemName: appState.isCapturing ? "display.trianglebadge.exclamationmark" : "display")
-    }
-}
-
-/// 런치타임 셋업은 AppDelegate에서 (MenuBarExtra 콘텐츠 onAppear는 첫 클릭 시에야 실행되므로
-/// 핫키·auto-start를 여기서 처리해야 앱 시작 즉시 동작한다). AppState도 여기 소유해 뷰와 공유.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let appState = AppState()
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+    private var iconTimer: Timer?
+    /// 사용자가 Quit을 눌렀는가 — 시스템發 종료 요청과 구분한다.
+    private var userRequestedQuit = false
+    private var systemIsPoweringOff = false
+
+    override init() {
+        super.init()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.systemIsPoweringOff = true } }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 메뉴바 전용 — Dock 아이콘·⌘Tab 제거. 창 없이 상주하므로 닫기로 종료되지 않는다.
         NSApplication.shared.setActivationPolicy(.accessory)
+        setUpStatusItem()
 
         // 접근성 권한 (마우스 역매핑용) — 없으면 프롬프트
         if !AXIsProcessTrusted() {
             AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         }
 
+        appState.onQuitRequested = { [weak self] in self?.quitFromUser() }
         appState.registerHotKeys()
         Task { await appState.processAutoStartArguments() }
+    }
+
+    // MARK: - 상태 항목 (직접 소유)
+
+    private func setUpStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "MacFG")
+        item.button?.target = self
+        item.button?.action = #selector(togglePopover(_:))
+        item.isVisible = true      // 숨김으로 기록돼 있던 상태를 매 실행 되돌린다
+        statusItem = item
+
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.animates = false
+        pop.delegate = self
+        pop.contentSize = NSSize(width: 440, height: 592)
+        pop.contentViewController = NSHostingController(rootView: WindowPickerView(appState: appState))
+        popover = pop
+
+        // 캡처 상태를 아이콘에 반영 — 상태 변화가 드물어 1초 폴링으로 충분
+        iconTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let btn = self.statusItem?.button else { return }
+                let name = self.appState.isCapturing ? "display.trianglebadge.exclamationmark" : "display"
+                if btn.image?.accessibilityDescription != name {
+                    let img = NSImage(systemSymbolName: name, accessibilityDescription: name)
+                    btn.image = img
+                }
+            }
+        }
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        guard let pop = popover, let btn = statusItem?.button else { return }
+        if pop.isShown {
+            pop.performClose(sender)
+        } else {
+            pop.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+            pop.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    func popoverDidShow(_ notification: Notification) { appState.popoverVisible = true }
+    func popoverDidClose(_ notification: Notification) { appState.popoverVisible = false }
+
+    // MARK: - 종료 정책
+
+    func quitFromUser() {
+        userRequestedQuit = true
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// 사용자 Quit과 시스템 로그아웃/재시동만 허용한다. 상태항목 씬 파괴 같은 이유로 오는
+    /// 종료 요청은 거부해 앱을 살려둔다(위 주석의 실패 모드 방어).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if userRequestedQuit || systemIsPoweringOff { return .terminateNow }
+        DiagnosticLog.shared.log("[APP] 시스템發 종료 요청 무시 — 메뉴바 상주 유지")
+        return .terminateCancel
     }
 
     // 마지막 창(뷰어)을 닫아도 앱은 메뉴바에 상주 — 종료는 팝오버의 Quit 버튼으로만.

@@ -175,6 +175,9 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) var infoOverlayVisible = false
     /// 메뉴바 팝오버 열림 여부 (MenuBarExtra 콘텐츠 onAppear/onDisappear) — stats 갱신 게이트
     @ObservationIgnored nonisolated(unsafe) var popoverVisible = false
+    /// Quit 버튼 → AppDelegate. 델리게이트가 "사용자 요청"으로 표시해야 종료가 허용된다
+    /// (시스템發 종료 요청은 거부해 메뉴바 상주를 지킨다 — MacFGApp.swift 주석 참조).
+    @ObservationIgnored var onQuitRequested: (() -> Void)?
 
     // MARK: - Components
     let device: any MTLDevice

@@ -424,7 +424,7 @@ struct WindowPickerView: View {
                 .controlSize(.small)
                 Spacer()
                 Button(role: .destructive) {
-                    NSApplication.shared.terminate(nil)
+                    appState.onQuitRequested?()
                 } label: {
                     Label(L("Quit", "종료", "終了"), systemImage: "power")
                 }

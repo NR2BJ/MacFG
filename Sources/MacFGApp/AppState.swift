@@ -1619,6 +1619,13 @@ public final class AppState {
                 destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
             )
             blit.endEncoding()
+        } else {
+            // 인코더 생성 실패를 삼키면 **한 번도 쓰이지 않은 텍스처가 그대로 표시된다**
+            // (풀은 .private이고 클리어하지 않는다 = 초기화 안 된 GPU 메모리). 조용히 넘기지 않는다.
+            DiagnosticLog.shared.log("[INGEST] ⚠︎ blit 인코더 생성 실패 — 이 프레임 폐기")
+            lastAcceptedTimestamp = previousAcceptedTs
+            lastAcceptedFingerprint = previousAcceptedFingerprint
+            return
         }
 
         // 시간축 정지-UI 검출 갱신 — blit 직후 같은 cb1(소스 준비됨, 순서 보장). 누적 마스크는
@@ -1667,9 +1674,21 @@ public final class AppState {
         }
         if let ev = stableReadyEvent {
             (pairEngine as? RIFEEngine)?.noteInputReady(event: ev, value: readyValue)
-            // splitQ면 cb1이 다른 큐(copy)라 in-order 보장이 없다 — cb2 워프가 stable/마스크를
-            // 읽기 전에 cb1 완료를 명시적으로 기다린다. 미분리(기본)면 같은 큐 in-order라 불필요.
-            if splitQueueEnabled { cb2.encodeWaitForEvent(ev, value: readyValue) }
+            // **항상 기다린다.** 예전엔 splitQ일 때만 걸었다 — "미분리면 같은 큐 in-order라 불필요"
+            // 라는 이유였는데, 그 전제는 **cb2가 비어 있을 때 깨진다.**
+            //
+            // cb2에 인코딩되는 건 encodePair뿐이라, 보간이 꺼지면 cb2는 완료 핸들러만 달린 빈
+            // 커맨드 버퍼가 된다. 빈 버퍼는 GPU 실행 없이 회수될 수 있어 cb1의 blit보다 먼저
+            // 완료될 수 있는데, 그 핸들러가 "이 텍스처에 프레임이 들어있다"를 알리는 **유일한**
+            // 신호다. 게다가 present는 또 다른 큐(presentQueue)에서 GPU 동기화 없이 그 텍스처를
+            // 읽는다. 풀 텍스처는 .private에 클리어도 안 하므로, 결과는 초기화 안 된 GPU 메모리 —
+            // 실측 2026-07-26: 첫 캡처를 보간 OFF로 시작하면 화면 전체가 색 노이즈가 됐고,
+            // 보간을 한 번 켰다 끄면 "고쳐졌다". 후자는 풀이 실제 프레임으로 채워져 최악이
+            // "한 프레임 낡음"으로 바뀐 것뿐이라, 고친 게 아니라 가린 것이었다.
+            //
+            // 같은 큐인 경우엔 이미 순서가 보장되므로 이 대기는 실질 비용이 없다. cb1은 이 시점에
+            // 이미 커밋돼 있어 교착도 불가능하다.
+            cb2.encodeWaitForEvent(ev, value: readyValue)
         }
         // 이하 보간/핸들러는 cb2에 인코딩
 

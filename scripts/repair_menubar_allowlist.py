@@ -109,12 +109,14 @@ def repair(entries, reset=False):
 def main():
     apply = "--apply" in sys.argv
     reset = "--reset" in sys.argv
-    if not apply and "--dry-run" not in sys.argv:
-        print(__doc__)
-        return 2
     if not os.path.exists(PLIST):
         print(f"허용 목록 없음: {PLIST}")
         return 1
+    if "--verify" in sys.argv:
+        return verify()
+    if not apply and "--dry-run" not in sys.argv:
+        print(__doc__)
+        return 2
 
     root = plistlib.load(open(PLIST, "rb"))
     entries = plistlib.loads(bytes(root["trackedApplications"]))
@@ -137,7 +139,40 @@ def main():
     with open(PLIST, "wb") as f:
         plistlib.dump(root, f, fmt=plistlib.FMT_BINARY)
     print(f"\n적용 완료. 백업: {backup}")
-    print("이제 ControlCenter를 재시작해야 반영된다:  killall ControlCenter")
+    print("""
+다음이 **중요**하다 — ControlCenter는 이 파일을 메모리에 들고 있다:
+
+    killall -9 ControlCenter
+
+**반드시 -9(SIGKILL)여야 한다.** 그냥 `killall`(SIGTERM)을 쓰면 ControlCenter가 죽기 전에
+자기 메모리 상태를 디스크에 flush해서 방금 쓴 편집을 **되돌려 버린다**(2026-07-25 실측:
+적용 3분 뒤 오염 기록 5건이 전부 되살아나 있었다). SIGKILL은 flush 기회를 주지 않으므로,
+launchd가 재시작한 ControlCenter가 우리가 쓴 파일을 읽는다.
+
+확인:  python3 scripts/repair_menubar_allowlist.py --verify
+""")
+    return 0
+
+
+def verify():
+    """편집이 살아남았는지 확인 — ControlCenter가 되돌렸는지 판정."""
+    root = plistlib.load(open(PLIST, "rb"))
+    entries = plistlib.loads(bytes(root["trackedApplications"]))
+    claimers = []
+    for e in entries:
+        if not isinstance(e, dict) or "location" not in e:
+            continue
+        owner = loc_name(e["location"])
+        if any(loc_name(l) == APP_ID for l in (e.get("menuItemLocations") or [])) or BUILD_MARK in owner:
+            claimers.append((owner, e.get("isAllowed")))
+    print(f"{APP_ID} 를 주장하는 소유자 {len(claimers)}건:")
+    for o, a in claimers:
+        print(f"  {o[:70]}  허용={a}")
+    foreign = [c for c in claimers if c[0] != APP_ID]
+    if foreign:
+        print("\n→ 아직 남의 주장이 있다. 수리가 되돌려졌거나 아직 적용되지 않았다.")
+        return 1
+    print("\n→ 자기 주장만 남았다. 이제 Finder에서 dist/MacFG.app 을 더블클릭하라.")
     return 0
 
 

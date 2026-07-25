@@ -29,13 +29,23 @@ The app UI is localized to **English / 한국어 / 日本語** (auto-detected fr
 
 ## Install
 
-Download the `.dmg` from [Releases](https://github.com/NR2BJ/MacFG/releases). It's self-signed; on first launch right-click → **Open** once (or `xattr -dr com.apple.quarantine MacFG.app`).
+Download the `.dmg` from [Releases](https://github.com/NR2BJ/MacFG/releases) and drag MacFG to Applications.
+
+MacFG is self-signed, so the first launch is blocked. **The block is silent** — MacFG has no Dock icon, so a blocked launch looks exactly like nothing happening. To allow it:
+
+1. Double-click MacFG once (nothing will appear — that's expected).
+2. Open **System Settings → Privacy & Security**, scroll to Security, and click **Open Anyway** next to the MacFG message.
+3. Double-click MacFG again and confirm.
+
+Or from Terminal: `xattr -dr com.apple.quarantine /Applications/MacFG.app`
+
+MacFG lives in the menu bar. If the icon does not appear, press **⌃⌥⌘M** to open the settings window — it works regardless.
 
 ## Build
 
 ```sh
 swift build                    # debug
-scripts/make_app.sh 1.0.6      # release .app + .dmg (in dist/)
+scripts/make_app.sh 1.2.0      # release .app + .dmg (in dist/)
 ```
 
 `make_app.sh` signs with a local **"MacFG Dev"** identity if present (so Screen Recording / Accessibility grants survive rebuilds), else ad-hoc.
@@ -44,7 +54,7 @@ scripts/make_app.sh 1.0.6      # release .app + .dmg (in dist/)
 
 - `Sources/CaptureKit` — ScreenCaptureKit capture (frame queue, fingerprint dedup, seamless resize)
 - `Sources/Interpolation` — engines (`MetalFlowEngine`, `RIFEEngine` — CoreML flow + Metal warp via MTLSharedEvent async pipeline, `AppleFIEngine`, `PairEngine` protocol) + `InterpBench` (PSNR/timing regression + real-content triplet A/B)
-- `Models/` — RIFE v4.25 CoreML flow networks (288/360/432p short side, MIT — [Practical-RIFE](https://github.com/hzwer/Practical-RIFE)), compiled and bundled into the app
+- `Models/` — RIFE v4.25 CoreML flow networks (180–540p short side, seven tiers, MIT — [Practical-RIFE](https://github.com/hzwer/Practical-RIFE)), compiled and bundled into the app
 - `Sources/Overlay` — overlay/viewer windows, `RenderSurface` (thread-agnostic encode), window tracking, same-display color passthrough, shader-side rounded corners
 - `Sources/MacFGApp` — `RenderDriver` (**dedicated render thread + CAMetalDisplayLink** — true 120 Hz), timestamp output scheduler (cadence snap, vsync-grid phases, adaptive latency), SwiftUI panel, in-code localization (`Localization.swift`)
 - `Sources/TestPattern` — self-verification source (`--fps N --jitter MS --complex`)
@@ -89,13 +99,23 @@ macOS용 실시간 프레임 **보간 + 업스케일링** 오버레이 — 애�
 
 ## 설치
 
-[Releases](https://github.com/NR2BJ/MacFG/releases)에서 `.dmg`를 받으세요. 자체 서명이라 첫 실행 시 우클릭 → **열기**를 한 번 하면 됩니다(또는 `xattr -dr com.apple.quarantine MacFG.app`).
+[Releases](https://github.com/NR2BJ/MacFG/releases)에서 `.dmg`를 받아 MacFG를 응용 프로그램으로 옮기세요.
+
+자체 서명이라 첫 실행은 차단됩니다. **차단은 아무 표시 없이 일어납니다** — MacFG는 Dock 아이콘이 없어서, 차단된 실행은 그냥 아무 일도 안 일어난 것처럼 보입니다. 허용하려면:
+
+1. MacFG를 한 번 더블클릭합니다 (아무것도 안 뜨는 게 정상입니다).
+2. **시스템 설정 → 개인정보 보호 및 보안**에서 보안 항목까지 내려가, MacFG 안내 옆의 **그래도 열기**를 누릅니다.
+3. MacFG를 다시 더블클릭하고 확인합니다.
+
+터미널을 쓴다면: `xattr -dr com.apple.quarantine /Applications/MacFG.app`
+
+MacFG는 메뉴 막대에 상주합니다. 아이콘이 안 보이면 **⌃⌥⌘M**으로 설정 창을 열 수 있습니다 — 아이콘과 무관하게 동작합니다.
 
 ## 빌드
 
 ```sh
 swift build                    # 디버그
-scripts/make_app.sh 1.0.6      # 릴리스 .app + .dmg (dist/에 생성)
+scripts/make_app.sh 1.2.0      # 릴리스 .app + .dmg (dist/에 생성)
 ```
 
 `make_app.sh`는 로컬 **"MacFG Dev"** 인증서가 있으면 그것으로 서명하고(화면 기록/접근성 권한이 재빌드에도 유지됨), 없으면 ad-hoc 서명합니다.
@@ -104,7 +124,7 @@ scripts/make_app.sh 1.0.6      # 릴리스 .app + .dmg (dist/에 생성)
 
 - `Sources/CaptureKit` — ScreenCaptureKit 캡처(프레임 큐, 지문 기반 중복 제거, 끊김 없는 리사이즈)
 - `Sources/Interpolation` — 엔진(`MetalFlowEngine`, `RIFEEngine` — CoreML flow + MTLSharedEvent 비동기 Metal 워프, `AppleFIEngine`, `PairEngine` 프로토콜) + `InterpBench`(PSNR/타이밍 회귀 + 실영상 삼중항 A/B)
-- `Models/` — RIFE v4.25 CoreML flow 네트워크(단변 288/360/432p, MIT — [Practical-RIFE](https://github.com/hzwer/Practical-RIFE)), 앱에 컴파일·번들됨
+- `Models/` — RIFE v4.25 CoreML flow 네트워크(단변 180–540p, 7단계, MIT — [Practical-RIFE](https://github.com/hzwer/Practical-RIFE)), 앱에 컴파일·번들됨
 - `Sources/Overlay` — 오버레이/뷰어 창, `RenderSurface`(스레드 무관 인코드), 창 추적, 동일 디스플레이 색 패스스루, 셰이더 측 라운드 코너
 - `Sources/MacFGApp` — `RenderDriver`(**전용 렌더 스레드 + CAMetalDisplayLink** — 진짜 120 Hz), 타임스탬프 출력 스케줄러(케이던스 스냅, vsync 그리드 위상, 적응형 지연), SwiftUI 패널, in-code 현지화(`Localization.swift`)
 - `Sources/TestPattern` — 자체 검증 소스(`--fps N --jitter MS --complex`)

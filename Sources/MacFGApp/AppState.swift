@@ -487,6 +487,10 @@ public final class AppState {
     @ObservationIgnored private var detachedWindow: NSWindow?
     func openSettingsWindow() {
         if let w = detachedWindow {
+            // 최소화 복원이 먼저다 — makeKeyAndOrderFront는 축소된 창을 되살리지 않는다.
+            // Dock 아이콘이 없는 앱이라 ⌘M 한 번이면 이 창도, 채택 실패 시 자동으로 띄우는
+            // 폴백 경로도 전부 조용한 무동작이 된다(= 탈출구 상실).
+            if w.isMiniaturized { w.deminiaturize(nil) }
             w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
         }
         let host = NSHostingController(rootView: WindowPickerView(appState: self))
@@ -746,8 +750,27 @@ public final class AppState {
 
     // MARK: - Capture Control
 
+    /// startCapture 진행 중 플래그 — isCapturing만으로는 재진입을 못 막는다(아래 주석 참조).
+    @ObservationIgnored private var isStartingCapture = false
+
     func startCapture() async {
         guard !isCapturing else { return }
+        // **재진입 가드.** isCapturing은 이 함수 *끝*에서야 true가 되는데, 그 전에
+        // `await captureManager.startCapture`와 `await configurePairEngine()`(RIFE면 수백 ms)가
+        // 있다. 그래서 단축키를 빠르게 두 번 누르면 두 Task가 모두 위 guard를 통과한다. 결과:
+        //  · 같은 pendingSlots에 프레임을 밀어넣는 SCStream이 두 개
+        //  · 아무도 닫을 수 없는 고아 shielding 레벨 오버레이
+        //  · statsTimer/trackingTimer가 invalidate 없이 덮어써져, 먼저 만든 타이머가
+        //    RunLoop.main에 붙들린 채 **정지 후에도 15~30Hz로 메인 스레드를 계속 두드린다**
+        //    — 표시 간격 σ가 전부인 앱에서 이건 그냥 상시 지터원이다.
+        // defer는 반드시 guard **뒤에** 둔다. 앞에 두면 세 번째 탭에서 구멍이 다시 열린다.
+        guard !isStartingCapture else {
+            DiagnosticLog.shared.log("[CAPTURE] 시작이 이미 진행 중 — 중복 요청 무시")
+            return
+        }
+        isStartingCapture = true
+        defer { isStartingCapture = false }
+
         guard let windowID = selectedWindowID else {
             logger.warning("No window selected")
             return
@@ -799,6 +822,10 @@ public final class AppState {
             pendingShowReset = false
             attachRenderDriver()
 
+            // 재진입 가드가 있어도 남은 타이머는 확실히 끊는다 — RunLoop가 강참조로 붙들어
+            // 덮어쓰기만으론 죽지 않는다(정지 후에도 계속 도는 유령 타이머의 원인).
+            statsTimer?.invalidate()
+            trackingTimer?.invalidate()
             statsTimer = addCommonTimer(0.5) { [weak self] _ in
                 Task { @MainActor in
                     self?.updateStats()
@@ -2600,16 +2627,24 @@ public final class AppState {
             })
         }
         if hotInfo.isSet {
-            // ⌃⌥⌘M — 설정 창 열기. 메뉴바 아이콘이 보조 모니터에 있거나 macOS가 숨겨버려 접근이
-        // 막히는 경우가 실제로 있었다(2026-07-25). 아이콘과 무관한 진입점을 항상 열어둔다.
+            bindings.append(.init(id: 7, keyCode: hotInfo.keyCode, modifiers: hotInfo.modifiers) { [weak self] in
+                self?.toggleInfoOverlay()
+            })
+        }
+        // ⌃⌥⌘M — 설정 창 열기. **절대 조건부로 두지 말 것.**
+        //
+        // 이 앱은 LSUIElement라 Dock 아이콘이 없고, 메뉴바 상태항목은 macOS가 채택을 거부하면
+        // 안 뜬다(2026-07-25 실측). 게다가 applicationShouldTerminate가 시스템發 종료를 거부한다.
+        // 그래서 이 단축키가 유일한 탈출구인데, 한때 `if hotInfo.isSet` 블록 **안에** 들어가 있었다
+        // — 사용자가 정보 오버레이 단축키를 ✕로 지우면 UI도 Dock도 메뉴바도 종료도 없는 앱이 되고,
+        // 그 상태가 설정에 저장돼 재실행해도 복구되지 않는다. 강제 종료 외에 방법이 없었다.
+        //
+        // 사용자 지정 바인딩들 **뒤에** 붙인다: HotKeyCenter가 배열 순서대로 등록하고 조합이
+        // 겹치면 뒤엣것이 -9878로 실패하므로, 뒤에 둬야 사용자가 지정한 조합이 항상 이긴다.
         bindings.append(.init(id: 9, keyCode: UInt32(kVK_ANSI_M),
                               modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
             self?.openSettingsWindow()
         })
-        bindings.append(.init(id: 7, keyCode: hotInfo.keyCode, modifiers: hotInfo.modifiers) { [weak self] in
-                self?.toggleInfoOverlay()
-            })
-        }
         // 개발 도구 덤프 단축키 — 개발자 로그 켜진 동안만 등록 (일반 사용자에겐 미노출).
         if devLoggingEnabled {
             bindings.append(.init(id: 5, keyCode: UInt32(kVK_ANSI_D),
@@ -2629,6 +2664,8 @@ public final class AppState {
             })
         }
         HotKeyCenter.shared.register(bindings)
+        // 탈출구(id 9)가 실제로 등록됐는지 로그로 남긴다 — 조합 충돌은 -9878로 조용히 실패한다.
+        DiagnosticLog.shared.log("[HOTKEY] 등록 id=\(bindings.map(\.id).sorted()) (9=설정창 탈출구)")
     }
 
     /// 보간 on/off 전역 토글 (라이브 반영) — 동영상↔텍스트 즉시 전환

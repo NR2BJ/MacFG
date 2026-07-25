@@ -1178,6 +1178,10 @@ public final class AppState {
     /// interval 히스테리시스 — 락 대비 ±25% 넘는 추정치의 연속 지속 카운트
     @ObservationIgnored nonisolated(unsafe) private var snapIntervalDeviateStreak = 0
     @ObservationIgnored nonisolated(unsafe) private var diagResyncCount = 0
+    /// 케이던스 격자 이탈 관측치 — B1(버스트 창) 착수 여부를 실측으로 결정하기 위한 것.
+    @ObservationIgnored nonisolated(unsafe) private var diagSnapMissCount = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagSnapPullableCount = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagSnapPullLagMax: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTimestamp: CFTimeInterval = 0
     @ObservationIgnored nonisolated(unsafe) private var lastPresentedTexture: (any MTLTexture)?
     /// 마지막 표시 텍스처의 세대 도장 — 강제 재표시(링크 재부착) 시 그 사이 덮였는지 검증
@@ -1851,13 +1855,18 @@ public final class AppState {
             // 장면 전환이면 보간 프레임 폐기 — 무관한 두 샷 사이의 모핑 프레임 방지
             let isSceneCut = cutEvaluator?() ?? false
             var entries: [TimelineEntry] = []
+            // captureTimestamp에는 **스냅 전 원본 캡처 시각**을 싣는다(entryTs는 스냅된 값).
+            // e2e = presentedAt - captureTimestamp인데 스냅된 값을 기준으로 재면, 스케줄러가
+            // 지연을 더할수록 보고되는 e2e가 오히려 **줄어든다** — 스케줄러가 자기 채점표를
+            // 쥐고 있는 셈이라 B1(버스트 창) 같은 변경의 비용을 원리적으로 볼 수 없다.
+            // timestamp(표시 슬롯)는 스냅된 값 그대로 — 그건 페이싱의 입력이라 건드리지 않는다.
             if !isSceneCut {
                 for frame in interpFrames {
                     let ts = startTs + gapRef * Double(frame.t)
-                    entries.append(TimelineEntry(timestamp: ts, texture: frame.texture, isInterpolated: true, captureTimestamp: entryTs, stamp: frame.stamp))
+                    entries.append(TimelineEntry(timestamp: ts, texture: frame.texture, isInterpolated: true, captureTimestamp: rawCaptureTsRef, stamp: frame.stamp))
                 }
             }
-            entries.append(TimelineEntry(timestamp: entryTs, texture: stableRef, isInterpolated: false, captureTimestamp: entryTs))
+            entries.append(TimelineEntry(timestamp: entryTs, texture: stableRef, isInterpolated: false, captureTimestamp: rawCaptureTsRef))
             // 캡처 시각 → 타임라인 등재까지의 파이프라인 지연 (스케줄러 offset 튜닝 지표)
             let workLatency = (CACurrentMediaTime() - entryTs) * 1000.0
             mailboxRef.postCompleted(entries: entries, released: releasePrevID, workLatencyMs: workLatency, sceneCut: isSceneCut)
@@ -2047,6 +2056,21 @@ public final class AppState {
         }
 
         // 이탈 — 이 프레임은 raw로 통과. 앵커는 보호, 3연속(진짜 불연속)만 재동기.
+        //
+        // **관측치 (B1 판단 근거).** B1(버스트 창 pull)은 PLL 코어를 건드리는 위험한 변경인데,
+        // 지금까지 "실제 소스가 버스트를 내긴 하는가, 얼마나 자주인가"를 아무도 세어본 적이 없다.
+        // 세 숫자를 [SCHED]에 노출해 그 질문에 먼저 답한다:
+        //   snapMiss     — 격자 이탈 횟수
+        //   snapPullable — 그중 "당길 수 있었던" 것 (일찍 온 프레임이고 지연이 한 간격 이내)
+        //                  = B1을 구현했을 때 실제로 건질 수 있는 프레임 수
+        //   pullLagMax   — 거절된 지연의 최대치 (버스트 창을 얼마나 넓혀야 하는지)
+        // 한 릴리즈 주기 동안 snapPullable이 0이면 B1은 영구히 닫는다.
+        diagSnapMissCount += 1
+        if err < 0 {
+            let lag = predicted - raw
+            if lag <= usedInterval { diagSnapPullableCount += 1 }
+            diagSnapPullLagMax = max(diagSnapPullLagMax, lag)
+        }
         snapMissStreak += 1
         if snapMissStreak >= 3 || rawDelta > 0.5 {
             snapMissStreak = 0
@@ -2188,7 +2212,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2211,6 +2235,7 @@ public final class AppState {
             : 1.0
 
         diagResyncCount = 0
+        diagSnapMissCount = 0; diagSnapPullableCount = 0; diagSnapPullLagMax = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
@@ -2382,6 +2407,12 @@ public final class AppState {
     /// 배치는 업스케일 모드에서 자동 결정 (사용자 선택 없음): 업스케일 쓰면 Separate Window(실효),
     /// 안 쓰면 Cover. 캡처 중 변경 시 오버레이 재생성.
     func autoSelectPlacementForUpscale() {
+        // 소스가 전체화면이라 뷰어를 **자동으로** 띄운 상태면 손대지 않는다. 안 그러면
+        // 업스케일을 끄는 순간 배치를 cover로 바꿔 출력 창을 재생성하고, 다음 추적 틱(15~30Hz)에
+        // detectFullscreenAutoViewer가 도로 viewer로 되돌려 또 재생성한다 — 무동작이어야 할
+        // 설정 변경에 검은 화면 번쩍임 + 스케줄러 리셋 2회 + attachRenderDriver 2회.
+        // 전체화면 이탈 경로가 살아있는 upscaleMode로 배치를 다시 유도하므로 사용자 선택은 보존된다.
+        guard !autoFsViewer else { return }
         let target: OverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
         guard target != selectedOverlayPlacement else { return }
         selectedOverlayPlacement = target

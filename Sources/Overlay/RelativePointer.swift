@@ -101,7 +101,13 @@ final class RelativePointer {
         // **스레드 종료를 동기 대기** — 비동기로 두면 스레드가 아직 도는 중 소유자(OverlayWindow)가
         // dealloc돼 refcon(passUnretained self)이 dangling → 힙 손상(동시 해제되는 다른 객체에서
         // over-release로 표출). 종료 확정 후 정리한다(0.5s 타임아웃 — 최악에도 앱은 안 멈춤).
-        _ = threadStopped.wait(timeout: .now() + 0.5)
+        // 타임아웃을 **반드시 보고한다.** 이 대기는 설계상 best-effort라, 만료되면 refcon이
+        // dangling인 채로 아래에서 참조를 놓는다 — 그게 B-2(MetalFXUpscaler over-release로
+        // 표출되는 힙 손상)의 유력 원인이고, 지금까지 만료 사실 자체를 아무도 알 수 없었다.
+        // 이 줄은 정상 세션에선 절대 나오지 않는다. 나오면 B-2 원인이 확정된다.
+        if threadStopped.wait(timeout: .now() + 0.5) == .timedOut {
+            DiagnosticLog.shared.log("[RELPTR] ⚠︎ 탭 스레드가 0.5s 안에 멈추지 않음 — refcon dangling 위험 (B-2 후보)")
+        }
         tap = nil; runLoopSource = nil; thread = nil; threadRunLoop = nil; dragFrameNS = nil
         DiagnosticLog.shared.log("[RELPTR] disabled")
     }
@@ -170,12 +176,6 @@ final class RelativePointer {
             }
         }
 
-        switch type {
-        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            dragFrameNS = g.sourceFrameNS               // 드래그 매핑 고정 (down 시점 프레임)
-        default:
-            break
-        }
         let clickLike: Bool
         switch type {
         case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
@@ -202,7 +202,15 @@ final class RelativePointer {
                                  clickInset: clickLike, g)
         }
         switch type {
-        case .leftMouseUp, .rightMouseUp, .otherMouseUp: dragFrameNS = nil
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            // **매핑이 성공했을 때만 무장한다.** 예전엔 매핑 계산 *전에* 무조건 걸었는데,
+            // 블랙바에서 누른 down은 아래 guard에서 소비되면서도 시퀀스를 열어버렸다.
+            // 그러면 이후 dragged가 전부 mustDeliver로 가장자리에 클램프돼 강제 배달되고,
+            // up은 짝 맞는 down 없이 전달된다 — 영상 밖을 클릭했을 뿐인데 플레이어 타임라인이
+            // 스크럽되기에 충분하다.
+            if mapped != nil { dragFrameNS = g.sourceFrameNS }   // 드래그 매핑 고정 (down 시점 프레임)
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+            dragFrameNS = nil
         default: break
         }
 

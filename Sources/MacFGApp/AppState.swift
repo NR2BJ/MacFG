@@ -214,6 +214,13 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var stgWork = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCount = 0
     @ObservationIgnored private let stageLock = NSLock()
+    /// 직전 cb1 GPU 시간 — 스파이크 한 프레임을 단계별로 찍기 위해 값 자체를 들고 있는다
+    /// (누적합만으론 어느 단계가 튀었는지 알 수 없다).
+    @ObservationIgnored nonisolated(unsafe) private var stgLastCb1Gpu = 0.0
+    /// work의 완만한 EMA — 스파이크 판정 기준선. 고정 문턱을 쓰면 4K/1080p·엔진마다 의미가 달라진다.
+    @ObservationIgnored nonisolated(unsafe) private var stgWorkEMA = 0.0
+    /// 스파이크 로그 최소 간격 (초) — 폭주 방지
+    @ObservationIgnored nonisolated(unsafe) private var stgLastSpikeLog = 0.0
     /// UI 정적 검출 스트라이드 카운터 — 매 6프레임만 4K 검출 갱신 (백로그 증폭 방지)
     @ObservationIgnored nonisolated(unsafe) private var uiDetectFrame = 0
     /// 보간 엔진(cb2)의 GPU 실행시간 EMA [ms] — 자동 flow 스케일러 입력
@@ -1648,7 +1655,7 @@ public final class AppState {
             cb.addCompletedHandler { [weak self] b in
                 guard let self else { return }
                 let g = (b.gpuEndTime - b.gpuStartTime) * 1000.0
-                self.stageLock.lock(); self.stgCb1Gpu += g; self.stageLock.unlock()
+                self.stageLock.lock(); self.stgCb1Gpu += g; self.stgLastCb1Gpu = g; self.stageLock.unlock()
             }
         }
         cb.commit()
@@ -1841,6 +1848,25 @@ public final class AppState {
                 let cb2Gpu = (cb2Buf.gpuEndTime - cb2Buf.gpuStartTime) * 1000.0
                 let capIngest = (stageEnterRef - rawCaptureTsRef) * 1000.0
                 let workNow = (CACurrentMediaTime() - stageEnterRef) * 1000.0
+
+                // ── 스파이크 프레임 단독 기록.
+                // [STAGE]는 120프레임 평균이라 꼬리가 묻힌다. 그런데 지연을 정하는 건 평균이 아니라
+                // work **p90**이다(requiredExtra = ceil((paceWorkP90 + 2 − base)/slot)). 실측: 60fps
+                // 구간에서 work 평균 21ms인데 창의 89%가 최대 40ms를 넘고 p90이 67ms — 그 꼬리 때문에
+                // lat이 +3~4까지 올라가 e2e에 25~33ms가 상시로 실린다. 어느 단계가 튀는지 알아야
+                // 꼬리만 잘라낼 수 있으므로, 기준선의 2.5배를 넘는 프레임 하나를 통째로 찍는다.
+                let base = self.stgWorkEMA
+                self.stgWorkEMA = base <= 0 ? workNow : base * 0.95 + workNow * 0.05
+                let now = CACurrentMediaTime()
+                if base > 0, workNow > max(25.0, base * 2.5), now - self.stgLastSpikeLog > 1.0 {
+                    self.stgLastSpikeLog = now
+                    let c1 = self.stgLastCb1Gpu
+                    DiagnosticLog.shared.log(String(format:
+                        "[SPIKE] work=%.1fms (기준 %.1f) capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f 대기=%.1f t×%d",
+                        workNow, base, capIngest, c1, cb2Gpu, max(0, workNow - capIngest - c1 - cb2Gpu),
+                        interpFrames.count))
+                }
+
                 self.stageLock.lock()
                 self.stgCapIngest += capIngest
                 self.stgCb2Gpu += cb2Gpu

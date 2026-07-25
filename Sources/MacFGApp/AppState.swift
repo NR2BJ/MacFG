@@ -2273,12 +2273,34 @@ public final class AppState {
                 lines.append("Flow: \(r.currentFlowShort)p (\(L("auto", "자동", "自動")))")
             }
         }
+        if let q = qualityToggleStatus { lines.append("⚙︎ " + q) }
         // 거버너가 개입 중이면 알린다 — 화질이 낮아진 이유를 사용자가 알 수 있어야 한다
         if let gov = loadGovernor.statusText {
             lines.append("⚠︎ " + gov)
         }
         overlayManager?.setInfoOverlay(lines.joined(separator: "\n"))
     }
+
+    /// 2026-07-25 MetalFlow 화질 변경(모션비례 신뢰도 / 역방향 결합 / 정적 문턱)을 통째로 껐다 켠다.
+    /// 실사용 아티팩트가 이 변경 탓인지 같은 장면에서 즉시 A/B 하기 위한 진단용 토글.
+    @ObservationIgnored private var qualityChangesOn = true
+    func toggleMetalFlowQualityChanges() {
+        qualityChangesOn.toggle()
+        if qualityChangesOn {
+            MetalFlowEngine.confRel = 0.3; MetalFlowEngine.confMax = 0.5
+            MetalFlowEngine.staticLo = 0.004; MetalFlowEngine.staticHi = 0.02
+        } else {
+            MetalFlowEngine.confRel = 0.0; MetalFlowEngine.confMax = 0.0
+            MetalFlowEngine.staticLo = 0.008; MetalFlowEngine.staticHi = 0.04
+        }
+        let msg = qualityChangesOn ? "화질 변경 ON (7/25 신규)" : "화질 변경 OFF (이전 동작)"
+        DiagnosticLog.shared.log("[HOTKEY] MetalFlow \(msg)")
+        qualityToggleStatus = msg
+        refreshInfoOverlay()
+        NSSound.beep()
+    }
+    /// 정보 오버레이에 현재 토글 상태 표시 (nil이면 미표시 = 한 번도 안 누름)
+    @ObservationIgnored private var qualityToggleStatus: String?
 
     /// 정보 오버레이 토글 (단축키)
     func toggleInfoOverlay() {
@@ -2574,6 +2596,13 @@ public final class AppState {
             bindings.append(.init(id: 5, keyCode: UInt32(kVK_ANSI_D),
                                   modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
                 self?.startFrameDump()   // 실프레임 삼중항 캡처
+            })
+            // ⌃⌥⌘Q — MetalFlow 화질 변경(2026-07-25) 즉시 ON/OFF 토글.
+            // 지각 비교는 **같은 장면에서 즉시 전환**해야 정확하다(재시작하면 장면이 달라져 흐려짐).
+            // 아티팩트 원인이 이 변경인지 사용자가 직접 판정할 수 있게 한다.
+            bindings.append(.init(id: 8, keyCode: UInt32(kVK_ANSI_Q),
+                                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                self?.toggleMetalFlowQualityChanges()
             })
             bindings.append(.init(id: 6, keyCode: UInt32(kVK_ANSI_O),
                                   modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in

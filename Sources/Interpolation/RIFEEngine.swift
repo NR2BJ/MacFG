@@ -334,6 +334,11 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     private var lastPromoteAt: CFTimeInterval = 0
     /// 천장에서 연속 안정한 창 수 — 천장 회복(재탐침)의 근거
     private var stableAtCeiling = 0
+    /// 같은 티어에서 반복 실패한 횟수 — 재탐침 간격을 배로 늘린다.
+    /// 고정 60초로 두면 360이 계속 실패하는데도 60초마다 두드려, 매번 모델 전환 2회
+    /// (승격 + 강등)로 프레임이 끊긴다(실측 04:48~04:50 두 바퀴). 실패가 반복될수록
+    /// 재시도를 드물게 해서, 조건이 정말 바뀐 경우에만 다시 올라가게 한다.
+    private var ceilingFailStreak = 0
 
     /// 과부하/여유 판정 → 필요 시 모델·유닛 핫스왑 킥. encodePair(렌더 스레드)에서 호출.
     /// 판정: predict 중앙값이 쌍 간격의 90%↑(지속 불가) 또는 슬롯 고갈 5%↑ → (288, ANE)로
@@ -390,11 +395,13 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             // 천장이 내려가기만 하면 일시적 외란 한 번이 세션 내내 화질 상한을 깎는다
             // (AutoFlowScaler에서 같은 결함을 실측하고 고쳤다).
             stableAtCeiling += 1
-            if stableAtCeiling >= 20 {          // 창 하나가 180쌍(~3s) → 약 60s 연속 안정
+            // 창 하나 ≈ 180쌍(~3s). 20창 ≈ 60s에서 시작해 실패할 때마다 배로(최대 8배 ≈ 8분).
+            let need = 20 * min(8, 1 << ceilingFailStreak)
+            if stableAtCeiling >= need {
                 stableAtCeiling = 0
                 if let up = Self.ladderTiers.first(where: { $0 > learnedCeilingShort }) {
                     learnedCeilingShort = up
-                    DiagnosticLog.shared.log("[RIFE] 천장 회복 → \(up)p (60s 연속 안정)")
+                    DiagnosticLog.shared.log("[RIFE] 천장 회복 → \(up)p (\(need * 3)s 연속 안정, 실패\(ceilingFailStreak)회)")
                 }
             }
         } else if !overloaded,
@@ -426,10 +433,12 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         guard lastPromoteTarget > 0, currentShort == lastPromoteTarget,
               CFAbsoluteTimeGetCurrent() - lastPromoteAt < 30 else { return }
         let below = Self.ladderTiers.last(where: { $0 < lastPromoteTarget }) ?? 288
+        // 같은 티어에서 또 실패했으면 연패를 누적 — 재탐침 간격이 배로 늘어난다.
+        ceilingFailStreak = min(ceilingFailStreak + 1, 8)
         guard below < learnedCeilingShort else { return }
         learnedCeilingShort = below
         stableAtCeiling = 0
-        DiagnosticLog.shared.log("[RIFE] 천장 학습 → \(below)p (\(lastPromoteTarget)p 승격 직후 실패)")
+        DiagnosticLog.shared.log("[RIFE] 천장 학습 → \(below)p (\(lastPromoteTarget)p 승격 직후 실패, 연패\(ceilingFailStreak))")
     }
 
     private func kickSwitch(short: Int, gpu: Bool, reason: String) {

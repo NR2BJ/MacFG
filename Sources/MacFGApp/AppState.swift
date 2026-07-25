@@ -3,6 +3,7 @@ import AppKit
 import Carbon.HIToolbox
 @preconcurrency import Metal
 import QuartzCore
+import MetalPerformanceShaders
 import CaptureKit
 import Overlay
 import FramePacing
@@ -372,6 +373,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var uiDetector: UIStaticDetector?
     /// Vision 텍스트 검출 (흐린 채팅 보완) — ~2초 주기, 백그라운드 큐. 스냅샷 shared 텍스처 재사용.
     @ObservationIgnored nonisolated(unsafe) private var visionSnapshotTex: (any MTLTexture)?
+    /// Vision 스냅샷 축소용 스케일러 — 매 호출 생성은 낭비라 캐시한다.
+    @ObservationIgnored nonisolated(unsafe) private var visionScaler: MPSImageBilinearScale?
     @ObservationIgnored nonisolated(unsafe) private var visionInFlight = false
     @ObservationIgnored nonisolated(unsafe) private var lastVisionAt: CFTimeInterval = 0
     private let visionQueue = DispatchQueue(label: "macfg.vision", qos: .utility)
@@ -1053,20 +1056,41 @@ public final class AppState {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastVisionAt > 2.0 else { return }
         lastVisionAt = now
-        // 스냅샷 텍스처 (shared, 재사용)
-        if visionSnapshotTex == nil || visionSnapshotTex!.width != source.width || visionSnapshotTex!.height != source.height {
+        // ── 스냅샷은 **축소해서** 뜬다 (긴 변 1280 상한).
+        // 예전엔 소스 해상도 그대로 복사했는데, 4K에선 GPU blit 33MB + CPU getBytes 33MB가
+        // 2초마다 걸렸다. 그 메모리 대역폭과 뒤이은 Vision 추론(ANE)이 동시에 도는 4K 워프와
+        // 경합해, [SPIKE] 실측에서 cb2gpu가 6.1 → 18~45ms로 튀고 ANE 대기도 11.6 → 25~29ms로
+        // 동반 상승했다. 그 외란이 RIFE 사다리 승격 여유(0.9ms)를 삼켜 발진의 방아쇠가 됐다.
+        // Vision의 boundingBox는 **정규화 좌표(0~1)** 라 입력 해상도를 낮춰도 결과가 그대로다.
+        // 4K → 1280 기준이면 전송량이 33MB → 3.7MB로 약 9배 준다.
+        let longSide = max(source.width, source.height)
+        let vScale = longSide > 1280 ? 1280.0 / Double(longSide) : 1.0
+        let dw = max(16, Int(Double(source.width) * vScale) & ~1)
+        let dh = max(16, Int(Double(source.height) * vScale) & ~1)
+        if visionSnapshotTex == nil || visionSnapshotTex!.width != dw || visionSnapshotTex!.height != dh {
             let d = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm, width: source.width, height: source.height, mipmapped: false)
-            d.usage = [.shaderRead]; d.storageMode = .shared
+                pixelFormat: .bgra8Unorm, width: dw, height: dh, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .shared
             visionSnapshotTex = device.makeTexture(descriptor: d)
         }
-        guard let snap = visionSnapshotTex, let blit = cb.makeBlitCommandEncoder() else { return }
-        blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
-                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                  sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
-                  to: snap, destinationSlice: 0, destinationLevel: 0,
-                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-        blit.endEncoding()
+        guard let snap = visionSnapshotTex else { return }
+        if dw == source.width && dh == source.height {
+            guard let blit = cb.makeBlitCommandEncoder() else { return }
+            blit.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
+                      to: snap, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+        } else {
+            if visionScaler == nil { visionScaler = MPSImageBilinearScale(device: device) }
+            guard let scaler = visionScaler else { return }
+            var xf = MPSScaleTransform(scaleX: Double(dw) / Double(source.width),
+                                       scaleY: Double(dh) / Double(source.height),
+                                       translateX: 0, translateY: 0)
+            withUnsafePointer(to: &xf) { scaler.scaleTransform = $0 }
+            scaler.encode(commandBuffer: cb, sourceTexture: source, destinationTexture: snap)
+        }
         visionInFlight = true
         let queue = visionQueue
         nonisolated(unsafe) let selfRef = self   // visionInFlight 플래그 리셋용 (unsafe 필드)
@@ -2347,12 +2371,14 @@ public final class AppState {
         let ptSnap = presentedTimes
         let latSnap = latencySamplesMs
         statsLock.unlock()
-        var newOutput: Double = 0
-        if ptSnap.count >= 2,
-           let first = ptSnap.first, let last = ptSnap.last, last > first {
-            newOutput = (Double(ptSnap.count - 1) / (last - first)).rounded()
+        // 표본이 부족하면 **이전 값을 유지한다.** 예전엔 0으로 떨어뜨렸는데, 표본 부족은
+        // "프레임이 안 나온다"가 아니라 "이 0.5초 창에 presented 기록이 아직 안 모였다"는 뜻이라
+        // 실제로는 120fps로 잘 돌고 있는데 오버레이에 0 fps가 뜨는 오표시가 났다(사용자 제보).
+        // 같은 이유로 산출 구간이 비정상적으로 짧으면(<0.1s) 표본 잡음이 커 신뢰하지 않는다.
+        if ptSnap.count >= 8, let first = ptSnap.first, let last = ptSnap.last, last - first > 0.1 {
+            let newOutput = (Double(ptSnap.count - 1) / (last - first)).rounded()
+            if outputFPS != newOutput { outputFPS = newOutput }
         }
-        if outputFPS != newOutput { outputFPS = newOutput }
         let newLatency = (latSnap.isEmpty ? 0 : latSnap.reduce(0, +) / Double(latSnap.count)).rounded()
         if latencyMs != newLatency { latencyMs = newLatency }
         let newScale = overlayManager?.scaleStatus

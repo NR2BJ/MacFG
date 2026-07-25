@@ -838,6 +838,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     #include <metal_stdlib>
     using namespace metal;
 
+    // ⚠️ 필드 순서는 Swift WarpParams와 **정확히 일치**해야 한다 — setBytes 원시 복사라
+    // 한쪽만 중간에 삽입하면 셰이더가 엉뚱한 오프셋을 읽는다. 컴파일 에러도 크래시도 없이
+    // 화질만 조용히 떨어진다(실측: 필드 6개 어긋나 RIFE -3.5dB). 같은 계열로 과거 .size vs .stride
+    // 28↔32바이트 사고도 있었다. 필드 추가는 **양쪽 끝에 동시에**.
     struct WarpParams { float2 flowScale; float scale0; float scale1; float tPhase; float useDiffTex; float useUIMask; };
     constant float3 kLuma = float3(0.2126, 0.7152, 0.0722);
 
@@ -998,6 +1002,10 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         float fmag = (length(f0) + length(f1)) * 0.5;
         float tol = 1.0 + min(fmag * 0.06, 1.5);
         float ratio = errW / ((dBlur + 0.01) * tol);
+        // 문턱 1.0/1.8 + 관용 0.06/1.5는 **실측으로 이미 최적**임을 확인(2026-07-25):
+        // MetalFlow에서 큰 이득을 준 완화 처방(정적 0.004/0.02, 신뢰도 완화)을 그대로 적용해도
+        // RIFE는 -0.006~-0.019dB로 손해다. RIFE는 모델이 flow와 mask를 함께 학습해 신뢰도가
+        // 이미 정확하고, 이 게이트는 그 위의 백스톱이라 풀면 오차만 통과한다. 건드리지 말 것.
         float conf = 1.0 - smoothstep(1.0, 1.8, ratio);
         float3 srcBlend = mix(a0, b0, p.tPhase);
         float3 outc = mix(srcBlend, warped, conf);

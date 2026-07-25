@@ -55,6 +55,7 @@ struct BenchConfig {
     var rifeANE = false             // RIFE를 ANE로 (기본 GPU)
     var multiT = false              // 멀티-t 화질 벤치 (t별 PSNR — 24/30fps 경로 검증)
     var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
+    var qualityAB = false           // 같은 삼중항에 MetalFlow 화질 변경 4단계를 전부 돌려 비교
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -75,6 +76,7 @@ struct BenchConfig {
             case "--rife-ane": config.rifeANE = true
             case "--multi-t": config.multiT = true
             case "--triplets": if let v = args.popFirst() { config.tripletsDir = v }
+            case "--quality-ab": config.qualityAB = true
             default: break
             }
         }
@@ -449,6 +451,69 @@ func computeBlendPSNR(device: any MTLDevice, queue: any MTLCommandQueue,
     return mse <= 0 ? 99 : 10 * log10(255 * 255 / mse)
 }
 
+/// **정적 영역 이탈량** — 텍스트/UI 흔들림을 재는 지표. (staticDev dB, 높을수록 안정)
+///
+/// 왜 필요한가: 삼중항 PSNR은 t=0.5에서 정답과의 **공간적 정확도**를 잰다. 그런데 사용자가
+/// 실제로 거슬려 하는 "정적 UI 텍스트가 프레임마다 미세하게 흔들리는" 현상은 **시간적**이다.
+/// 실측 2026-07-25: 화질 변경 3건이 삼중항 PSNR을 +0.361dB 올렸는데 눈으로는 더 나빠 보였다.
+/// 두 측정이 서로 다른 것을 재고 있었던 것이다. 그 간극을 메운다.
+///
+/// 정의: 소스에서 정지한 픽셀(|A−B| ≤ tol)만 골라, 보간 결과가 A에서 얼마나 벗어났는지 잰다.
+/// 안 움직여야 할 픽셀은 A와 같아야 하므로, 이탈량이 곧 흔들림이다.
+/// - Returns: (dB, 정적 판정 픽셀 비율). 비율이 낮으면 표본이 적어 dB를 신뢰하면 안 된다.
+func computeStaticDeviation(device: any MTLDevice, queue: any MTLCommandQueue,
+                            texA: any MTLTexture, texB: any MTLTexture,
+                            interp: any MTLTexture, tol: Double = 3.0) -> (db: Double, staticFrac: Double) {
+    let a = readTextureBytes(texA, device: device, queue: queue)
+    let b = readTextureBytes(texB, device: device, queue: queue)
+    let p = readTextureBytes(interp, device: device, queue: queue)
+    guard !a.isEmpty, a.count == b.count, a.count == p.count else { return (0, 0) }
+    let w = min(min(texA.width, texB.width), interp.width)
+    let h = min(min(texA.height, texB.height), interp.height)
+    let rowA = texA.width * 4, rowB = texB.width * 4, rowP = interp.width * 4
+    var sum = 0.0, n = 0.0, total = 0.0
+    for y in stride(from: 0, to: h, by: 2) {
+        for x in stride(from: 0, to: w, by: 2) {
+            total += 1
+            // 세 채널 모두 정지해야 정적으로 인정 — 한 채널만 보면 색만 바뀌는 이동을 놓친다
+            var isStatic = true
+            for c in 0..<3 where abs(Double(a[y * rowA + x * 4 + c]) - Double(b[y * rowB + x * 4 + c])) > tol {
+                isStatic = false
+            }
+            guard isStatic else { continue }
+            for c in 0..<3 {
+                let d = Double(p[y * rowP + x * 4 + c]) - Double(a[y * rowA + x * 4 + c])
+                sum += d * d; n += 1
+            }
+        }
+    }
+    guard n > 0 else { return (0, 0) }
+    let mse = sum / n
+    let db = mse <= 0 ? 99 : 10 * log10(255 * 255 / mse)
+    return (db, total > 0 ? (n / 3) / total : 0)
+}
+
+/// 텍스처를 BGRA8 바이트로 읽어온다 (private면 shared로 블릿).
+func readTextureBytes(_ tex: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue) -> [UInt8] {
+    let w = tex.width, h = tex.height
+    if tex.storageMode == .shared {
+        var b = [UInt8](repeating: 0, count: w * h * 4)
+        tex.getBytes(&b, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        return b
+    }
+    let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+    desc.storageMode = .shared; desc.usage = [.shaderRead]
+    guard let shared = device.makeTexture(descriptor: desc), let cb = queue.makeCommandBuffer(),
+          let blit = cb.makeBlitCommandEncoder() else { return [] }
+    blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              sourceSize: MTLSize(width: w, height: h, depth: 1), to: shared, destinationSlice: 0,
+              destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+    blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+    var b = [UInt8](repeating: 0, count: w * h * 4)
+    shared.getBytes(&b, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+    return b
+}
+
 func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: any MTLTexture, texB: any MTLTexture) -> Double {
     func readAll(_ tex: any MTLTexture) -> [UInt8] {
         let w = tex.width, h = tex.height
@@ -555,6 +620,84 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  (n=\(psnrs.count))")
     }
     print("\n⏱  실프레임 = 합성보다 압축노이즈·반투명·대모션 모두 포함. 높을수록 정확.")
+}
+
+/// **화질 변경 A/B (결정론적)** — 같은 삼중항에 4단계를 전부 돌려 비교한다.
+///
+/// 왜 이 모드인가: 실사용 A/B는 매번 장면이 달라 판정이 흐려진다(사용자 실측:
+/// "둘 다는 확실히 최악인데 각각은 off와 구분이 안 된다 — 매번 조건이 달라서 그런가").
+/// 같은 입력에 4단계를 돌리면 그 confound가 사라지고, 상호작용(각각은 무해한데 함께면
+/// 나빠지는지)도 드러난다.
+///
+/// 두 지표를 같이 본다 — 하나만 보면 이 세션에서 겪은 함정에 다시 빠진다:
+///  - PSNR      : t=0.5 정답과의 공간적 정확도. 높을수록 정확.
+///  - staticDev : 정지한 픽셀이 원본에서 벗어난 정도. 높을수록 **텍스트/UI가 안정**.
+/// 7/25 변경은 PSNR을 올리면서 staticDev를 떨어뜨렸을 가능성이 크다(눈에 보인 게 그쪽이다).
+func runQualityABMode(dir: String, device: any MTLDevice, queue: any MTLCommandQueue) async {
+    let fm = FileManager.default
+    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
+    guard files.count >= 3 else { print("❌ 프레임 부족 (\(files.count)) — \(dir)"); return }
+    var frames: [any MTLTexture] = []
+    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
+    guard frames.count >= 3 else { print("❌ 로드 실패"); return }
+    print("▶ 화질 A/B: \(frames.count)장 → \(frames.count - 2) 삼중항, \(frames[0].width)x\(frames[0].height)  (\(dir))")
+
+    // (이름, conf 계열 켬, static 계열 조임)
+    let stages: [(String, Bool, Bool)] = [
+        ("0 이전동작", false, false),
+        ("1 conf만",   true,  false),
+        ("2 static만", false, true),
+        ("3 둘다(현재)", true,  true),
+    ]
+    print("  \("단계".padding(toLength: 14, withPad: " ", startingAt: 0))  PSNR avg    PSNR min   staticDev  (정적비율)")
+
+    var rows: [(String, Double, Double, Double)] = []
+    for (name, conf, stat) in stages {
+        MetalFlowEngine.confRel = conf ? 0.3 : 0.0
+        MetalFlowEngine.confMax = conf ? 0.5 : 0.0
+        MetalFlowEngine.staticLo = stat ? 0.004 : 0.008
+        MetalFlowEngine.staticHi = stat ? 0.02 : 0.04
+
+        let engine = MetalFlowEngine()
+        do { try await engine.prepare(device: device) } catch { print("  \(name): prepare 실패"); continue }
+        var psnrs: [Double] = [], devs: [Double] = [], fracs: [Double] = []
+        let dt = 1.0 / 30.0
+        for i in 0..<(frames.count - 2) {
+            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
+            guard let cb = queue.makeCommandBuffer() else { continue }
+            let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt, tsB: Double(i + 2) * dt,
+                                      tValues: [0.5], into: cb)
+            cb.commit(); await cb.completed()
+            guard let interp = r?.frames.first?.texture else { continue }
+            psnrs.append(computePSNRFull(device: device, queue: queue, texA: interp, texB: gt))
+            let sd = computeStaticDeviation(device: device, queue: queue, texA: a, texB: b, interp: interp)
+            if sd.staticFrac > 0.02 { devs.append(sd.db); fracs.append(sd.staticFrac) }
+        }
+        engine.shutdown()
+        let pAvg = psnrs.isEmpty ? 0 : psnrs.reduce(0, +) / Double(psnrs.count)
+        let pMin = psnrs.min() ?? 0
+        let dAvg = devs.isEmpty ? 0 : devs.reduce(0, +) / Double(devs.count)
+        let fAvg = fracs.isEmpty ? 0 : fracs.reduce(0, +) / Double(fracs.count)
+        rows.append((name, pAvg, pMin, dAvg))
+        print(String(format: "  %@  %7.3f dB  %7.3f dB  %7.3f dB   (%.0f%%)",
+                     name.padding(toLength: 14, withPad: " ", startingAt: 0), pAvg, pMin, dAvg, fAvg * 100))
+    }
+
+    guard let base = rows.first else { return }
+    print("\n  ── 0(이전동작) 대비 차이 ──")
+    for r in rows.dropFirst() {
+        print(String(format: "  %@  PSNR %+.3f dB   staticDev %+.3f dB",
+                     r.0.padding(toLength: 14, withPad: " ", startingAt: 0), r.1 - base.1, r.3 - base.3))
+    }
+    print("""
+
+      PSNR      = 정답과의 공간 정확도 (높을수록 정확)
+      staticDev = 정지 픽셀이 원본에서 벗어난 정도 (높을수록 텍스트/UI가 안정)
+      정적비율  = 삼중항에서 정지로 판정된 픽셀 비율. 낮으면 staticDev 표본이 적어 신뢰도 낮음.
+      기준선 없음이 정상: hold/blend는 정지 픽셀에서 정의상 완벽해 비교 대상이 아니다.
+      단계별로 PSNR과 staticDev가 **반대로** 움직이면 그게 이 변경의 거래 조건이다.
+    """)
 }
 
 func benchmarkEngine(_ engine: any PairInterpolationEngine,
@@ -681,7 +824,11 @@ func main() async {
     }
 
     if let td = config.tripletsDir {
-        await runTripletMode(dir: td, engineKeys: config.engines, device: device, queue: commandQueue)
+        if config.qualityAB {
+            await runQualityABMode(dir: td, device: device, queue: commandQueue)
+        } else {
+            await runTripletMode(dir: td, engineKeys: config.engines, device: device, queue: commandQueue)
+        }
         return
     }
 

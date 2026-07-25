@@ -92,6 +92,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pop.contentViewController = NSHostingController(rootView: WindowPickerView(appState: appState))
         popover = pop
 
+        verifyStatusItemAdopted()
+
         // 캡처 상태를 아이콘에 반영 — 상태 변화가 드물어 1초 폴링으로 충분
         iconTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -102,6 +104,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     btn.image = img
                 }
             }
+        }
+    }
+
+    /// 상태항목이 **실제로 메뉴바에 올라갔는지** 확인하고, 아니면 설정 창을 대신 띄운다.
+    ///
+    /// 왜 필요한가: macOS 26에서 메뉴바 상태항목 창은 ControlCenter가 소유·호스팅한다. 우리
+    /// NSStatusItem은 그 채택을 신청하는 프록시일 뿐이고, 채택이 거부돼도 **AppKit은 아무것도
+    /// 알려주지 않는다** — isVisible·window·onScreen 전부 true를 계속 반환한다(프록시 자신을
+    /// 설명하는 값이라서). 실제로 2026-07-25에 이 상태에 빠졌고, 아이콘이 없으니 사용자에겐
+    /// "앱이 아예 안 켜진다"로 보였다. 조용한 실패를 눈에 보이는 실패로 바꾼다.
+    ///
+    /// 판정: 창 서버에 우리 pid 소유의 상태항목 레이어(25) 창이 있는가. 채택되면 창은
+    /// ControlCenter 소유가 되므로 0개가 정상… 이 아니라, **채택 실패 시에도 0개**다.
+    /// 그래서 창 서버가 아니라 프록시 창의 기하로 가른다: 채택 못 받은 항목은 화면 오른쪽
+    /// 끝에 딱 붙고(가장자리로부터 자기 폭만큼), 높이가 구형 22pt로 남는다 — Tahoe의 실제
+    /// 메뉴바 띠는 30pt 이상이다.
+    private func verifyStatusItemAdopted() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, let win = self.statusItem?.button?.window, let screen = win.screen else { return }
+            let menuBarHeight = screen.frame.height - screen.visibleFrame.height - (screen.visibleFrame.origin.y - screen.frame.origin.y)
+            let flushToRightEdge = (screen.frame.maxX - win.frame.maxX) < 1.0
+            let legacyHeight = menuBarHeight > 0 && win.frame.height < menuBarHeight - 1.0
+            guard flushToRightEdge && legacyHeight else { return }
+
+            DiagnosticLog.shared.log("""
+                [SI] 메뉴바 채택 실패 — ControlCenter가 상태항목을 받아주지 않았다 \
+                (frame=\(win.frame) 메뉴바높이=\(menuBarHeight)). 설정 창으로 대체한다. \
+                복구: scripts/repair_menubar_allowlist.py --apply && killall ControlCenter
+                """)
+            self.appState.openSettingsWindow()
         }
     }
 

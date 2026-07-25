@@ -186,7 +186,13 @@ public final class AppState {
     /// predict 이벤트 대기가 다음 프레임 blit을 head-of-line 블로킹하던 것을 없애 파이프라인
     /// 중첩(predict↔warp)을 복원. MACFG_SPLITQ=1로 활성(검증 전 기본 OFF — 동시성 변경).
     @ObservationIgnored nonisolated(unsafe) private var copyQueue: (any MTLCommandQueue)?
-    @ObservationIgnored private let splitQueueEnabled = ProcessInfo.processInfo.environment["MACFG_SPLITQ"] == "1"
+    /// cb1(blit)을 별도 copy 큐로 분리할지 — **엔진별로 다르다.**
+    /// 이 분리가 노리는 병목은 "cb2가 RIFE predict(ANE) 이벤트를 기다리며 workQueue를 점유해
+    /// 다음 프레임 blit이 head-of-line 블로킹되는 것"이다. MetalFlow는 predict 대기 자체가 없어
+    /// 이득 경로가 존재하지 않는다 — 실측도 그랬다(N=20: MetalFlow σ 0.78→0.84·tick 119.3→117.4 손해,
+    /// RIFE σ 1.49→1.21·편차 ±1.18→±0.74 개선). 그래서 RIFE에서만 켠다. MACFG_SPLITQ로 수동 오버라이드.
+    @ObservationIgnored nonisolated(unsafe) private var splitQueueEnabled = false
+    @ObservationIgnored private let splitQueueOverride: Bool? = ProcessInfo.processInfo.environment["MACFG_SPLITQ"].map { $0 == "1" }
 
     /// 단계별 지연 분해 계측 (MACFG_STAGEDBG=1). 라이브 work(50~80ms)가 큐 대기인지 GPU 실행인지
     /// 가른다: capIngest(캡처→인제스트 = SCK/큐 대기), cb1(blit+검출 GPU), cb2(warp GPU),
@@ -2698,6 +2704,8 @@ public final class AppState {
     private var configureEpoch = 0
 
     private func configurePairEngine() async {
+        // 큐 분리는 predict 대기가 있는 엔진(RIFE)에서만 이득 — 위 선언부 주석의 실측 근거 참조
+        splitQueueEnabled = splitQueueOverride ?? (selectedRenderMode == .rife && isInterpolationEnabled)
         configureEpoch += 1
         let epoch = configureEpoch
         let old = pairEngine

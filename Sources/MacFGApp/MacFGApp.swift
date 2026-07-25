@@ -59,6 +59,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: - 상태 항목 (직접 소유)
 
     private func setUpStatusItem() {
+        // **번들 밖(.build/release/MacFGApp 직접 실행)에서는 상태항목을 만들지 않는다.**
+        // macOS 26의 ControlCenter는 메뉴바 항목 허용 목록을 앱이 아니라 **띄운 프로세스**
+        // (responsible process) 기준으로 기록한다. 번들 없이 셸에서 실행하면 그룹 컨테이너
+        // group.com.apple.controlcenter의 trackedApplications에 `adhocBinary .build/...` 소유자
+        // 기록이 새로 생기고, 같은 메뉴 항목을 여러 소유자가 상충하는 허용 상태로 주장하게 되면
+        // ControlCenter가 **아무것도 채택하지 않는다** — 그러면 아이콘이 영영 안 뜬다.
+        // (실측 2026-07-25: 디버깅 중 셸/에이전트에서 반복 실행해 소유자 기록이 6개까지 늘었고,
+        //  코드는 그대로인데 같은 커밋이 30분 만에 정상→고장으로 바뀌었다.)
+        // 개발 중 셸 실행은 ⌃⌥⌘M(설정 창)으로 쓴다.
+        guard Bundle.main.bundleIdentifier != nil else {
+            DiagnosticLog.shared.log("[SI] 번들 밖 실행 — 상태항목 생성 생략 (ControlCenter 기록 오염 방지). ⌃⌥⌘M 사용")
+            return
+        }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "MacFG")
         item.button?.target = self

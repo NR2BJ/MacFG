@@ -3,7 +3,10 @@
 # 사용: scripts/make_app.sh <version>   (예: scripts/make_app.sh 1.0.0)
 set -euo pipefail
 
-VERSION="${1:-1.0.0}"
+# 기본값을 1.0.0으로 두면 인자 없이 패키징할 때마다 번들이 1.0.0으로 되돌아가, 저장소가
+# v1.1.5인데 설치본은 1.0.0이라 주장하는 상태가 된다(실측). 최신 태그를 기본값으로 쓴다.
+VERSION="${1:-$(git -C "$(dirname "$0")/.." describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)}"
+VERSION="${VERSION:-1.0.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/MacFG.app"

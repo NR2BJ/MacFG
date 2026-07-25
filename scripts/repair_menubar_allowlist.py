@@ -17,9 +17,17 @@
   - .build/... 를 가리키는 adhocBinary 기록 → 통째로 제거 (번들 아닌 실행의 잔재)
   - com.macfg.MacFG 자신의 정상 기록은 **보존한다**
 
+--reset 모드 (권장):
+  MacFG 관련 기록을 **자기 기록까지 포함해 전부** 제거한다. 다음 실행이 ControlCenter에겐
+  첫 실행이 되어 깨끗하게 채택된다. 실측 2026-07-25: 같은 바이너리를 번들ID만 바꿔
+  (com.macfg.MacFGProbe) 띄웠더니 기록이 없는 덕에 isAllowed=True를 받고 정상 표시됐다.
+  자기 기록의 isAllowed가 False로 박힌 경우(시스템 설정에서 한 번 끄면 이렇게 된다)는
+  기본 모드로는 못 고친다 — 기본 모드는 자기 기록을 보존하기 때문이다.
+
 사용:
-  python3 scripts/repair_menubar_allowlist.py --dry-run     # 무엇이 바뀔지만 출력
-  python3 scripts/repair_menubar_allowlist.py --apply       # 실제 수정 (백업 생성)
+  python3 scripts/repair_menubar_allowlist.py --dry-run             # 기본 정리 미리보기
+  python3 scripts/repair_menubar_allowlist.py --reset --dry-run     # 전체 제거 미리보기
+  python3 scripts/repair_menubar_allowlist.py --reset --apply       # 적용 (백업 생성)
 """
 import os
 import plistlib
@@ -31,7 +39,8 @@ PLIST = os.path.expanduser(
     "~/Library/Group Containers/group.com.apple.controlcenter/"
     "Library/Preferences/group.com.apple.controlcenter.plist"
 )
-NEEDLES = ("com.macfg.MacFG", "/MacFG/.build/", "MacFGApp")
+APP_ID = "com.macfg.MacFG"          # 정확히 이 번들ID만. com.macfg.MacFGProbe 같은 다른 앱은 건드리지 않는다
+BUILD_MARK = "/MacFG/.build/"       # 번들 없이 실행한 잔재
 
 
 def loc_name(loc):
@@ -47,11 +56,17 @@ def loc_name(loc):
 
 
 def is_macfg(name):
-    return any(n in name for n in NEEDLES)
+    """정확히 MacFG 본체(또는 그 .build 잔재)인가. 부분일치를 쓰면 com.macfg.MacFGProbe
+    같은 **다른 앱**까지 지운다 — 실측에서 실제로 그랬다."""
+    return name == APP_ID or BUILD_MARK in name
 
 
-def repair(entries):
-    """(새 목록, 변경 로그) 반환. 원본은 건드리지 않는다."""
+def repair(entries, reset=False):
+    """(새 목록, 변경 로그) 반환. 원본은 건드리지 않는다.
+
+    reset=True면 com.macfg.MacFG 자기 기록도 제거해, 다음 실행이 첫 실행이 되게 한다.
+    자기 기록의 isAllowed가 False로 박힌 상태는 이 모드로만 풀린다.
+    """
     out, log = [], []
     for e in entries:
         if not isinstance(e, dict) or "location" not in e:
@@ -65,9 +80,14 @@ def repair(entries):
             log.append(f"제거(adhoc 소유자): {owner}")
             continue
 
-        # 소유자가 MacFG 자신이면 보존
+        # 소유자가 MacFG 자신인 기록
         if owner == "com.macfg.MacFG":
+            if reset:
+                log.append(f"제거(자기 기록): {owner} (허용={e.get('isAllowed')}) — 다음 실행이 첫 실행이 된다")
+                continue
             out.append(e)
+            if e.get("isAllowed") is False:
+                log.append(f"경고: {owner} 의 허용이 False다. 기본 모드는 이걸 못 고친다 → --reset 을 쓰라")
             continue
 
         kept = [l for l in locs if not is_macfg(loc_name(l))]
@@ -88,6 +108,7 @@ def repair(entries):
 
 def main():
     apply = "--apply" in sys.argv
+    reset = "--reset" in sys.argv
     if not apply and "--dry-run" not in sys.argv:
         print(__doc__)
         return 2
@@ -97,7 +118,8 @@ def main():
 
     root = plistlib.load(open(PLIST, "rb"))
     entries = plistlib.loads(bytes(root["trackedApplications"]))
-    new, log = repair(entries)
+    new, log = repair(entries, reset=reset)
+    print(f"모드: {'--reset (자기 기록까지 제거)' if reset else '기본 (자기 기록 보존)'}")
 
     print(f"소유자 기록 {len(entries)} → {len(new)}")
     for line in log:

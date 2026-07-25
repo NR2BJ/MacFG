@@ -323,6 +323,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     private var ladderPairs = 0
     private var ladderExhausts = 0
     private var gapMsEMA: Double = 0
+    /// 학습 천장 — 올린 직후 깨진 티어를 기억한다. 예산 규칙만으로는 같은 자리를 오르내린다:
+    /// 실측 2026-07-26(4K 60fps) 288→360 판정이 `med×1.5625=11.7 < gap×0.75=12.6`으로 여유가
+    /// 겨우 7%인데, Vision 정적검출이 2초마다 GPU+ANE를 때려 그 여유를 삼킨다. 그래서
+    /// 360 승격 → 과부하 → 거버너 강등(240p) → 회복 → 360 승격 이 2분에 두 바퀴 돌았고,
+    /// 전환마다 모델을 바꿔 끼우며 프레임이 끊겼다("투툭" 체감 + 120↔110 왕복).
+    private var learnedCeilingShort = Int.max
+    /// 마지막 승격의 대상/시각 — "올린 직후 실패"인지 판정용
+    private var lastPromoteTarget = 0
+    private var lastPromoteAt: CFTimeInterval = 0
+    /// 천장에서 연속 안정한 창 수 — 천장 회복(재탐침)의 근거
+    private var stableAtCeiling = 0
 
     /// 과부하/여유 판정 → 필요 시 모델·유닛 핫스왑 킥. encodePair(렌더 스레드)에서 호출.
     /// 판정: predict 중앙값이 쌍 간격의 90%↑(지속 불가) 또는 슬롯 고갈 5%↑ → (288, ANE)로
@@ -338,6 +349,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
            let target = Self.descentTiers.last(where: { $0 <= Self.flowCapShort && Self.modelAvailable(short: $0) }),
            target != currentShort,
            CFAbsoluteTimeGetCurrent() - lastSwitchAt > 2.0 {
+            noteTierFailed()
             kickSwitch(short: target, gpu: false, reason: "거버너 상한 →\(target)p")
             return
         }
@@ -364,10 +376,32 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             kickSwitch(short: target, gpu: false,
                        reason: "GPU-free 이전 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
         } else if overloaded, currentShort > 288, Self.modelAvailable(short: 288) {
+            noteTierFailed()
             kickSwitch(short: 288, gpu: false,
                        reason: "과부하 강등 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
+        } else if !overloaded, Self.ladderTiers.contains(where: {
+                      $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort)
+                          && $0 > learnedCeilingShort && Self.modelAvailable(short: $0)
+                  }), !Self.ladderTiers.contains(where: {
+                      $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort)
+                          && $0 <= learnedCeilingShort && Self.modelAvailable(short: $0)
+                  }) {
+            // 학습 천장에 막혀 있다 — 오래 안정적이면 한 칸 되돌려 다시 탐침할 기회를 준다.
+            // 천장이 내려가기만 하면 일시적 외란 한 번이 세션 내내 화질 상한을 깎는다
+            // (AutoFlowScaler에서 같은 결함을 실측하고 고쳤다).
+            stableAtCeiling += 1
+            if stableAtCeiling >= 20 {          // 창 하나가 180쌍(~3s) → 약 60s 연속 안정
+                stableAtCeiling = 0
+                if let up = Self.ladderTiers.first(where: { $0 > learnedCeilingShort }) {
+                    learnedCeilingShort = up
+                    DiagnosticLog.shared.log("[RIFE] 천장 회복 → \(up)p (60s 연속 안정)")
+                }
+            }
         } else if !overloaded,
-                  let next = Self.ladderTiers.first(where: { $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort) && Self.modelAvailable(short: $0) }) {
+                  let next = Self.ladderTiers.first(where: {
+                      $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort)
+                          && $0 <= learnedCeilingShort && Self.modelAvailable(short: $0)
+                  }) {
             // 한 티어씩 승격 — 다음 해상도 예상 비용(면적비 = (next/cur)²)이 갭 여유 안일 때만.
             // 288→360 ×1.56, 360→432 ×1.44, 432→540 ×1.56 (실측 부합). 여유 없으면 자연히 안 올라감.
             let factor = Double(next * next) / Double(currentShort * currentShort)
@@ -375,10 +409,27 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             // 거의 등가(288exact=432a1)이고 최고해상도+앵커1(540a1 .7846)이 실현가능 최선 —
             // 정확앵커 확보를 위해 승격을 막을 이유 없음. 순수 예산 규칙만 적용.
             if med * factor < gapMsEMA * 0.75 {
+                lastPromoteTarget = next
+                lastPromoteAt = CFAbsoluteTimeGetCurrent()
+                stableAtCeiling = 0
                 kickSwitch(short: next, gpu: false,
                            reason: "여유 승격 →\(next) med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
             }
         }
+    }
+
+    /// 강등 직전 호출 — **올린 직후** 깨진 것이면 그 티어를 천장으로 학습한다.
+    /// 예산 규칙만으론 강등 후 같은 계산을 다시 해 같은 티어로 되올라가고, 그 왕복마다
+    /// 모델을 바꿔 끼우며 프레임이 끊긴다(실측: 2분에 두 바퀴, 사용자 체감 "투툭").
+    /// 오래 버티다 깨진 것(외란)은 학습하지 않는다 — 그건 천장이 아니라 일시적 부하다.
+    private func noteTierFailed() {
+        guard lastPromoteTarget > 0, currentShort == lastPromoteTarget,
+              CFAbsoluteTimeGetCurrent() - lastPromoteAt < 30 else { return }
+        let below = Self.ladderTiers.last(where: { $0 < lastPromoteTarget }) ?? 288
+        guard below < learnedCeilingShort else { return }
+        learnedCeilingShort = below
+        stableAtCeiling = 0
+        DiagnosticLog.shared.log("[RIFE] 천장 학습 → \(below)p (\(lastPromoteTarget)p 승격 직후 실패)")
     }
 
     private func kickSwitch(short: Int, gpu: Bool, reason: String) {

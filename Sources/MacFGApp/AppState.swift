@@ -201,7 +201,13 @@ public final class AppState {
     /// 가른다: capIngest(캡처→인제스트 = SCK/큐 대기), cb1(blit+검출 GPU), cb2(warp GPU),
     /// work(캡처→cb2완료 총). GPU 시간은 cb.gpuStart/EndTime(대기 제외 순수 실행). 부하와 무관하게
     /// **비율**이 병목을 드러낸다. 완료 핸들러가 임의 스레드라 stageLock으로 누적.
-    @ObservationIgnored private let stageDbg = ProcessInfo.processInfo.environment["MACFG_STAGEDBG"] == "1"
+    /// **개발 로그 토글에 묶는다.** 예전엔 MACFG_STAGEDBG=1 환경변수 전용이었는데, 환경변수는
+    /// Finder에서 더블클릭으로 켠 .app에는 전달되지 않는다 — 즉 이 계측이 **실사용에서 구조적으로
+    /// 도달 불가**였고, "e2e의 70ms가 어디서 오는가"라는 질문에 답할 유일한 도구가 죽어 있었다.
+    /// 로그 파일에만 쓰고 렌더 경로에 분기 하나를 더할 뿐이라 켜져 있어도 비용이 없다.
+    @ObservationIgnored nonisolated(unsafe) private var stageDbg =
+        ProcessInfo.processInfo.environment["MACFG_STAGEDBG"] == "1"
+        || UserDefaults.standard.bool(forKey: "s.devlog")
     @ObservationIgnored nonisolated(unsafe) private var stgCapIngest = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCb1Gpu = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCb2Gpu = 0.0
@@ -473,6 +479,7 @@ public final class AppState {
     /// 개발자 로그 토글 — on이면 /tmp/MacFG_diag.log 기록, off면 삭제+기록 중단.
     func updateDevLogging() {
         DiagnosticLog.shared.setEnabled(devLoggingEnabled)
+        stageDbg = devLoggingEnabled || ProcessInfo.processInfo.environment["MACFG_STAGEDBG"] == "1"
         registerHotKeys()   // 개발 덤프 단축키(⌃⌥⌘D/O)를 devLogging 상태에 맞춰 등록/해제
     }
 

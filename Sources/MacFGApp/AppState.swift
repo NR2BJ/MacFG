@@ -1146,6 +1146,7 @@ public final class AppState {
         uiDetector?.reset()   // 불연속(재시작/리사이즈) — 정지-UI 누적도 리셋
         timeline = []
         inFlightTextures = [:]
+        presentingTextures.withLock { $0.removeAll() }
         stablePool = []
         stablePoolWidth = 0
         stablePoolHeight = 0
@@ -1184,6 +1185,7 @@ public final class AppState {
     nonisolated private func softResetForResize() {
         timeline = []
         inFlightTextures = [:]
+        presentingTextures.withLock { $0.removeAll() }
         stablePool = []
         stablePoolWidth = 0
         stablePoolHeight = 0
@@ -1274,6 +1276,17 @@ public final class AppState {
     /// 인플라이트 present 수 (presentedHandler에서 감소 — 임의 스레드라 락 보호).
     /// 인플라이트 present 수 (presentedHandler에서 감소). 드로어블 포화 진단용 (drawBusy).
     private let inFlightPresents = OSAllocatedUnfairLock(initialState: 0)
+    /// **표시 커맨드 버퍼가 아직 읽고 있는 스테일 텍스처** — 완료까지 참조를 붙잡는다.
+    ///
+    /// 예전엔 `lastPresentedTexture` 한 장만 "사용 중"으로 지켰다. 그런데
+    /// maximumDrawableCount=3이라 present는 동시에 2장 이상 떠 있고(바로 위 diagPresentBusy가
+    /// 그걸 센다), 그러면 **앞선 present가 GPU에서 아직 읽는 텍스처가 busy 판정에서 빠진다.**
+    /// 풀이 그걸 다시 내주면 cb1의 blit이 읽는 중인 텍스처에 새 프레임을 덮어쓴다
+    /// — 화면에 프레임이 겹쳐 보이거나 멈춘 듯 보이는 증상의 원인.
+    /// (인플라이트 텍스처가 조기 해제되던 버그를 고치자 이 결함이 드러났다: 예전엔 죽은
+    ///  ObjectIdentifier가 주소를 재사용한 새 텍스처와 충돌해 우연히 busy로 잡히면서
+    ///  이 경로를 가려주고 있었다.)
+    private let presentingTextures = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: any MTLTexture]())
     @ObservationIgnored nonisolated(unsafe) private var diagPresentBusy = 0
     @ObservationIgnored nonisolated(unsafe) private var isRestartingCapture = false
     @ObservationIgnored nonisolated(unsafe) private var presentedTimes: [CFTimeInterval] = []
@@ -2077,6 +2090,14 @@ public final class AppState {
             inFlightRef.withLock { $0 = max(0, $0 - 1) }
             mailboxRef.postPresented(at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
         }
+        // 이 커맨드 버퍼가 끝날 때까지 소스 텍스처를 붙잡는다 — 그 전에 풀이 재사용하면
+        // 읽는 중에 덮어쓰게 된다(프레임 중첩).
+        let presentTex = entry.texture
+        let presentingRef = presentingTextures
+        presentingRef.withLock { $0[ObjectIdentifier(presentTex)] = presentTex }
+        cb.addCompletedHandler { _ in
+            presentingRef.withLock { $0.removeValue(forKey: ObjectIdentifier(presentTex)) }
+        }
         // CAMetalDisplayLink의 드로어블은 targetPresentTimestamp 슬롯에 이미 바인딩 —
         // plain present가 곧 그 슬롯 표시 (예전 plain-present 실험과 달리 시각이 링크에 고정됨)
         cb.present(drawable)
@@ -2277,6 +2298,7 @@ public final class AppState {
         if let prev = prevStable { busy.insert(ObjectIdentifier(prev.texture)) }
         if let last = lastPresentedTexture { busy.insert(ObjectIdentifier(last)) }
         busy.formUnion(inFlightTextures.keys)
+        busy.formUnion(presentingTextures.withLock { Array($0.keys) })
 
         return stablePool.first { !busy.contains(ObjectIdentifier($0)) }
     }

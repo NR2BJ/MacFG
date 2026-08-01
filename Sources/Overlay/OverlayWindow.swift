@@ -377,7 +377,21 @@ public final class OverlayWindow: NSObject {
     }
 
     /// 뷰어 표시 시작 시 상대커서 진입 — 뷰어를 클릭투과로 만들고 커서를 소스에 상주.
+    /// 상대커서 킬 스위치. `defaults write com.macfg.MacFG s.norelptr -bool true` 로 끈다.
+    ///
+    /// 환경변수가 아니라 UserDefaults인 이유: Finder 더블클릭으로 켠 .app에는 환경변수가
+    /// 전달되지 않아, env 게이트는 실사용에서 **도달 불가능한 스위치**가 된다(이미 겪은 함정).
+    ///
+    /// 왜 필요한가: 마우스를 뷰어에 반복 진입/이탈시키면 앱이 SIGTRAP으로 죽는다(참조 카운트
+    /// 손상, 크래시 3건). 탭이 켜진 뒤 수십 초 안에 터지는 상관이 있으나 원인은 미확정이다.
+    /// 이 스위치는 **회피책이자 결정적 실험**이다 — 끄고도 죽으면 상대커서는 무죄다.
+    private static let relativePointerDisabled = UserDefaults.standard.bool(forKey: "s.norelptr")
+
     private func enterRelativePointer() {
+        guard !Self.relativePointerDisabled else {
+            DiagnosticLog.shared.log("[RELPTR] 비활성 (s.norelptr) — 상대커서 진입 생략")
+            return
+        }
         guard style == .viewer, !relativePointer.active else { return }
         window.ignoresMouseEvents = true            // 재게시 이벤트가 뷰어 통과 → 소스 도달
         // 소스를 키 창으로 — 비활성 창은 mouseMoved 로컬좌표가 붕괴해 호버가 죽음(실측 재확인).

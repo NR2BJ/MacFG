@@ -97,11 +97,27 @@ public final class AutoFlowScaler {
     /// 폐기가 **조금** 개선되므로 "하강이 유효했다"고 판정돼 다시 내려간다 — 자기강화 하강이다.
     /// 실측(4K/M4): 프레임은 120으로 멀쩡한데 flow만 1200→480까지 단조 하강했다.
     /// 그래서 폐기는 정말 심각할 때(생산의 1/5 이상을 버릴 때)만 미달 신호로 인정한다.
+    /// - deliveryRatio: **소스 프레임 중 실제로 파이프라인에 들어간 비율** (1 - 풀고갈 폐기율).
+    ///
+    /// deliveryRatio가 왜 필요한가 — 이게 없어서 제어기가 붕괴를 성공으로 읽었다.
+    /// 풀이 고갈되면 소스 프레임을 **cb1 인코딩 전에 통째로 버린다.** 그래도 타임라인엔
+    /// 이미 만든 프레임이 남아 있어 **틱은 주사율을 그대로 낸다.** keepRatio도 무사하다 —
+    /// 그건 "우리가 만든 보간 프레임" 중 살아남은 비율이라 애초에 만들지 못한 프레임은 안 센다.
+    /// 실측(2026-08-01, MetalFlow 4K): work 97~140ms · e2e 164~179ms · **소스의 40%가 파괴**되는
+    /// 붕괴 구간 내내 tick=144.0Hz, achieved=1.00 → 스케일러는 "여유"로 판정해 화질을 **올리려
+    /// 탐침**했다. r(poolMiss, work)=0.90이고 AppleFI도 같은 서명을 보이므로 엔진 문제가 아니라
+    /// 파이프라인 병리다. 소스 손실은 낭비가 아니라 **진짜 손실**이므로 그대로 달성도에 넣는다.
+    /// 다만 리사이즈 순간의 한 창짜리 튐으로 하강이 걸리지 않게 5% 문턱을 둔다.
+    ///
     /// (순수 함수 — feedLoadGovernor가 렌더 스레드에서 부르므로 nonisolated)
-    public nonisolated static func combinedAchieved(tickRatio: Double, keepRatio: Double) -> Double {
+    public nonisolated static func combinedAchieved(tickRatio: Double,
+                                                    keepRatio: Double,
+                                                    deliveryRatio: Double = 1.0) -> Double {
         let tick = max(0, min(1.0, tickRatio))
         let keep = max(0, min(1.0, keepRatio))
-        return keep < 0.80 ? min(tick, keep) : tick
+        let delivered = max(0, min(1.0, deliveryRatio))
+        let base = keep < 0.80 ? min(tick, keep) : tick
+        return delivered < 0.95 ? min(base, delivered) : base
     }
 
     /// "하강이 무효였으니 원복" 시 되돌아갈 칸. **max(ceilingIdx, idx)가 핵심**:

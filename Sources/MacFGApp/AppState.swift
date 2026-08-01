@@ -331,8 +331,14 @@ public final class AppState {
         // 자동 flow 스케일러 입력 — 달성도는 "틱이 주사율을 내는가"와 "낸 프레임을 지키는가" 중
         // 나쁜 쪽(둘 다 목표 프레임 미달의 증상). 엔진 GPU 비중이 근거로 함께 들어간다.
         let tickRatio = refresh > 0 && lastTickHz > 1 ? min(1.0, lastTickHz / refresh) : 1.0
+        // **소스 전달률** — 풀 고갈로 통째로 버린 소스 프레임까지 본다. 이게 없으면 붕괴 중에도
+        // 틱이 주사율을 내므로 제어기가 "여유"로 오판한다(실측: 소스 40% 파괴 중 achieved=1.00).
+        let srcSeen = diagSourceCount + diagPoolExhaustCount
+        let deliveryRatio = srcSeen > 8 ? 1.0 - Double(diagPoolExhaustCount) / Double(srcSeen) : 1.0
         // 합성 규칙과 그 근거는 AutoFlowScaler.combinedAchieved 참조 (단위 테스트로 고정돼 있다).
-        let achieved = AutoFlowScaler.combinedAchieved(tickRatio: tickRatio, keepRatio: pacePresentRatio)
+        let achieved = AutoFlowScaler.combinedAchieved(tickRatio: tickRatio,
+                                                       keepRatio: pacePresentRatio,
+                                                       deliveryRatio: deliveryRatio)
         let engineMs = engineGpuMsEMA
         let budgetMs = interval * 1000.0
         Task { @MainActor [weak self] in
@@ -2001,8 +2007,9 @@ public final class AppState {
                     self.stgCapIngest = 0; self.stgCb1Gpu = 0; self.stgCb2Gpu = 0; self.stgWork = 0; self.stgCount = 0
                     self.stageLock.unlock()
                     DiagnosticLog.shared.log(String(format:
-                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f work=%.1f (대기=%.1f) ms/frame (n=120)",
-                        ci, c1, c2, wk, max(0, wk - ci - c1 - c2)))
+                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f work=%.1f (대기=%.1f) chain=%.1f(%.2f×간격) ms/frame (n=120)",
+                        ci, c1, c2, wk, max(0, wk - ci - c1 - c2), c1 + c2,
+                        (c1 + c2) / max(1.0, self.sourceIntervalEMA * 1000.0)))
                 } else {
                     self.stageLock.unlock()
                 }
@@ -2380,7 +2387,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.

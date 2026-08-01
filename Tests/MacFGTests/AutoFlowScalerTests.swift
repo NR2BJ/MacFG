@@ -108,6 +108,24 @@ struct AutoFlowScalerTests {
                 "틱 자체가 모자라면 그건 진짜 배달 실패")
     }
 
+    /// **소스 프레임 손실은 달성도에 반드시 반영돼야 한다.**
+    /// 풀 고갈로 소스를 통째로 버려도 타임라인에 남은 프레임 덕에 틱은 주사율을 그대로 낸다.
+    /// keepRatio도 무사하다(만들지 못한 프레임은 안 세므로). 그래서 이 신호가 없으면 제어기가
+    /// 붕괴를 "여유"로 읽고 화질을 올리려 든다 — 실측된 실패 모드다.
+    @Test func sourceFrameLossCountsAsMissing() {
+        // 붕괴 실측 재현: 틱 100%, 폐기율 정상, 그런데 소스의 40%가 파괴됨
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 1.0, deliveryRatio: 0.60) == 0.60,
+                "소스 40% 손실이 달성도에 안 잡히면 스케일러가 붕괴 중에 화질을 올린다")
+        // 리사이즈 순간의 한 창짜리 튐으로 하강이 걸리면 안 된다
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 1.0, deliveryRatio: 0.97) == 1.0,
+                "소소한 손실은 무시")
+        // 기존 규칙은 그대로 — 인자를 안 주면 예전 동작
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 0.88) == 1.0)
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 1.0, keepRatio: 0.50) == 0.50)
+        // 셋 중 가장 나쁜 것이 이긴다
+        #expect(AutoFlowScaler.combinedAchieved(tickRatio: 0.70, keepRatio: 1.0, deliveryRatio: 0.50) == 0.50)
+    }
+
     /// **원복은 절대 아래로 가면 안 된다.** 천장이 현재 칸보다 낮은 상태(Pro/Max 시딩은 천장
     /// 위에서 출발한다)에서 옛 식 min(idx+2, ceilingIdx)는 현재보다 **아래**를 가리켜,
     /// "원복"이라 로그하면서 실제로는 화질을 더 깎았다.

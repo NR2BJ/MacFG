@@ -232,7 +232,13 @@ public final class OverlayWindow: NSObject {
             .paragraphStyle: para,
         ])
         label.isHidden = false
-        content.addSubview(label, positioned: .above, relativeTo: nil)   // 항상 최상단
+        // 이미 최상단이면 다시 넣지 않는다. 이 함수는 0.5초마다 불리는데, addSubview는
+        // 이미 붙어 있는 뷰라도 **레이어 트리를 재정렬**한다 — 4K 창에서 초당 두 번 컴포지터를
+        // 건드릴 이유가 없다. (렌더 런루프 점유가 vsync 콜백을 버리게 만드는 게 확인된 상황이라,
+        //  주기적이고 불필요한 컴포지터 작업은 지운다.)
+        if label.superview !== content || content.subviews.last !== label {
+            content.addSubview(label, positioned: .above, relativeTo: nil)   // 항상 최상단
+        }
     }
 
     /// 상대커서 모드 — 진짜 커서 위치를 소스로 재타깃 (호버/스크롤/클릭/드래그 전부 진짜 이벤트)

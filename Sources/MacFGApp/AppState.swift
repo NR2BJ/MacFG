@@ -1217,6 +1217,11 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var snapIntervalDeviateStreak = 0
     @ObservationIgnored nonisolated(unsafe) private var diagResyncCount = 0
     /// 케이던스 격자 이탈 관측치 — B1(버스트 창) 착수 여부를 실측으로 결정하기 위한 것.
+    /// 인제스트 소요 — 렌더 런루프를 점유해 링크 콜백을 버리게 만드는 후보 1순위.
+    @ObservationIgnored nonisolated(unsafe) private var diagIngestSum = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var diagIngestSamples = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagIngestMax = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var diagIngestOver = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSnapMissCount = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSnapPullableCount = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSnapPullLagMax: Double = 0
@@ -1400,14 +1405,16 @@ public final class AppState {
             if cpuMs > 8.0 { diagTickOverruns += 1 }
             diagPrevTickCPU = cpuMs
         }
-        // vsync 스킵 감지 (link.timestamp 간격 > 1.4슬롯) — 직전 틱 CPU가 낮은데 갭이면
-        // **우리 핸들러 밖**에서 콜백이 삼켜진 것이다.
-        // (예전 주석은 "다른 메인스레드 작업"이라고 단정했는데, 그건 전용 렌더 스레드 도입
-        //  이전의 설명이라 지금은 오해를 부른다. 실측 2026-08-01: 갭이 몰리는 창에서 우리 쪽
-        //  지표는 오히려 한가하다 — over=0, 틱 CPU 0.1~0.2ms, staleDrop/capDrop/poolMiss 모두 0,
-        //  GPU work도 평상시보다 낮다. 그런데 **SCK 프레임 전달까지 동시에 굶는다**
-        //  (106 → 77회/s). 서로 독립적인 두 WindowServer 스트림이 같이 마르므로 외란은
-        //  프로세스 밖에 있다. 아래 mouse= 카운터가 그게 포인터 때문인지 가른다.)
+        // vsync 스킵 감지 (link.timestamp 간격 > 1.4슬롯) — 콜백이 버려진 횟수.
+        //
+        // **"우리 핸들러 밖" ≠ "프로세스 밖".** 이 구분을 두 번 틀렸다.
+        // cpu=/over=는 onDisplayLinkTick **안**만 잰다. 그런데 캡처 인제스트(drainAndIngest)는
+        // performAsync로 **같은 런루프**에 올라가므로 이 카운터들에서 통째로 빠진다. 즉
+        // "틱 CPU가 낮은데 갭이 있다"는 관측은 외란을 가리키는 게 아니라, **재지 않은 구간이
+        // 있다**는 뜻이었다. 링크는 큐잉을 안 해서 늦은 콜백은 버려지고, 그래서 갭은 언제나
+        // "CPU 비용 0"으로 보인다 — 자기 원인을 숨기는 지표다.
+        // 실측(2026-08-01, 609창): r(gap, capIngest) = +0.729, 다른 후보는 전부 |r| < 0.4.
+        // 아래 ing= 카운터가 그 구간을 직접 잰다.
         if diagLastTickTs > 0 {
             let dt = timestamp - diagLastTickTs
             if dt > 1.4 / max(mirrorRefreshRate, 60) {
@@ -1523,6 +1530,22 @@ public final class AppState {
     /// 인코딩 CPU가 한 번에 8ms를 넘겨 다음 vsync 콜백을 삼키는 것을 막는다. 나머지는
     /// pendingIngest에 남아 다음 호출로 이월 (타임스탬프 보존, 표시는 latencyOffset 뒤라 무해).
     nonisolated private func drainAndIngest(maxCount: Int) {
+        // **인제스트 시간을 잰다 — 지금까지 아무도 안 쟀던 구간.**
+        // CAMetalDisplayLink는 렌더 스레드 런루프의 소스이고, 이 인제스트는 performAsync로
+        // **같은 런루프**에 올라간다. 링크는 큐잉을 하지 않아서, 다음 vsync 전에 서비스되지
+        // 못한 콜백은 **버려진다 — 핸들러 CPU 비용 0으로.** 그게 로그의 gap이다.
+        // 그런데 cpu=/over=는 틱 핸들러 안만 재므로 이 구간이 통째로 빠져 있었고, 그 탓에
+        // "우리는 한가한데 콜백이 사라진다 → 외란은 프로세스 밖"이라는 **틀린 결론**이 나왔다.
+        // 실측 상관: r(gap, capIngest) = +0.729 (다른 후보는 전부 |r| < 0.4).
+        let ingestT0 = CACurrentMediaTime()
+        defer {
+            let ms = (CACurrentMediaTime() - ingestT0) * 1000.0
+            diagIngestSum += ms
+            diagIngestSamples += 1
+            if ms > diagIngestMax { diagIngestMax = ms }
+            // 한 슬롯(vsync 간격)을 넘게 잡으면 그 사이 링크 콜백이 버려질 수 있다.
+            if ms > 1000.0 / max(mirrorRefreshRate, 60) { diagIngestOver += 1 }
+        }
         pendingIngest.append(contentsOf: captureManager.drainFrames().filter { $0.texture != nil })
         let n = min(pendingIngest.count, maxCount)
         guard n > 0 else { return }
@@ -2240,7 +2263,10 @@ public final class AppState {
         diagLastLogWall = nowWall
         let tickCPUAvg = diagTickCPUSum / 240.0
         let pointerEvents = PointerTapStats.drain()
-        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) mouse=%llu", tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax, pointerEvents)
+        let ingAvg = diagIngestSamples > 0 ? diagIngestSum / Double(diagIngestSamples) : 0
+        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) mouse=%llu ing=%.2f/%.1fms ingOver=%d",
+                               tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax,
+                               pointerEvents, ingAvg, diagIngestMax, diagIngestOver)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
         // 콘텐츠 간격 통계 (wobble 지표)
@@ -2325,6 +2351,7 @@ public final class AppState {
 
         diagResyncCount = 0
         diagSnapMissCount = 0; diagSnapPullableCount = 0; diagSnapPullLagMax = 0
+        diagIngestSum = 0; diagIngestSamples = 0; diagIngestMax = 0; diagIngestOver = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
         diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0

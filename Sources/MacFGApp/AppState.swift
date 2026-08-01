@@ -1401,7 +1401,13 @@ public final class AppState {
             diagPrevTickCPU = cpuMs
         }
         // vsync 스킵 감지 (link.timestamp 간격 > 1.4슬롯) — 직전 틱 CPU가 낮은데 갭이면
-        // 핸들러 밖(다른 메인스레드 작업)이 콜백을 삼킨 것
+        // **우리 핸들러 밖**에서 콜백이 삼켜진 것이다.
+        // (예전 주석은 "다른 메인스레드 작업"이라고 단정했는데, 그건 전용 렌더 스레드 도입
+        //  이전의 설명이라 지금은 오해를 부른다. 실측 2026-08-01: 갭이 몰리는 창에서 우리 쪽
+        //  지표는 오히려 한가하다 — over=0, 틱 CPU 0.1~0.2ms, staleDrop/capDrop/poolMiss 모두 0,
+        //  GPU work도 평상시보다 낮다. 그런데 **SCK 프레임 전달까지 동시에 굶는다**
+        //  (106 → 77회/s). 서로 독립적인 두 WindowServer 스트림이 같이 마르므로 외란은
+        //  프로세스 밖에 있다. 아래 mouse= 카운터가 그게 포인터 때문인지 가른다.)
         if diagLastTickTs > 0 {
             let dt = timestamp - diagLastTickTs
             if dt > 1.4 / max(mirrorRefreshRate, 60) {
@@ -1443,6 +1449,12 @@ public final class AppState {
         }
         statsLock.lock()
         for record in presented {
+            // **표시되지 못한 드로어블은 presentedTime이 0이다.** 그 0을 그대로 버퍼에 넣으면
+            // 인덱스 0에 앉아 `last - first`가 머신 부팅 이후 시간(수십만 초)이 되고,
+            // count·구간 길이 가드를 **둘 다 통과**한 채 fps가 0.0007 → 반올림 0으로 표시된다.
+            // 실제로는 120fps로 잘 돌고 있는데 오버레이에 0 fps가 뜨던 잔여 원인(사용자 제보).
+            // 버퍼 중간에 섞이면 반대로 count만 늘려 fps를 부풀린다. 아예 받지 않는다.
+            guard record.presentedAt > 0 else { continue }
             performanceMonitor.recordRenderTime()
             presentedTimes.append(record.presentedAt)
             if presentedTimes.count > 240 { presentedTimes.removeFirst(120) }
@@ -2227,7 +2239,8 @@ public final class AppState {
         lastTickHz = tickHz   // 거버너 신호용 (다음 창에서 읽음)
         diagLastLogWall = nowWall
         let tickCPUAvg = diagTickCPUSum / 240.0
-        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f)", tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax)
+        let pointerEvents = PointerTapStats.drain()
+        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) mouse=%llu", tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax, pointerEvents)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
         // 콘텐츠 간격 통계 (wobble 지표)

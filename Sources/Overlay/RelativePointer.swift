@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Monitoring
+import os
 
 /// 상대커서 모드 — 진짜(네이티브) 커서를 그대로 포인터로 쓰고, 마우스 이벤트만 소스 좌표로
 /// 재타깃해 뷰어 아래 소스가 호버·스크롤·클릭·드래그를 받게 한다.
@@ -26,6 +27,11 @@ final class RelativePointer {
     private let geoLock = NSLock()
     private var geo = Geometry()
     func setGeometry(_ g: Geometry) { geoLock.lock(); geo = g; geoLock.unlock() }
+
+    /// 탭이 시스템에 의해 꺼졌을 때 — 타임아웃은 우리 콜백이 늦었다는 뜻이라 반드시 남긴다.
+    fileprivate func noteTapDisabled(timeout: Bool) {
+        DiagnosticLog.shared.log("[RELPTR] ⚠︎ 탭이 시스템에 의해 비활성 (\(timeout ? "타임아웃 — 콜백 지연" : "사용자 입력")) — 재활성")
+    }
 
     private(set) var active = false
     private var tap: CFMachPort?
@@ -158,6 +164,7 @@ final class RelativePointer {
     // MARK: - 탭 처리 (탭 스레드)
 
     fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        PointerTapStats.bump()
         geoLock.lock(); let g = geo; geoLock.unlock()
         let loc = event.location
         let screen = CGDisplayBounds(g.displayID)
@@ -228,8 +235,26 @@ private func relativePointerTapCallback(proxy: CGEventTapProxy, type: CGEventTyp
     guard let refcon else { return Unmanaged.passUnretained(event) }
     let instance = Unmanaged<RelativePointer>.fromOpaque(refcon).takeUnretainedValue()
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        // 조용히 되살리기만 하면 "탭이 타임아웃된 적 없다"가 검증 불가능한 주장이 된다.
+        // 타임아웃은 우리 콜백이 늦었다는 뜻이라 페이싱 조사에서 반드시 알아야 한다.
+        instance.noteTapDisabled(timeout: type == .tapDisabledByTimeout)
         instance.reenableTap()
         return Unmanaged.passUnretained(event)
     }
     return instance.handle(type: type, event: event)
+}
+
+/// 포인터 탭 활동 카운터 — **포인터를 관측 가능하게 만드는 유일한 신호.**
+///
+/// 지금까지 앱에는 포인터 계측이 전혀 없어서 "마우스를 뷰어에 올리면 끊긴다"를 검증할 방법이
+/// 없었다. [SCHED]의 `gap`(= 삼켜진 vsync 콜백)과 나란히 찍는다:
+///   · mouse와 gap이 같이 움직이면 → 포인터가 원인 (창 구성/컴포지팅 쪽을 본다)
+///   · mouse=0인데 gap이 터지면   → 포인터는 무죄, 외란은 다른 곳
+/// 정적으로 두는 이유: 이 값을 읽는 곳이 렌더 스레드(nonisolated)라 MainActor에 격리된
+/// 오버레이 객체 그래프를 타고 갈 수 없다. 인스턴스는 어차피 하나뿐이다.
+public enum PointerTapStats {
+    nonisolated(unsafe) private static let counter = OSAllocatedUnfairLock(initialState: UInt64(0))
+    static func bump() { counter.withLock { $0 &+= 1 } }
+    /// 창마다 비우며 읽는다.
+    public static func drain() -> UInt64 { counter.withLock { let n = $0; $0 = 0; return n } }
 }

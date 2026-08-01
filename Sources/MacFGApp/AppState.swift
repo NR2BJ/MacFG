@@ -1145,7 +1145,7 @@ public final class AppState {
     nonisolated private func resetScheduler() {
         uiDetector?.reset()   // 불연속(재시작/리사이즈) — 정지-UI 누적도 리셋
         timeline = []
-        inFlightTextures = []
+        inFlightTextures = [:]
         stablePool = []
         stablePoolWidth = 0
         stablePoolHeight = 0
@@ -1183,7 +1183,7 @@ public final class AppState {
     /// 케이던스(스냅 링/EMA/타임스탬프)는 유지한다. 전체 리셋의 ~16프레임 재락을 회피.
     nonisolated private func softResetForResize() {
         timeline = []
-        inFlightTextures = []
+        inFlightTextures = [:]
         stablePool = []
         stablePoolWidth = 0
         stablePoolHeight = 0
@@ -1202,7 +1202,18 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var stablePool: [any MTLTexture] = []
     @ObservationIgnored nonisolated(unsafe) private var stablePoolWidth = 0
     @ObservationIgnored nonisolated(unsafe) private var stablePoolHeight = 0
-    @ObservationIgnored nonisolated(unsafe) private var inFlightTextures: Set<ObjectIdentifier> = []
+    /// 표시 파이프라인에 떠 있는 스테일 텍스처 — **참조를 붙잡는다.**
+    ///
+    /// 예전엔 `Set<ObjectIdentifier>`였다. 식별자만 들고 있으면 텍스처를 살려두지 못한다:
+    /// 이 텍스처들을 붙잡는 건 stablePool뿐인데, 소스 크기가 바뀌면 acquireStableTexture가
+    /// `stablePool = []`로 8장을 통째로 놓는다. 그러면 timeline/prevStable에 걸리지 않은
+    /// **인플라이트 텍스처가 GPU가 아직 읽는 중에 해제된다** — GPU 측 use-after-free다.
+    /// 힙이 깨지면 트랩은 엉뚱한 곳에서 난다. 실측 크래시 4건이 전부
+    /// `acquireStableTexture → first(where:) → swift_unknownObjectRetain`인 이유가 이것이다
+    /// (방금 깨진 그 풀을 바로 다음에 순회하니까). 마우스 진입/이탈이 트리거인 것도
+    /// 소스 재활성 → 창 레이아웃 변경 → 캡처 크기 변경 → 풀 재생성 경로로 설명된다.
+    /// 죽은 주소의 ObjectIdentifier가 남아 나중 텍스처와 충돌하던 문제도 함께 사라진다.
+    @ObservationIgnored nonisolated(unsafe) private var inFlightTextures: [ObjectIdentifier: any MTLTexture] = [:]
     // stable 준비 이벤트 — blit(cb1) 완료를 GPU 이벤트로 알림. RIFE pack(별도 큐)이 이걸
     // 기다려 '아직 안 쓰인 stableB를 읽는' 크로스큐 레이스를 차단 (인앱 flow 폭주의 원인).
     @ObservationIgnored nonisolated(unsafe) private var stableReadyEvent: (any MTLSharedEvent)?
@@ -1457,7 +1468,7 @@ public final class AppState {
         // 보간·present는 생략한다 (사용자가 다른 앱으로 전환한 목적이 GPU 확보이므로).
         if overlayHiddenState {
             let (_, released, _) = mailbox.drain()
-            for id in released { inFlightTextures.remove(id) }
+            for id in released { inFlightTextures.removeValue(forKey: id) }
             _ = captureManager.drainFrames()   // 파이프 적체 방지 (텍스처는 풀로 회수)
             pendingIngest = []
             return
@@ -1465,7 +1476,7 @@ public final class AppState {
 
         // 1) 완료된 GPU 작업 수거 → 타임라인 등재
         let (newEntries, released, presented) = mailbox.drain()
-        for id in released { inFlightTextures.remove(id) }
+        for id in released { inFlightTextures.removeValue(forKey: id) }
         if !newEntries.isEmpty {
             timeline.append(contentsOf: newEntries)
             timeline.sort { $0.timestamp < $1.timestamp }
@@ -1924,7 +1935,7 @@ public final class AppState {
         // 이 cb2가 기다리므로 cb2 완료 시 반납이 안전.
         let releasePrevID = prevStable.map { ObjectIdentifier($0.texture) }
         prevStable = (stable, snappedTs, slot.timestamp)
-        inFlightTextures.insert(ObjectIdentifier(stable))
+        inFlightTextures[ObjectIdentifier(stable)] = stable
 
         let entryTs = snappedTs
         let mailboxRef = mailbox
@@ -2265,7 +2276,7 @@ public final class AppState {
         for entry in timeline { busy.insert(ObjectIdentifier(entry.texture)) }
         if let prev = prevStable { busy.insert(ObjectIdentifier(prev.texture)) }
         if let last = lastPresentedTexture { busy.insert(ObjectIdentifier(last)) }
-        busy.formUnion(inFlightTextures)
+        busy.formUnion(inFlightTextures.keys)
 
         return stablePool.first { !busy.contains(ObjectIdentifier($0)) }
     }

@@ -828,7 +828,27 @@ public final class AppState {
             // 워밍업 포함 깨끗한 상태로 리셋 — 안 하면 첫 틱이 오래된 프레임을 버스트로
             // 먹고 그 miss로 적응 지연이 +4까지 불필요하게 램프 (리뷰 지적, 로그 확인).
             _ = captureManager.drainFrames()
-            resetScheduler()
+            // **resetScheduler는 렌더 스레드에서 돌려야 한다 — 메인에서 직접 부르면 크래시난다.**
+            // 이 함수는 timeline · inFlightTextures · stablePool · prevStable ·
+            // lastPresentedTexture를 통째로 비운다. 전부 렌더 스레드가 매 프레임 읽고 쓰는
+            // 구조다. 캡처 시작은 마우스 이탈 시 소스 재활성(OverlayWindow의 activate) →
+            // 전체화면 재타깃 → 재시작 경로로도 들어오므로, 렌더 스레드가 살아 있는 채로
+            // 여기 도달할 수 있다. 그때 배열 버퍼가 통째로 교체되면 순회 중이던 렌더 스레드가
+            // 죽은 참조를 retain해 **SIGTRAP**으로 죽는다.
+            // 실측 크래시 2건(2026-08-01, 마우스 반복 진입/이탈 중):
+            //   ① MacFG.Render: acquireStableTexture → Sequence.first(where:) →
+            //      Array.subscript → swift_unknownObjectRetain
+            //   ② SCK 전달 큐: outlined consume of FrameSlot? → swift_unknownObjectRelease
+            //      (①이 힙을 깨뜨린 뒤 엉뚱한 곳에서 표출된 것)
+            // 코드베이스는 이미 올바른 규약을 갖고 있다 — 다른 두 호출부는 renderDriver.perform
+            // 안에서 부르거나(:1011) 렌더 틱 자신이 부른다(pendingShowReset 경로). 여기만 예외였다.
+            // 드라이버가 안 돌 때는 이 구조를 만지는 스레드가 우리뿐이라 직접 호출이 안전하다
+            // (perform은 런루프가 죽어 있으면 조용한 no-op이라 리셋이 통째로 유실된다).
+            if renderDriver.isRunning {
+                renderDriver.perform { [weak self] in self?.resetScheduler() }
+            } else {
+                resetScheduler()
+            }
             // 거버너/스케일러 시딩은 소스 해상도를 아는 첫 프레임 시점(acquireStableTexture)에서
             // 한다 — 여기선 stablePool이 아직 없어 크기가 0이라 "4K 무거움" 판정이 불가능하다.
             loadGovernor.reset()

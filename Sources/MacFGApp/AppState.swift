@@ -134,7 +134,9 @@ public final class AppState {
     // 앱 설정 (엔진 무관) — 각 update*가 자체 영속. UI 언어는 관찰되어 변경 시 뷰 재구성→L() 재평가.
     var uiLanguage: String = UserDefaults.standard.string(forKey: "s.lang") ?? "system"
     var devLoggingEnabled: Bool = UserDefaults.standard.bool(forKey: "s.devlog")
-    var menuBarOnly: Bool = UserDefaults.standard.bool(forKey: "s.menubaronly")
+    /// 메뉴바 전용(Dock 아이콘 없음). **기본 true** — 저장된 값이 없을 때 false로 떨어지면
+    /// 첫 실행이 일반 앱으로 뜬다(UserDefaults.bool은 미설정 시 false).
+    var menuBarOnly: Bool = UserDefaults.standard.object(forKey: "s.menubaronly") as? Bool ?? true
     // 기본 엔진 = Metal Flow: 24/30/60fps 전 매트릭스에서 우위 실측
     // (144Hz 기준 — 24fps: 144fps/σ0.8 vs AppleFI 48fps/σ9; 지터 강건성 동급 이상)
     var selectedRenderMode: RenderMode = .metalFlow
@@ -683,8 +685,20 @@ public final class AppState {
     /// `--auto-capture-title <substr> [--auto-mode <mode>] [--auto-placement <cover|beside>]`
     func processAutoStartArguments() async {
         let args = ProcessInfo.processInfo.arguments
-        guard let idx = args.firstIndex(of: "--auto-capture-title"), idx + 1 < args.count else { return }
-        let titleSub = args[idx + 1].lowercased()
+        // 제목은 CLI 인자 우선, 없으면 **UserDefaults**(`s.autocapturetitle`)에서 읽는다.
+        // env/CLI만 지원하면 Finder 더블클릭으로 켠 앱에선 도달할 수 없다 — 그런데 셸에서
+        // 인자를 주며 띄우면 macOS 26이 그 셸을 메뉴바 항목의 소유자로 기록해 허용 목록이
+        // 오염된다(2026-07-25에 하루를 쓴 그 문제). defaults 키면 둘 다 피한다.
+        //   defaults write com.macfg.MacFG s.autocapturetitle "치지직"
+        //   defaults delete com.macfg.MacFG s.autocapturetitle     ← 끄기
+        let cliTitle: String? = {
+            guard let idx = args.firstIndex(of: "--auto-capture-title"), idx + 1 < args.count else { return nil }
+            return args[idx + 1]
+        }()
+        let storedTitle = UserDefaults.standard.string(forKey: "s.autocapturetitle")
+        guard let rawTitle = cliTitle ?? storedTitle, !rawTitle.isEmpty else { return }
+        let titleSub = rawTitle.lowercased()
+        if cliTitle == nil { DiagnosticLog.shared.log("[AUTO] 저장된 자동 캡처 제목 '\(rawTitle)'") }
 
         if let mIdx = args.firstIndex(of: "--auto-mode"), mIdx + 1 < args.count,
            let mode = RenderMode(rawValue: args[mIdx + 1]) {

@@ -40,6 +40,10 @@ public final class LoadGovernor {
     private let enabled: Bool
 
     private var badWindows = 0
+    /// 복귀 탐침 실패 기억 — 실패할수록 재시도를 드물게 (1,2,4,8배).
+    private var probeBackoff = 1
+    private var lastProbeTarget: Level?
+    private var lastProbeAt: CFAbsoluteTime = 0
     private var goodWindows = 0
     private var lastChangeAt: CFAbsoluteTime = 0
 
@@ -114,7 +118,19 @@ public final class LoadGovernor {
         let computeOverloaded = s.predictP90Ms >= budget * 0.85 || s.slotExhaustFrac >= 0.5
         let shortfall = s.presentRatio < 0.85 && (!hasComputeSignal || computeOverloaded)
 
-        if shortfall || tickStarved {
+        // **바이패스(보간 완전 정지)는 진짜 배달 실패일 때만.**
+        // presentRatio는 폐기율 기반인데, 폐기(staleDrop)는 배달 실패가 아니라 **필요보다 많이
+        // 만들어 늦은 걸 버린 낭비**다. 지터가 큰 스트리밍 소스(srcInt 8~32ms)는 갭이 벌어질 때
+        // t를 여러 개 만들고 다음 프레임이 일찍 오면 그중 절반이 폐기돼, 우리가 한가한데도
+        // ratio가 58%로 읽힌다. 그 신호로 바이패스까지 가면 **앱의 존재 이유가 꺼진다.**
+        // 게다가 바이패스에선 보간을 안 만드니 폐기도 0 → "처리량 100% 회복" → 복귀 →
+        // 다시 58% → 바이패스가 무한 반복된다(실측 2026-08-05, MetalFlow/4K: 3→2→3→2,
+        // 18초 주기, 그 사이 내내 interpEnc=0 · 화면은 소스 그대로).
+        // 틱 굶주림은 실제로 화면에 프레임을 못 내고 있다는 뜻이라 그건 그대로 인정한다.
+        let goingToBypass = level.rawValue + 1 >= Level.bypass.rawValue
+        let overloaded = (shortfall && !goingToBypass) || tickStarved
+
+        if overloaded {
             badWindows += 1
             goodWindows = 0
         } else if s.presentRatio >= 0.97 && !tickStarved {
@@ -141,14 +157,26 @@ public final class LoadGovernor {
         let now = CFAbsoluteTimeGetCurrent()
         // 강등은 2창(≈4s) 연속이면 즉시 — 붕괴 중엔 빨리 손을 써야 한다
         if badWindows >= 2, level < .bypass, now - lastChangeAt > 3.0 {
+            // 복귀 탐침 30초 이내에 그 자리에서 깨지면 실패로 기록 — 재탐침을 드물게 한다.
+            if lastProbeTarget == level, now - lastProbeAt < 30 {
+                probeBackoff = min(probeBackoff * 2, 8)
+            } else {
+                probeBackoff = 1
+            }
             let next = Level(rawValue: level.rawValue + 1) ?? .bypass
             apply(next, reason: String(format: "처리량 %.0f%% (work %.0fms)%@", s.presentRatio * 100, s.workAvgMs, tickStarved ? " + 틱 굶주림" : ""), at: now)
             badWindows = 0
         }
-        // 복귀는 5창(≈10s) 연속 여유일 때 한 단계씩 — 천천히 (플래핑 방지)
-        else if goodWindows >= 5, level > .full, now - lastChangeAt > 8.0 {
+        // 복귀는 5창(≈10s) 연속 여유일 때 한 단계씩 — 천천히 (플래핑 방지).
+        // **실패한 탐침은 기억한다.** 복귀 직후 같은 자리에서 다시 강등되면 재탐침 간격을
+        // 배로 늘린다. 이게 없으면 강등 4s + 복귀 10s의 고정 주기로 영원히 오르내리고,
+        // 전환마다 엔진 재설정으로 프레임이 끊긴다(실측: 18초 주기 발진).
+        else if goodWindows >= 5 * probeBackoff, level > .full, now - lastChangeAt > 8.0 * Double(probeBackoff) {
             let next = Level(rawValue: level.rawValue - 1) ?? .full
-            apply(next, reason: String(format: "처리량 회복 %.0f%%", s.presentRatio * 100), at: now)
+            lastProbeTarget = next
+            lastProbeAt = now
+            apply(next, reason: String(format: "처리량 회복 %.0f%% (탐침%@)", s.presentRatio * 100,
+                                       probeBackoff > 1 ? " ×\(probeBackoff) 대기" : ""), at: now)
             goodWindows = 0
         }
     }

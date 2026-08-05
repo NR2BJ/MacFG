@@ -43,7 +43,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 메뉴바 전용 — Dock 아이콘·⌘Tab 제거. 창 없이 상주하므로 닫기로 종료되지 않는다.
-        NSApplication.shared.setActivationPolicy(.accessory)
+        // 활성화 정책은 **설정값을 따른다** — 예전엔 .accessory로 하드코딩돼 있어서
+        // menuBarOnly 설정이 로드·저장은 되는데 실제로 적용되는 곳이 없는 죽은 상태였다.
+        // (기본값은 true라 기존 동작 그대로 메뉴바 전용이다.)
+        // 부수 효과: false로 두면 Dock에 뜨는 일반 앱이 되어 자동화 도구가 창을 인식한다 —
+        // LSUIElement 앱은 그 열거에 안 잡혀 화면 캡처에서 통째로 필터링된다.
+        appState.updateMenuBarOnly()
         setUpStatusItem()
 
         // 접근성 권한 (마우스 역매핑용) — 없으면 프롬프트

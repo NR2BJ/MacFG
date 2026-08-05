@@ -38,7 +38,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 빠져 있어 벤치에서 flow 해상도를 고정 비교할 수 없었다(실측 시도가 전부 같은 값으로 돌았다).
     /// 실사용에선 AutoFlowScaler/거버너가 이 값을 덮어쓴다.
     public nonisolated(unsafe) static var flowBaseLongSide: Double = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFFLOWBASE"], let v = Double(s), v >= 240 { return v }
+        if let s = Knob.string("MACFG_MFFLOWBASE"), let v = Double(s), v >= 240 { return v }
         return 1440
     }()
 
@@ -49,19 +49,19 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 서브픽셀 정련을 적용할 최종 레벨 수 (기본 1 = 최종 레벨만). 늘리면 상위 레벨의 정수 반올림
     /// 오차를 더 이른 단계에서 줄여 하위 전파가 정확해질 수 있다(비용: 레벨당 4 gather).
     public nonisolated(unsafe) static var refineLevels: Int = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFREFINE"], let v = Int(s), (1...7).contains(v) { return v }
+        if let s = Knob.string("MACFG_MFREFINE"), let v = Int(s), (1...7).contains(v) { return v }
         return 1
     }()
 
     /// 하위(정련) 레벨 탐색 반경 (기본 1). prior가 빗나갔을 때 각 레벨이 되잡을 수 있는 폭.
     public nonisolated(unsafe) static var fineSearchRadius: Int32 = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFFINE"], let v = Int32(s), (1...3).contains(v) { return v }
+        if let s = Knob.string("MACFG_MFFINE"), let v = Int32(s), (1...3).contains(v) { return v }
         return 1
     }()
 
     /// 평활 페널티 계수 (기본 0.017). 크면 prior에서 안 움직이려 하고(안정), 작으면 잘 따라감(디테일).
     public nonisolated(unsafe) static var matchPenalty: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFPENALTY"], let v = Float(s), v >= 0, v <= 0.2 { return v }
+        if let s = Knob.string("MACFG_MFPENALTY"), let v = Float(s), v >= 0, v <= 0.2 { return v }
         return 0.017
     }()
 
@@ -69,11 +69,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 이 게이트가 닫히면(conf≈0) 워프 대신 폴백으로 빠져 **flow 계산이 결과에 반영되지 않는다**.
     /// 빠른 콘텐츠에서 순환 오차가 hi를 넘으면 화면 대부분이 폴백이 되므로 실측으로 잡아야 한다.
     public nonisolated(unsafe) static var confLo: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFCYCLO"], let v = Float(s), v >= 0 { return v }
+        if let s = Knob.string("MACFG_MFCYCLO"), let v = Float(s), v >= 0 { return v }
         return 2.5
     }()
     public nonisolated(unsafe) static var confHi: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFCYCHI"], let v = Float(s), v > 0 { return v }
+        if let s = Knob.string("MACFG_MFCYCHI"), let v = Float(s), v > 0 { return v }
         return 8.0
     }()
 
@@ -81,7 +81,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 같은 3px 순환 오차라도 50px 모션에선 정상, 2px 모션에선 쓰레기다 — 절대 문턱 하나로는
     /// 빠른 콘텐츠(과도하게 폐기)와 느린 콘텐츠(엉터리 flow 통과)를 동시에 맞출 수 없다.
     public nonisolated(unsafe) static var confRel: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFCYCREL"], let v = Float(s), v >= 0 { return v }
+        if let s = Knob.string("MACFG_MFCYCREL"), let v = Float(s), v >= 0 { return v }
         return 0.3   // 실측 최적 (전 7세트: avg +0.141 / 빠른셋 +0.197 / 최악값 평균 +0.051)
     }()
 
@@ -89,7 +89,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 그 워프는 쓸 만한데 기존엔 순방향 신뢰도만 봐서 통째로 폴백(=blend)으로 버렸다.
     /// dirBlend(방향별 tBlend)와 분리한 축 — 그쪽은 반복패턴 aliasing 리스크가 있어 따로 다룬다.
     public nonisolated(unsafe) static var confMax: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFCONFMAX"], let v = Float(s), v >= 0, v <= 1 { return v }
+        if let s = Knob.string("MACFG_MFCONFMAX"), let v = Float(s), v >= 0, v <= 1 { return v }
         return 0.5   // 실측 최적 (전 7세트 avg +0.121 / 빠른셋 +0.150 / 최악값 +0.016).
                      // 1.0(완전 max)은 이득이 더 작고 최악값을 깎는다 — 한 방향만 확신할 때
                      // 그걸 100% 신뢰하면 틀릴 때 크게 틀리기 때문. 절반 결합이 안전점.
@@ -97,18 +97,18 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     /// 신뢰도 곡선 감마 (1 = 선형). <1이면 중간 신뢰도에서 워프 비중↑(폴백=blend 의존↓).
     public nonisolated(unsafe) static var confGamma: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFCONFGAMMA"], let v = Float(s), v > 0 { return v }
+        if let s = Knob.string("MACFG_MFCONFGAMMA"), let v = Float(s), v > 0 { return v }
         return 1.0
     }()
 
     /// 광도 검증 문턱 (기본 0.04~0.14) — flow를 따라간 곳의 밝기 차로 그 방향을 기각하는 2차 방어선.
     /// 압축 노이즈가 큰 스트리밍에선 정상 워프까지 기각할 수 있어 실측 대상.
     public nonisolated(unsafe) static var photoLo: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFPHOTOLO"], let v = Float(s), v >= 0 { return v }
+        if let s = Knob.string("MACFG_MFPHOTOLO"), let v = Float(s), v >= 0 { return v }
         return 0.04
     }()
     public nonisolated(unsafe) static var photoHi: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFPHOTOHI"], let v = Float(s), v > 0 { return v }
+        if let s = Knob.string("MACFG_MFPHOTOHI"), let v = Float(s), v > 0 { return v }
         return 0.14
     }()
     /// 정적 판정 문턱 — 조이면 정적 판정이 **줄어**(움직이는 걸 덜 고정), 느슨하면 늘어난다.
@@ -127,17 +127,17 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// (흔들림은 **주변 움직임이 정지 요소의 flow를 오염시킬 때** 생긴다 — 정지 영역이 움직임과
     ///  떨어져 있으면 그곳 flow는 0이라 워프해도 원본과 같다.)
     public nonisolated(unsafe) static var staticLo: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFSTATLO"], let v = Float(s), v >= 0 { return v }
+        if let s = Knob.string("MACFG_MFSTATLO"), let v = Float(s), v >= 0 { return v }
         return 0.008
     }()
     public nonisolated(unsafe) static var staticHi: Float = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFSTATHI"], let v = Float(s), v > 0 { return v }
+        if let s = Knob.string("MACFG_MFSTATHI"), let v = Float(s), v > 0 { return v }
         return 0.04
     }()
 
     /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.
     public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
-        if let s = ProcessInfo.processInfo.environment["MACFG_MFRADIUS"], let v = Int32(s), (1...8).contains(v) { return v }
+        if let s = Knob.string("MACFG_MFRADIUS"), let v = Int32(s), (1...8).contains(v) { return v }
         return 3
     }()
 
@@ -185,7 +185,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 직전 쌍의 tsB — 이번 tsA와 같으면 A쪽 피라미드를 재사용할 수 있다 (O1-2 핑퐁)
     private var lastPairTsB: CFTimeInterval = 0
     /// A쪽 재사용 허용 (MACFG_NOREUSEA=1로 끄고 A/B 비교)
-    private let reuseA = ProcessInfo.processInfo.environment["MACFG_NOREUSEA"] != "1"
+    private let reuseA = Knob.string("MACFG_NOREUSEA") != "1"
     // 출력 링: 갭 채움으로 쌍당 최대 4장 → 넉넉히 12 (타임라인 cap 12와 정합)
     private var outputPool: [any MTLTexture] = []
     private var outputIndex = 0

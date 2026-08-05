@@ -68,9 +68,8 @@ public final class AutoFlowScaler {
     public var nowProvider: () -> CFAbsoluteTime = { CFAbsoluteTimeGetCurrent() }
 
     public init() {
-        let env = ProcessInfo.processInfo.environment
-        enabled = env["MACFG_AUTOFLOW"] != "0"
-        debug = env["MACFG_AUTOFLOW_DEBUG"] == "1"
+        enabled = Knob.string("MACFG_AUTOFLOW") != "0"
+        debug = Knob.string("MACFG_AUTOFLOW_DEBUG") == "1"
     }
 
     /// 기기 등급으로 시작점 시딩 — 수렴을 몇 창 앞당길 뿐, 정착값은 실측이 정한다.

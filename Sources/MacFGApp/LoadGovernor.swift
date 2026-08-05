@@ -48,9 +48,8 @@ public final class LoadGovernor {
     private var lastChangeAt: CFAbsoluteTime = 0
 
     public init() {
-        let env = ProcessInfo.processInfo.environment
-        enabled = env["MACFG_GOV"] != "0"
-        forced = env["MACFG_GOV_FORCE"].flatMap { Int($0) }.flatMap { Level(rawValue: $0) }
+        enabled = Knob.string("MACFG_GOV") != "0"
+        forced = Knob.string("MACFG_GOV_FORCE").flatMap { Int($0) }.flatMap { Level(rawValue: $0) }
         if let forced {
             level = forced
             lastReason = "강제(MACFG_GOV_FORCE=\(forced.rawValue))"
@@ -150,7 +149,7 @@ public final class LoadGovernor {
             goodWindows = 0
         }
 
-        if ProcessInfo.processInfo.environment["MACFG_GOV_DEBUG"] == "1" {
+        if Knob.string("MACFG_GOV_DEBUG") == "1" {
             DiagnosticLog.shared.log(String(format: "[GOV?] L%d ratio=%.2f work=%.1f tick=%.0f/%.0f miss=%d good=%d bad=%d",
                 level.rawValue, s.presentRatio, s.workAvgMs, s.tickHz, s.refreshHz, s.missCount, goodWindows, badWindows))
         }

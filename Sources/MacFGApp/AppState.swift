@@ -198,7 +198,7 @@ public final class AppState {
     /// 이득 경로가 존재하지 않는다 — 실측도 그랬다(N=20: MetalFlow σ 0.78→0.84·tick 119.3→117.4 손해,
     /// RIFE σ 1.49→1.21·편차 ±1.18→±0.74 개선). 그래서 RIFE에서만 켠다. MACFG_SPLITQ로 수동 오버라이드.
     @ObservationIgnored nonisolated(unsafe) private var splitQueueEnabled = false
-    @ObservationIgnored private let splitQueueOverride: Bool? = ProcessInfo.processInfo.environment["MACFG_SPLITQ"].map { $0 == "1" }
+    @ObservationIgnored private let splitQueueOverride: Bool? = Knob.string("MACFG_SPLITQ").map { $0 == "1" }
 
     /// 단계별 지연 분해 계측 (MACFG_STAGEDBG=1). 라이브 work(50~80ms)가 큐 대기인지 GPU 실행인지
     /// 가른다: capIngest(캡처→인제스트 = SCK/큐 대기), cb1(blit+검출 GPU), cb2(warp GPU),
@@ -209,13 +209,19 @@ public final class AppState {
     /// 도달 불가**였고, "e2e의 70ms가 어디서 오는가"라는 질문에 답할 유일한 도구가 죽어 있었다.
     /// 로그 파일에만 쓰고 렌더 경로에 분기 하나를 더할 뿐이라 켜져 있어도 비용이 없다.
     @ObservationIgnored nonisolated(unsafe) private var stageDbg =
-        ProcessInfo.processInfo.environment["MACFG_STAGEDBG"] == "1"
+        Knob.string("MACFG_STAGEDBG") == "1"
         || UserDefaults.standard.bool(forKey: "s.devlog")
     @ObservationIgnored nonisolated(unsafe) private var stgCapIngest = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCb1Gpu = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCb2Gpu = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgWork = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCount = 0
+    /// present 커맨드 버퍼 GPU 시간 — **지금까지 유일하게 안 재던 구간.**
+    /// 실측(2026-08-05)으로 여기가 천장임이 확정됐다: 보간을 완전히 끄고(cb2gpu=0, chain=1.1ms)
+    /// present만 매 틱 하게 했더니 틱이 130Hz → 100Hz로 무너지고 갭이 20 → 70이 됐다.
+    /// 즉 틱 굶주림의 원인은 보간 부하가 아니라 present 자체의 처리량이다.
+    @ObservationIgnored nonisolated(unsafe) private var stgPresentGpu = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var stgPresentCount = 0
     @ObservationIgnored private let stageLock = NSLock()
     /// 직전 cb1 GPU 시간 — 스파이크 한 프레임을 단계별로 찍기 위해 값 자체를 들고 있는다
     /// (누적합만으론 어느 단계가 튀었는지 알 수 없다).
@@ -263,7 +269,7 @@ public final class AppState {
         }
         // RIFE 워프 해상도 배율 (LSFG식) — RIFE의 실질 중간 강등 다이얼. env 수동 오버라이드가
         // 있으면 그걸 존중(측정용), 없으면 거버너가 설정.
-        if ProcessInfo.processInfo.environment["MACFG_WARPSCALE"] == nil {
+        if Knob.string("MACFG_WARPSCALE") == nil {
             let wscale = loadGovernor.warpScale
             if abs(RIFEEngine.warpScale - wscale) > 0.001 {
                 RIFEEngine.warpScale = wscale
@@ -309,6 +315,12 @@ public final class AppState {
     /// 거버너 미러 (렌더 스레드에서 읽음) — 갭 확장 허용 / t 개수 상한
     @ObservationIgnored nonisolated(unsafe) private var gapExpansionAllowed = true
     @ObservationIgnored nonisolated(unsafe) private var tCountCap: Int?
+    /// 쌍당 보간 프레임 수 강제 상한 (측정용, MACFG_TCAP). 거버너 상한과 함께 더 작은 쪽이 이긴다.
+    @ObservationIgnored nonisolated(unsafe) private let tCapOverride: Int? = Knob.int("MACFG_TCAP")
+    /// 매 틱 강제 재present (측정용, MACFG_ALWAYSPRESENT) — present 레이트와 틱 굶주림의 인과 분리.
+    @ObservationIgnored nonisolated(unsafe) private let alwaysRepresent = Knob.string("MACFG_ALWAYSPRESENT") == "1"
+    /// N틱마다 한 번만 present (측정용, MACFG_PRESENTEVERY). 1이면 매 틱(기본).
+    @ObservationIgnored nonisolated(unsafe) private let presentEveryN = Knob.int("MACFG_PRESENTEVERY") ?? 1
 
     /// 사용자가 고른 flow 해상도 (거버너 상한 계산의 기준값)
     @ObservationIgnored private var userFlowBase: Double = MetalFlowEngine.flowBaseLongSide
@@ -433,7 +445,7 @@ public final class AppState {
         self.overlayManager = OverlayManager(device: device)
         self.interpolationEngine = selectedRenderMode.displayName
         // 정지-UI 프리즈 토글 (A/B·회귀 확인용). 기본 on.
-        if ProcessInfo.processInfo.environment["MACFG_NO_UISTATIC"] != nil { UIStaticDetector.enabled = false }
+        if Knob.string("MACFG_NO_UISTATIC") != nil { UIStaticDetector.enabled = false }
         // 새 릴리즈 확인 (기본 on, 6시간 주기). 설치는 하지 않고 알리기만 한다.
         self.updateChecker.startPeriodicCheck()
         // 뷰어 창 X 버튼 → 캡처 정지
@@ -497,7 +509,7 @@ public final class AppState {
     /// 개발자 로그 토글 — on이면 /tmp/MacFG_diag.log 기록, off면 삭제+기록 중단.
     func updateDevLogging() {
         DiagnosticLog.shared.setEnabled(devLoggingEnabled)
-        stageDbg = devLoggingEnabled || ProcessInfo.processInfo.environment["MACFG_STAGEDBG"] == "1"
+        stageDbg = devLoggingEnabled || Knob.string("MACFG_STAGEDBG") == "1"
         registerHotKeys()   // 개발 덤프 단축키(⌃⌥⌘D/O)를 devLogging 상태에 맞춰 등록/해제
     }
 
@@ -604,6 +616,14 @@ public final class AppState {
         renderSurface = surface
         mirrorRefreshRate = Double(overlayManager?.outputScreen?.maximumFramesPerSecond ?? 120)
         let attachW = Int(surface.metalLayer.drawableSize.width)
+        // **부착 조건을 남긴다.** 이게 없어서 "왜 120이 안 나오나"를 추적하는 내내 정작
+        // 디스플레이가 144Hz라는 사실을 로그로 확인할 방법이 없었다. 스케줄러의 슬롯
+        // 크기(1/refresh)와 드로어블 크기가 전부 여기서 정해지므로 둘 다 찍는다.
+        DiagnosticLog.shared.log("[DISPLAY] 부착: \(overlayManager?.outputScreen?.localizedName ?? "?")"
+            + " refresh=\(Int(mirrorRefreshRate))Hz"
+            + " drawable=\(attachW)x\(Int(surface.metalLayer.drawableSize.height))"
+            + " maxDrawables=\(surface.metalLayer.maximumDrawableCount)"
+            + " vsync=\(surface.metalLayer.displaySyncEnabled)")
         renderDriver.attach(layer: surface.metalLayer) { [weak self] tick in
             self?.onDisplayLinkTick(
                 timestamp: tick.timestamp,
@@ -711,8 +731,14 @@ public final class AppState {
         if args.contains("--upscale") { upscaleMode = .aneMetalfx }
         if args.contains("--no-interp") { isInterpolationEnabled = false }
         // 영역 캡처 테스트: --capture-rect x,y,w,h (소스 창 상대 pt)
-        if let rIdx = args.firstIndex(of: "--capture-rect"), rIdx + 1 < args.count {
-            let parts = args[rIdx + 1].split(separator: ",").compactMap { Double($0) }
+        // 제목과 같은 이유로 defaults 폴백을 둔다 (Finder 실행 유지):
+        //   defaults write com.macfg.MacFG s.autocapturerect "0,0,960,540"
+        let rectSpec: String? = {
+            if let rIdx = args.firstIndex(of: "--capture-rect"), rIdx + 1 < args.count { return args[rIdx + 1] }
+            return UserDefaults.standard.string(forKey: "s.autocapturerect")
+        }()
+        if let rectSpec {
+            let parts = rectSpec.split(separator: ",").compactMap { Double($0) }
             if parts.count == 4 {
                 captureRegion = CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
                 DiagnosticLog.shared.log("[AUTO] captureRegion=\(captureRegion!)")
@@ -760,16 +786,16 @@ public final class AppState {
                 DiagnosticLog.shared.log("[AUTO] capturing '\(target.displayName)' mode=\(selectedRenderMode.rawValue) placement=\(selectedOverlayPlacement.rawValue)")
                 await startCapture()
                 // 자체검증: MACFG_AUTODUMP 설정 시 캡처 안정화 후 프레임 덤프 자동 무장
-                if ProcessInfo.processInfo.environment["MACFG_AUTODUMP"] != nil {
+                if Knob.string("MACFG_AUTODUMP") != nil {
                     Task { @MainActor in
                         try? await Task.sleep(for: .seconds(4))
                         self.startFrameDump()
                     }
                 }
-                if ProcessInfo.processInfo.environment["MACFG_AUTOINFO"] != nil {
+                if Knob.string("MACFG_AUTOINFO") != nil {
                     Task { @MainActor in try? await Task.sleep(for: .seconds(5)); self.infoOverlayVisible = true; self.refreshInfoOverlay() }
                 }
-                if let od = ProcessInfo.processInfo.environment["MACFG_AUTOOUTDUMP"] {
+                if let od = Knob.string("MACFG_AUTOOUTDUMP") {
                     // 값이 숫자면 지연(초) — 사다리 승격 전환창(~1s 소스-온리)을 피해
                     // 정착 후를 측정할 때 사용 (예: MACFG_AUTOOUTDUMP=25). 그 외엔 6초.
                     let delay = Double(od) ?? 6
@@ -818,7 +844,7 @@ public final class AppState {
         // work·e2e에 그대로 실릴 뿐 아니라 paceWorkP90을 올려 적응지연 하한까지 밀어올린다.
         // performAsync는 틱과 같은 런루프라 절대 겹치지 않음 → 무락 전제 보존.
         // MACFG_CBINGEST=0이면 기존(틱 drain 전용) 경로로 폴백.
-        if ProcessInfo.processInfo.environment["MACFG_CBINGEST"] != "0" {
+        if Knob.string("MACFG_CBINGEST") != "0" {
             captureManager.onFrameAvailable = { [weak self] in
                 guard let self else { return }
                 self.renderDriver.performAsync { [weak self] in
@@ -1310,6 +1336,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagPresentBusy = 0
     @ObservationIgnored nonisolated(unsafe) private var isRestartingCapture = false
     @ObservationIgnored nonisolated(unsafe) private var presentedTimes: [CFTimeInterval] = []
+    /// 표시되지 못한 present 수 (drawable.presentedTime == 0) — 창마다 리셋.
+    @ObservationIgnored nonisolated(unsafe) private var diagPresentDropped = 0
     @ObservationIgnored nonisolated(unsafe) private var latencySamplesMs: [Double] = []
     /// 최근 vsync 목표 시각 — 보간 위상을 디스플레이 그리드에 정렬하기 위한 기준
     @ObservationIgnored nonisolated(unsafe) private var lastVsyncTarget: CFTimeInterval = 0
@@ -1382,7 +1410,7 @@ public final class AppState {
         let interval = min(max(sourceIntervalEMA > 0 ? sourceIntervalEMA : 1.0 / 60.0, 1.0 / 120.0), 1.0 / 24.0)
         let baseMs = (interval * 1.25 + 0.004 + 0.5 / refresh) * 1000.0
         // 적응 지연 상한 — 측정용 MACFG_MAXLAT로 낮춰 "지연↓ 드롭↑" 트레이드 확인 (기본 4).
-        let maxSlots = ProcessInfo.processInfo.environment["MACFG_MAXLAT"].flatMap { Double($0) } ?? 4.0
+        let maxSlots = Knob.string("MACFG_MAXLAT").flatMap { Double($0) } ?? 4.0
         let requiredExtra = paceWorkP90 > 0
             ? min(maxSlots, max(0.0, ((paceWorkP90 + 2.0 - baseMs) / slotMs).rounded(.up)))
             : 0.0
@@ -1454,7 +1482,7 @@ public final class AppState {
     // 콘텐츠-시간 간격 (표시 프레임 간 콘텐츠 진행량 ms) — 균일성이 wobble의 직접 지표
     @ObservationIgnored nonisolated(unsafe) private var diagContentIntervals: [Double] = []
     // 적응형 지연 A/B용 (MACFG_NO_ADAPT=1이면 extraLatencySlots 0 고정 — 회귀 판별)
-    private let adaptDisabled = ProcessInfo.processInfo.environment["MACFG_NO_ADAPT"] != nil
+    private let adaptDisabled = Knob.string("MACFG_NO_ADAPT") != nil
 
     // MARK: - Render Loop
 
@@ -1525,7 +1553,11 @@ public final class AppState {
             // count·구간 길이 가드를 **둘 다 통과**한 채 fps가 0.0007 → 반올림 0으로 표시된다.
             // 실제로는 120fps로 잘 돌고 있는데 오버레이에 0 fps가 뜨던 잔여 원인(사용자 제보).
             // 버퍼 중간에 섞이면 반대로 count만 늘려 fps를 부풀린다. 아예 받지 않는다.
-            guard record.presentedAt > 0 else { continue }
+            // presentedAt == 0 = **우리가 그렸는데 화면에 한 번도 안 나간 프레임.**
+            // 통계에서 빼는 것만으로는 부족하다 — 이게 몇 장인지가 곧 "왜 120이 안 나오는가"의
+            // 답이다. 세지 않으면 glass 간격만 보고 "표시가 20ms 균일하다"고 읽게 되는데,
+            // 실제로는 present를 10ms마다 하고 그중 절반이 버려지는 상태일 수 있다.
+            guard record.presentedAt > 0 else { diagPresentDropped += 1; continue }
             performanceMonitor.recordRenderTime()
             presentedTimes.append(record.presentedAt)
             if presentedTimes.count > 240 { presentedTimes.removeFirst(120) }
@@ -1558,12 +1590,20 @@ public final class AppState {
             diagLeaseDropCount += before - timeline.count
         }
         let presentBefore = diagPresentCount
-        presentDueEntry(targetTimestamp: targetTimestamp, drawable: drawable)
+        // MACFG_PRESENTEVERY=N: N틱마다 한 번만 present. **측정 전용.**
+        // 가르려는 것: 표시 실패(presentedTime==0)가 우리가 과잉 공급해서인가, 컴포지터의
+        // 외부 천장인가. 공급을 절반으로 줄였을 때 표시 fps가 오르면 전자, 그대로면 후자다.
+        if presentEveryN <= 1 || diagTick % presentEveryN == 0 {
+            presentDueEntry(targetTimestamp: targetTimestamp, drawable: drawable)
+        }
         // 링크 재부착 직후 강제 재present — 정적 콘텐츠는 새 프레임이 없어 presentDueEntry가
         // 아무것도 표시하지 않으므로, 재부착 전 그려둔 흐린(960×540 드로어블) 프레임이 남는다.
         // 이번 틱에 새 present가 없었으면 최신 텍스처를 새(큰) 드로어블에 다시 그려 교체한다.
-        if forceRepresentTicks > 0 {
-            forceRepresentTicks -= 1
+        // MACFG_ALWAYSPRESENT=1: 새 프레임이 없어도 매 틱 재present한다. **측정 전용.**
+        // 가르려는 것: 틱이 굶는 원인이 보간 GPU 작업인가, present 레이트 자체인가.
+        // 바이패스(보간 0)에 이걸 켜면 GPU 부하는 그대로인데 present만 100%가 된다.
+        if forceRepresentTicks > 0 || alwaysRepresent {
+            if forceRepresentTicks > 0 { forceRepresentTicks -= 1 }
             // 재표시 텍스처가 그 사이 링에서 덮였으면(보간 프레임) 스킵 — 화면은 이전 상태 유지
             let stillLive = lastPresentedStamp == 0 || (pairEngine?.isFrameLive(lastPresentedStamp) ?? false)
             if diagPresentCount == presentBefore, stillLive, let tex = lastPresentedTexture {
@@ -1907,7 +1947,13 @@ public final class AppState {
                 // 거버너 t 상한 — **세 생성 경로 공통**. 경로별로 걸면 Auto 배율(=0)처럼
                 // 다른 분기를 타는 설정에서 그냥 새어나간다(실측: 캡을 첫 분기에만 걸었더니
                 // 강등 후에도 t×5·t×6이 계속 나옴). 균등 간격으로 솎아 케이던스는 보존.
-                if let cap = tCountCap, tValues.count > cap {
+                // 측정용 강제 상한 — 쌍당 t 개수가 work 꼬리에 얼마나 기여하는지 가른다.
+                //   defaults write com.macfg.MacFG env.MACFG_TCAP -string 1
+                let effTCap: Int? = {
+                    guard let k = tCapOverride else { return tCountCap }
+                    return min(k, tCountCap ?? k)
+                }()
+                if let cap = effTCap, tValues.count > cap {
                     if cap <= 0 {
                         tValues = []
                     } else {
@@ -2018,11 +2064,14 @@ public final class AppState {
                 if n >= 120 {
                     let ci = self.stgCapIngest / Double(n), c1 = self.stgCb1Gpu / Double(n)
                     let c2 = self.stgCb2Gpu / Double(n), wk = self.stgWork / Double(n)
+                    let pn = self.stgPresentCount
+                    let pg = pn > 0 ? self.stgPresentGpu / Double(pn) : 0
                     self.stgCapIngest = 0; self.stgCb1Gpu = 0; self.stgCb2Gpu = 0; self.stgWork = 0; self.stgCount = 0
+                    self.stgPresentGpu = 0; self.stgPresentCount = 0
                     self.stageLock.unlock()
                     DiagnosticLog.shared.log(String(format:
-                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f work=%.1f (대기=%.1f) chain=%.1f(%.2f×간격) ms/frame (n=120)",
-                        ci, c1, c2, wk, max(0, wk - ci - c1 - c2), c1 + c2,
+                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f present=%.2f(n=%d) work=%.1f (대기=%.1f) chain=%.1f(%.2f×간격) ms/frame (n=120)",
+                        ci, c1, c2, pg, pn, wk, max(0, wk - ci - c1 - c2), c1 + c2,
                         (c1 + c2) / max(1.0, self.sourceIntervalEMA * 1000.0)))
                 } else {
                     self.stageLock.unlock()
@@ -2116,8 +2165,16 @@ public final class AppState {
         let presentTex = entry.texture
         let presentingRef = presentingTextures
         presentingRef.withLock { $0[ObjectIdentifier(presentTex)] = presentTex }
-        cb.addCompletedHandler { _ in
+        let stageDbgRef = stageDbg
+        cb.addCompletedHandler { [weak self] buf in
             presentingRef.withLock { $0.removeValue(forKey: ObjectIdentifier(presentTex)) }
+            guard stageDbgRef, let self else { return }
+            let g = (buf.gpuEndTime - buf.gpuStartTime) * 1000.0
+            guard g > 0, g < 500 else { return }
+            self.stageLock.lock()
+            self.stgPresentGpu += g
+            self.stgPresentCount += 1
+            self.stageLock.unlock()
         }
         // CAMetalDisplayLink의 드로어블은 targetPresentTimestamp 슬롯에 이미 바인딩 —
         // plain present가 곧 그 슬롯 표시 (예전 plain-present 실험과 달리 시각이 링크에 고정됨)
@@ -2401,7 +2458,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2436,6 +2493,7 @@ public final class AppState {
         diagTsRejectCount = 0
         _ = wallSpan
         diagPresentCount = 0
+        diagPresentDropped = 0
         diagInterpPresentCount = 0
         diagPoolExhaustCount = 0
         diagInterpEncodedCount = 0
@@ -2764,7 +2822,7 @@ public final class AppState {
     private func detectFullscreenRetarget() {
         // MACFG_RETARGET=1일 때만 동작 (기본 OFF — 일반 캡처에서 PiP/잔재 창 오탐으로 회귀).
         // 소스 앱이 만든 전체화면 창(f키 플레이어 전체화면)을 전 화면 후보에서 추적해 재타깃.
-        guard ProcessInfo.processInfo.environment["MACFG_RETARGET"] != nil,
+        guard Knob.string("MACFG_RETARGET") != nil,
               isCapturing, !retargetInFlight, captureRegion == nil,
               sourceOwnerPID > 0, originalCaptureWindowID > 0 else { return }
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]

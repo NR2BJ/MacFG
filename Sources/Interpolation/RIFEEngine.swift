@@ -39,7 +39,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 그만큼 줄여 워프하고 present에서 4K로 업스케일 — 4K 60fps 워프 병목의 최대 지렛대.
     /// MACFG_WARPSCALE로 A/B. 거버너가 부하 시 자동 설정(setWarpScale).
     public nonisolated(unsafe) static var warpScale: Double =
-        ProcessInfo.processInfo.environment["MACFG_WARPSCALE"].flatMap { Double($0) } ?? 1.0
+        Knob.string("MACFG_WARPSCALE").flatMap { Double($0) } ?? 1.0
     /// CoreML 유닛 — true=GPU(전 사이즈 최속), false=ANE(느리지만 GPU를 비움) — 벤치 전용 노브
     public nonisolated(unsafe) static var useGPU: Bool = true
     /// 앱 적응 사다리(ANE-only). 벤치는 false로 두고 flowShortSide/useGPU를 그대로 존중.
@@ -188,7 +188,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             candidates.append(res.appendingPathComponent("rife\(short).mlmodelc"))
             candidates.append(res.appendingPathComponent("rife\(short).mlpackage"))
         }
-        if let env = ProcessInfo.processInfo.environment["MACFG_MODELS"] {
+        if let env = Knob.string("MACFG_MODELS") {
             candidates.append(URL(fileURLWithPath: env).appendingPathComponent("rife\(short).mlpackage"))
         }
         var dir = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent()
@@ -674,7 +674,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // 스무딩은 실측 순이득(등속 σ 24% vs OFF 71%) — 단 게이트를 조여(0.75~2.0px) 가감속
         // 랙 고스팅을 차단. 디버그: MACFG_NO_TEMPORAL=1로 끄기.
         var temporalW: Float = (anchors.count == 1 && prevValid
-            && ProcessInfo.processInfo.environment["MACFG_NO_TEMPORAL"] == nil) ? 0.5 : 0.0
+            && Knob.string("MACFG_NO_TEMPORAL") == nil) ? 0.5 : 0.0
         for i in 0..<anchors.count {
             guard let upEnc = commandBuffer.makeComputeCommandEncoder() else {
                 // packCB 커밋 후엔 predict 워커가 인플라이트로 slot 공유버퍼를 읽고/쓰는 중 —
@@ -769,7 +769,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let dumpPair = pairCount
         commandBuffer.addCompletedHandler { [weak self] _ in
             // 디버그: 패리티 진단용 버퍼 덤프 (MACFG_RIFE_DUMP=<dir>, 4번째 쌍 = 벤치 최종)
-            if dumpPair == 3, let dir = ProcessInfo.processInfo.environment["MACFG_RIFE_DUMP"] {
+            if dumpPair == 3, let dir = Knob.string("MACFG_RIFE_DUMP") {
                 for (nm, buf) in [("pack", slot.packBuf), ("flow", slot.flowBufs[0]), ("mask", slot.maskBufs[0])] {
                     let data = Data(bytes: buf.contents(), count: buf.length)
                     try? data.write(to: URL(fileURLWithPath: "\(dir)/rife_\(nm).bin"))
@@ -793,7 +793,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         if pairCount <= 3 || pairCount % 600 == 0 || anchors.count > 1 {
             let medNow = predictMsMedian()
             DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) anchors=\(anchors.count) predictMed=\(String(format: "%.1f", medNow))ms")
-            if ProcessInfo.processInfo.environment["MACFG_RIFE_VERBOSE"] != nil {
+            if Knob.string("MACFG_RIFE_VERBOSE") != nil {
                 print("  [RIFE] pair#\(pairCount) anchors=\(anchors.map { String(format: "%.2f", $0) }.joined(separator: ",")) med=\(String(format: "%.1f", medNow))")
             }
         }

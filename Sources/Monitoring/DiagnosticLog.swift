@@ -24,7 +24,7 @@ public final class DiagnosticLog: @unchecked Sendable {
         dateFormatter.timeZone = TimeZone.current
 
         // 무인 테스트(auto-capture/env)나 설정 저장값이면 시작부터 켬
-        let testMode = ProcessInfo.processInfo.environment["MACFG_DIAG"] != nil
+        let testMode = Knob.string("MACFG_DIAG") != nil
             || CommandLine.arguments.contains("--auto-capture-title")
         let on = testMode || UserDefaults.standard.bool(forKey: "s.devlog")
         enabledFlag.withLock { $0 = on }

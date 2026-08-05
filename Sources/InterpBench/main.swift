@@ -10,6 +10,7 @@
 import Metal
 import Interpolation
 import Foundation
+import Monitoring
 import ImageIO
 import CoreGraphics
 import UniformTypeIdentifiers
@@ -348,7 +349,7 @@ func benchmarkMultiT(_ engine: any PairInterpolationEngine, key: String,
         let budget = dt * 1000
         print("  \(label)  encode=\(String(format: "%.1f", avg))ms/pair (예산 \(String(format: "%.0f", budget))ms)  \(psnrParts.joined(separator: "  "))")
         // 육안 덤프 (MACFG_DUMP=<dir>) — 60fps t=0.5 보간 + GT
-        if let dir = ProcessInfo.processInfo.environment["MACFG_DUMP"], label.hasPrefix("60fps"),
+        if let dir = Knob.string("MACFG_DUMP"), label.hasPrefix("60fps"),
            let mid = frames.first(where: { abs($0.t - 0.5) < 0.01 }),
            let gt = createTestPattern(device: device, commandQueue: commandQueue, width: w, height: h, shift: 15) {
             dumpPNG(mid.texture, device: device, queue: commandQueue, path: "\(dir)/\(key)_interp.png")
@@ -588,7 +589,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
     if RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) { allEngines.append(("rife", RIFEEngine())) }
     let sel = engineKeys.contains("all") ? allEngines : allEngines.filter { engineKeys.contains($0.0) }
 
-    let dumpDir = ProcessInfo.processInfo.environment["MACFG_DUMP"]
+    let dumpDir = Knob.string("MACFG_DUMP")
     for (key, engine) in sel {
         do { try await engine.prepare(device: device) } catch { print("  \(key): prepare 실패"); continue }
         var psnrs: [Double] = []

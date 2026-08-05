@@ -1369,6 +1369,12 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var presentedTimes: [CFTimeInterval] = []
     /// 표시되지 못한 present 수 (drawable.presentedTime == 0) — 창마다 리셋.
     @ObservationIgnored nonisolated(unsafe) private var diagPresentDropped = 0
+    /// present 위상 계측 — 표시 시각이 링크가 준 슬롯에서 몇 슬롯 밀렸는가(0/1/2/3+).
+    /// 미표시(presentedTime==0)의 원인이 "뒤 present에 추월당함"인지 가르는 지표다.
+    @ObservationIgnored nonisolated(unsafe) private var diagSlipHist = [0, 0, 0, 0]
+    /// 링크가 같은 표시 슬롯을 연속으로 배달한 횟수 — 크면 원인이 present가 아니라 틱 쪽이다.
+    @ObservationIgnored nonisolated(unsafe) private var diagDupTargetSlot = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagLastTargetSlot = -1
     @ObservationIgnored nonisolated(unsafe) private var latencySamplesMs: [Double] = []
     /// 최근 vsync 목표 시각 — 보간 위상을 디스플레이 그리드에 정렬하기 위한 기준
     @ObservationIgnored nonisolated(unsafe) private var lastVsyncTarget: CFTimeInterval = 0
@@ -2188,8 +2194,20 @@ public final class AppState {
         let isInterp = entry.isInterpolated
         let inFlightRef = inFlightPresents
         inFlightRef.withLock { $0 += 1 }
-        drawable.addPresentedHandler { d in
+        let slotSec = 1.0 / max(mirrorRefreshRate, 60)
+        let targetRef = targetTimestamp
+        // 링크가 같은 표시 슬롯을 두 번 준 것인지 (원인이 present가 아니라 틱 쪽인지) 가른다.
+        let slotIdx = Int((targetTimestamp / slotSec).rounded())
+        if slotIdx == diagLastTargetSlot { diagDupTargetSlot += 1 }
+        diagLastTargetSlot = slotIdx
+        drawable.addPresentedHandler { [weak self] d in
             inFlightRef.withLock { $0 = max(0, $0 - 1) }
+            if let self, d.presentedTime > 0 {
+                // 실제 표시가 목표 슬롯에서 몇 칸 밀렸나. 밀림이 미표시 비율과 맞아떨어지면
+                // "뒤 present에 추월당해 버려진다"가 확정된다.
+                let slip = Int(((d.presentedTime - targetRef) / slotSec).rounded())
+                self.diagSlipHist[min(max(slip, 0), 3)] += 1
+            }
             mailboxRef.postPresented(at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
         }
         // 이 커맨드 버퍼가 끝날 때까지 소스 텍스처를 붙잡는다 — 그 전에 풀이 재사용하면
@@ -2208,8 +2226,21 @@ public final class AppState {
             self.stgPresentCount += 1
             self.stageLock.unlock()
         }
-        // CAMetalDisplayLink의 드로어블은 targetPresentTimestamp 슬롯에 이미 바인딩 —
-        // plain present가 곧 그 슬롯 표시 (예전 plain-present 실험과 달리 시각이 링크에 고정됨)
+        // 표시 시각을 링크가 준 슬롯에 못박을지 여부.
+        //
+        // plain present는 "GPU 완료 즉시"라 표시 시각이 우리 작업 시간을 따라 흔들린다.
+        // 그러면 두 present가 같은 리프레시 구간에 떨어져 앞의 것이 버려진다(presentedTime==0).
+        // 등간격으로 내보낸 실측(MACFG_PRESENTEVERY=3)에서 미표시가 정확히 0이고 glass가
+        // 정확히 3슬롯이었던 것이 이 해석의 근거다. atTime은 그 등간격성을 인위적 스로틀 없이
+        // 만들어낸다 — 링크가 준 슬롯은 틱마다 서로 다르므로 충돌이 원리적으로 사라진다.
+        // **명시 시각 present는 이 경로에서 불법이다 (실측 2026-08-05로 확정).**
+        // `cb.present(drawable, atTime: targetTimestamp)`를 쓰면 즉시
+        //   -[CAMetalDrawable presentWithOptions:] → NSException → SIGABRT
+        // 로 죽는다. CAMetalDisplayLink가 배달하는 드로어블은 이미 그 콜백의
+        // targetPresentationTimestamp 슬롯에 바인딩돼 있어서, 표시 시각을 다시 지정하는
+        // 것 자체가 허용되지 않는다. (nextDrawable로 직접 얻은 드로어블과 다르다.)
+        // 그래서 "present를 vsync 격자에 못박아 위상 충돌을 없앤다"는 접근은 이 구조에서
+        // 쓸 수 없다 — 위상을 고치려면 present 시각이 아니라 **무엇을 언제 만들지**를 바꿔야 한다.
         cb.present(drawable)
         cb.commit()
     }
@@ -2491,7 +2522,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2527,6 +2558,8 @@ public final class AppState {
         _ = wallSpan
         diagPresentCount = 0
         diagPresentDropped = 0
+        diagSlipHist = [0, 0, 0, 0]
+        diagDupTargetSlot = 0
         diagInterpPresentCount = 0
         diagPoolExhaustCount = 0
         diagInterpEncodedCount = 0

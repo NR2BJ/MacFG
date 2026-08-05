@@ -536,6 +536,16 @@ public final class OverlayWindow: NSObject {
     /// 렌더링을 멈추는 것(Firefox PiP 등 가려진 창 페인팅 중단 → 캡처 정지 화면)을 막는다.
     /// alpha 0.999면 창이 "불투명 오클루더"가 아니게 돼 아래 창이 계속 그려짐. cover·전체화면 뷰어 공통.
     public func setOcclusionBypass(_ enabled: Bool) {
+        // MACFG_NOOCCBYPASS=1: 우회를 끄고 완전 불투명으로 둔다. **측정 전용.**
+        // 가르려는 것: 표시 천장(~48장/s)이 반투명 합성 비용 때문인가.
+        // alpha < 1.0이면 window server가 이 창을 불투명 오클루더로 보지 않아 아래 창들을
+        // 계속 그리고 매 프레임 블렌딩한다. 불투명이면 그 아래를 통째로 건너뛸 수 있다.
+        // 부작용(의도됨): 소스 창이 occluded 판정돼 렌더링을 멈춘다 — 그래서 이 측정은
+        // MACFG_ALWAYSPRESENT=1과 함께 써서 마지막 프레임을 계속 내보내며 효율만 본다.
+        if Knob.string("MACFG_NOOCCBYPASS") == "1" {
+            window.alphaValue = 1.0
+            return
+        }
         window.alphaValue = enabled ? 0.999 : 1.0
     }
 

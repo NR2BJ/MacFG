@@ -34,7 +34,13 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     // (RIFE 신경 predict 288p=12ms의 절반, 예산 대폭 여유). flow 해상도가 높을수록 **빠른 모션의
     // 큰 변위**를 잘 잡아 저더가 준다 — RIFE는 predict 비용 때문에 288p에 갇혀 빠른 4K 모션이
     // 부들거리는데, MetalFlow는 그 캡이 없다. 소스보다 크면 min(1.0, base/long)로 소스 res에 캡.
-    public nonisolated(unsafe) static var flowBaseLongSide: Double = 1440
+    /// MACFG_MFFLOWBASE로 오프라인 A/B 가능 — 다른 MF 노브는 전부 env 게이트가 있는데 이것만
+    /// 빠져 있어 벤치에서 flow 해상도를 고정 비교할 수 없었다(실측 시도가 전부 같은 값으로 돌았다).
+    /// 실사용에선 AutoFlowScaler/거버너가 이 값을 덮어쓴다.
+    public nonisolated(unsafe) static var flowBaseLongSide: Double = {
+        if let s = ProcessInfo.processInfo.environment["MACFG_MFFLOWBASE"], let v = Double(s), v >= 240 { return v }
+        return 1440
+    }()
 
     /// 오클루전 방향별 워프 (실험, --occ-directional): 가림/드러남 영역에서 보이는 쪽 단방향 워프.
     /// 반복 패턴 aliasing 리스크로 합성 벤치 -3dB — 실영상 육안 A/B 전 기본 off.

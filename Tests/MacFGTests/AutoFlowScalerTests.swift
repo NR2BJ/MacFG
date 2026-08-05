@@ -12,11 +12,14 @@ import Foundation
 struct AutoFlowScalerTests {
 
     /// 테스트용 스케일러 — 가짜 시계로 최소 변경간격/동결을 통제
-    private func makeScaler(startIdx: Int = 5) -> (AutoFlowScaler, () -> Void) {
+    /// 사다리 천장이 800(idx 2)로 내려가 가용 칸이 480/640/800 셋뿐이다. 시나리오마다 필요한
+    /// 여유가 달라 시작점을 명시적으로 고른다 — 상승 시험은 아래 칸에서, 원복 시험은 맨 위 칸에서.
+    /// (heavy=8MP면 한 칸 아래에서 시작한다)
+    private func makeScaler(heavy: Bool = true) -> (AutoFlowScaler, () -> Void) {
         let s = AutoFlowScaler()
         var t: CFAbsoluteTime = 1_000_000
         s.nowProvider = { t }
-        s.seed(gpuCoreCount: 10, sourcePixels: 8_000_000)
+        s.seed(gpuCoreCount: 10, sourcePixels: heavy ? 8_000_000 : 2_000_000)
         return (s, { t += 10 })   // 한 호출 = 10초 경과 (상승 8s/하강 3s 게이트 통과)
     }
 
@@ -57,7 +60,7 @@ struct AutoFlowScalerTests {
     /// **핵심 안전장치**: 내렸는데 목표가 개선되지 않으면 되돌리고 동결한다.
     /// (화질을 팔았는데 산 게 없는 상태를 스스로 빠져나오는 경로)
     @Test func restoresWhenDescentDoesNotHelp() {
-        let (s, tick) = makeScaler()
+        let (s, tick) = makeScaler(heavy: false)   // 800에서 시작 — 두 칸 하강할 여유 필요
         let start = s.current
         // 컴퓨트 근거는 있지만 아무리 내려도 달성도가 그대로인 상황을 계속 먹인다
         var lowest = start
@@ -146,7 +149,7 @@ struct AutoFlowScalerTests {
         let s = AutoFlowScaler()
         var t: CFAbsoluteTime = 1_000_000
         s.nowProvider = { t }
-        s.seed(gpuCoreCount: 10, sourcePixels: 8_000_000)   // idx 4 (1200), 천장 5 (1440)
+        s.seed(gpuCoreCount: 10, sourcePixels: 8_000_000)   // idx 1 (640), 천장 2 (800)
 
         // 1단계 — 올린 직후 실패시켜 천장을 학습(깎이게) 한다.
         //   상승 게이트 8s / 하강 게이트 3s를 통과하도록 4초씩 진행하고,

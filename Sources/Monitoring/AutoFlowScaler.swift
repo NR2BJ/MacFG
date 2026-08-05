@@ -19,11 +19,19 @@ import Monitoring
 ///    최소 간격을 두고 히스테리시스를 건다.
 @MainActor
 public final class AutoFlowScaler {
-    /// flow 해상도 사다리 (긴 변 px). 4K 실측(M4): 960≈6ms · 1440≈6.2ms · 1920≈8.9ms · 2160≈10.3ms.
+    /// flow 해상도 사다리 (긴 변 px).
     public static let rungs: [Double] = [480, 640, 800, 960, 1200, 1440, 1728, 2160]
+    // **비용/화질 실측 재측정 (2026-08-02, 조용한 머신, 4K 합성 + 실프레임 삼중항)**
+    //   비용(격리):  480=2.5ms · 960≈4ms · 1440≈6.0ms   — flow 해상도가 사실상 유일한 비용 동인
+    //                (출력 해상도는 무관: 1080p/1440p/4K 모두 flow 640에서 12.6ms대로 동일)
+    //   화질(실프레임 삼중항 PSNR): 240=23.37 · 480=23.33 · 1440=23.20 · 2160=23.09 dB
+    //   → **낮출수록 오히려 미세하게 낫다.** 9배 범위에서 0.28dB이므로 사실상 무차별이고,
+    //     비용만 2.4배 차이난다. 위쪽 칸은 GPU 시간을 쓰고 화질은 0이다.
+    // 앱 안에서는 GPU 경합이 이 비용을 약 2.6배로 곱하므로(격리 6ms → 실측 cb2 12~17ms),
+    // 절감분도 같은 배수로 증폭된다 — 천장을 내리는 것이 지금 가장 값싼 지렛대다.
 
     /// 현재 선택된 flow 해상도
-    public private(set) var current: Double = 1440
+    public private(set) var current: Double = 800
     /// 마지막 전이 사유 (로그/UI용)
     public private(set) var lastReason: String = ""
     /// 현재 학습된 천장 (긴 변 px) — 진단 표시 및 테스트 관측용.
@@ -34,15 +42,15 @@ public final class AutoFlowScaler {
     /// 사용자가 --flow-base로 고정했으면 자동 조절 중지
     public var manualOverride = false
 
-    private var idx: Int = 5                       // rungs[5] = 1440
-    /// 학습된 천장. 초기값 = 1440(idx 5) — **실프레임 측정 근거**: 실제 4K 덤프 4세트 × flow 640~2160
-    /// 삼중항 PSNR에서 해상도에 따른 화질 변화가 ±0.5dB 안이고 방향도 콘텐츠마다 갈렸다(중립).
-    /// 반면 비용은 4K에서 960≈6ms → 1728≈8.9ms → 2160≈10.3ms로 확실히 는다. 즉 그 위로 올리는 건
-    /// GPU만 쓰고 화질은 0이므로 탐침 자체를 막고, 남는 여유는 틱 안정성/발열/저사양 여유로 남긴다.
-    private var ceilingIdx: Int = 5
+    private var idx: Int = 2                       // rungs[2] = 800
+    /// 학습된 천장. 초기값 = maxCeilingIdx(800). 근거는 rungs 위 재측정 블록 참조 —
+    /// 그 위 칸은 GPU 시간만 쓰고 화질 이득이 0이라 탐침 자체를 막는다.
+    private var ceilingIdx: Int = 2
     /// 학습 천장의 절대 상한 — 위 근거대로 그 위는 비용만 늘고 화질 이득이 0이라 탐침 자체를 막는다.
     /// 천장은 이 값까지만 **회복**할 수 있다(넘어서 오르지 않는다).
-    private let maxCeilingIdx: Int = 5
+    /// 실측 근거는 rungs 위 주석 참조. 예전 값 5(1440)는 "960 위로는 거의 공짜"라는 옛 비용
+    /// 모델에서 나왔는데, 재측정 결과 960→1440이 +2ms(50%)이고 화질 이득은 0이었다.
+    private let maxCeilingIdx: Int = 2
     /// 천장 칸에서 연속 달성한 창 수 — 천장 회복의 근거.
     private var goodAtCeiling = 0
     private var goodWindows = 0
@@ -72,10 +80,11 @@ public final class AutoFlowScaler {
         let heavy = sourcePixels >= 7_000_000
         let start: Int
         switch gpuCoreCount {
-        case ..<9:   start = heavy ? 2 : 3      // M1/M2 base (8코어) → 800/960
-        case 9...11: start = heavy ? 4 : 5      // M3/M4 base (10코어) → 1200/1440
-        case 12...20: start = heavy ? 5 : 6     // Pro → 1440/1728
-        default:     start = heavy ? 6 : 7      // Max/Ultra → 1728/2160
+        // 천장(800)이 화질 무차별 구간의 위쪽이라 등급별 차등은 의미가 작다 — 무거운 소스만
+        // 한 칸 낮춘다. 예전엔 Pro/Max가 천장(idx 5)보다 위인 6~7에서 출발해, 첫 창부터
+        // 천장을 넘은 채로 시작하고 원복 경로가 아래를 가리키는 버그까지 밟았다.
+        case ..<9:   start = heavy ? 0 : 1      // M1/M2 base → 480/640
+        default:     start = heavy ? 1 : 2      // M3/M4 이상 → 640/800
         }
         idx = min(max(start, 0), Self.rungs.count - 1)
         current = Self.rungs[idx]

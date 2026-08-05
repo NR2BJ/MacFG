@@ -34,7 +34,14 @@ final class RelativePointer {
     }
 
     private(set) var active = false
-    private var tap: CFMachPort?
+    /// 탭 핸들 — **탭 스레드가 읽고(reenableTap) 메인이 쓴다(disable).** 동기화 없이 두면
+    /// strong 참조의 읽기/쓰기가 겹쳐 그 자체로 over-release 원천이 된다.
+    private let tapLock = NSLock()
+    private var _tap: CFMachPort?
+    private var tap: CFMachPort? {
+        get { tapLock.lock(); defer { tapLock.unlock() }; return _tap }
+        set { tapLock.lock(); _tap = newValue; tapLock.unlock() }
+    }
     private var runLoopSource: CFRunLoopSource?
     private var thread: Thread?
     private var threadRunLoop: CFRunLoop?
@@ -74,11 +81,20 @@ final class RelativePointer {
             (1 << CGEventType.otherMouseDown.rawValue) |
             (1 << CGEventType.otherMouseUp.rawValue) |
             (1 << CGEventType.scrollWheel.rawValue)
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        // **refcon은 retained로 넘긴다.** passUnretained면 disable()의 0.5초 대기가 만료되는
+        // 순간 소유자(OverlayWindow)가 dealloc되면서 self가 죽는데, 탭 스레드는 아직 살아 있어
+        // 매 마우스 이벤트마다 **해제된 객체를 retain/release** 한다 — 힙이 깨지고 트랩은 한참 뒤
+        // 전혀 무관한 곳에서 난다(실측: stablePool · MetalFlow 배열 · FrameSlot 세 곳).
+        // retained로 넘기면 스레드가 종료될 때까지 self가 보장되므로 그 창이 **구조적으로 닫힌다**.
+        // 균형은 아래 CFRunLoopRun() 반환 직후에 맞춘다. 스레드가 영영 안 끝나면 객체 하나가
+        // 새지만, 그건 크래시보다 낫다.
+        let refconOwner = Unmanaged.passRetained(self)
+        let refcon = refconOwner.toOpaque()
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                           options: .defaultTap, eventsOfInterest: mask,
                                           callback: relativePointerTapCallback, userInfo: refcon) else {
             DiagnosticLog.shared.log("[RELPTR] tap create FAILED (accessibility 권한 필요)")
+            refconOwner.release()
             threadReady.signal()
             return
         }
@@ -89,6 +105,10 @@ final class RelativePointer {
         CGEvent.tapEnable(tap: tap, enable: true)
         threadReady.signal()
         CFRunLoopRun()                                // disable()의 CFRunLoopStop까지 실행
+        // 콜백이 더는 불릴 수 없는 지점 — 여기서 refcon 소유권을 놓는다.
+        CFMachPortInvalidate(tap)                     // 혹시 남은 소스가 있어도 발화 못 하게
+        refconOwner.release()
+        DiagnosticLog.shared.log("[RELPTR] 탭 스레드 종료")
         threadStopped.signal()                        // 종료 확정 신호 (disable이 대기)
     }
 
@@ -179,6 +199,12 @@ final class RelativePointer {
             wasOutside = false
             let pid = g.sourcePID                       // 옆 모니터 복귀 — 소스 재활성 (메인에서)
             if pid != 0 {
+                // **코드 전체에서 유일한 '호버당 부작용'이다.** 커서가 이 화면 밖으로 나갔다
+                // 돌아올 때마다 소스 앱을 활성화하는데, 그게 전체화면 감지를 흔들어 캡처
+                // 재시작을 유발하는지가 미해결이다. 재시작은 콜백/스트림 교체를 동반하므로
+                // 크래시 후보(M-C)의 발화 조건이다. 이 줄이 `Capture stopped` 직전에 몰리면
+                // "포인터 → 재활성 → 재시작 → 손상"의 다리가 확인된다.
+                DiagnosticLog.shared.log("[RELPTR] 화면 재진입 → 소스 활성화 (pid=\(pid))")
                 DispatchQueue.main.async { NSRunningApplication(processIdentifier: pid)?.activate() }
             }
         }

@@ -40,7 +40,17 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     public var onStreamStopped: (@Sendable () -> Void)?
 
     /// 새 프레임이 큐에 들어왔을 때 (캡처 스레드에서, 락 밖). 소비자가 즉시 drain하도록.
-    public var onFrameAvailable: (@Sendable () -> Void)?
+    ///
+    /// **저장은 락으로 보호한다.** 평범한 `var`로 두면 SCK 샘플 큐가 이 프로퍼티를 *읽는* 동안
+    /// MainActor가 *덮어쓸* 수 있는데, 클로저는 참조 카운트되는 박스라 그 동시 접근이 곧
+    /// over-release다. 해제된 박스는 힙을 깨뜨리고, 트랩은 한참 뒤 **전혀 무관한 곳**에서
+    /// 난다(실측: stablePool·MetalFlow 배열·FrameSlot 세 곳에서 각각 SIGTRAP).
+    /// 캡처 재시작 때마다 이 프로퍼티가 교체되므로 노출 창이 반복해서 열렸다.
+    private var _onFrameAvailable: (@Sendable () -> Void)?
+    public var onFrameAvailable: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onFrameAvailable }
+        set { lock.lock(); _onFrameAvailable = newValue; lock.unlock() }
+    }
 
     public init() {}
 
@@ -76,10 +86,14 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
             if self.pendingSlots.count > 8 {
                 self.pendingSlots.removeFirst(self.pendingSlots.count - 8)
             }
+            // 콜백을 **락 안에서 지역 변수로 복사**한 뒤, 호출은 락 밖에서 한다.
+            // 복사가 락 안이라 박스의 retain이 교체와 겹치지 않고, 호출이 락 밖이라
+            // 재진입 안전은 그대로다(소비자가 drainFrames를 불러도 교착하지 않는다).
+            let notify = self._onFrameAvailable
             self.lock.unlock()
             // 도착 즉시 알림 — 소비자가 렌더 틱을 기다리지 않고 인제스트를 시작할 수 있게.
-            // 틱을 기다리면 평균 ½틱(~4.2ms)이 그냥 버려진다 (락 밖에서 호출: 재진입 안전).
-            self.onFrameAvailable?()
+            // 틱을 기다리면 평균 ½틱(~4.2ms)이 그냥 버려진다.
+            notify?()
         }
         self.outputHandler = handler
 

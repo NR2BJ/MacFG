@@ -19,7 +19,16 @@ public final class CaptureManager: Sendable {
     nonisolated(unsafe) public var onStreamStopped: (@Sendable () -> Void)?
 
     /// 새 프레임 도착 즉시 콜백 (캡처 스레드) — 소비자가 렌더 틱을 기다리지 않고 인제스트하도록.
-    nonisolated(unsafe) public var onFrameAvailable: (@Sendable () -> Void)?
+    ///
+    /// **대입은 즉시 sckCapture로 전파한다.** 예전엔 startCapture 시점에 한 번만 복사해서,
+    /// 정지 경로의 `onFrameAvailable = nil`("콜백 인제스트 즉시 차단")이 실제로는 아무것도
+    /// 차단하지 못했다 — SCK는 낡은 클로저를 계속 호출했고, 인제스트를 실제로 막은 건
+    /// 소비자 쪽 isCapturingMirror 가드뿐이었다.
+    nonisolated(unsafe) private var _onFrameAvailable: (@Sendable () -> Void)?
+    nonisolated(unsafe) public var onFrameAvailable: (@Sendable () -> Void)? {
+        get { _onFrameAvailable }
+        set { _onFrameAvailable = newValue; sckCapture.onFrameAvailable = newValue }
+    }
 
     public init() {}
 
@@ -29,7 +38,7 @@ public final class CaptureManager: Sendable {
         // ScreenCaptureKit 먼저 시도 (영역 캡처는 SCK 전용)
         do {
             sckCapture.onStreamStopped = onStreamStopped
-            sckCapture.onFrameAvailable = onFrameAvailable
+            sckCapture.onFrameAvailable = _onFrameAvailable
             try await sckCapture.startCapture(windowID: windowID, device: device, captureRect: captureRect)
             activeSource = sckCapture
             _activeMethod = .screenCaptureKit

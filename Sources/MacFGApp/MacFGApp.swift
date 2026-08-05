@@ -42,6 +42,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 진단 빌드(Info.plist의 LSEnvironment로 MACFG_DIAGBUILD=1)에서는 stderr를 파일로 돌린다.
+        // NSZombieEnabled가 내는 "message sent to deallocated instance <클래스> 0x…"는 stderr로만
+        // 나가는데, Finder로 띄운 .app의 stderr는 아무 데도 안 남아서(통합 로그에도 안 옴)
+        // **정작 필요한 한 줄을 못 봤다**. 크래시 리포트에는 ___forwarding___ 프레임만 남는다.
+        if Knob.string("MACFG_DIAGBUILD") == "1" {
+            _ = freopen("/tmp/MacFG_stderr.log", "a", stderr)
+            setvbuf(stderr, nil, _IONBF, 0)
+            FileHandle.standardError.write("=== MacFG 진단 시작 \(Date()) ===\n".data(using: .utf8)!)
+        }
         // 메뉴바 전용 — Dock 아이콘·⌘Tab 제거. 창 없이 상주하므로 닫기로 종료되지 않는다.
         // 활성화 정책은 **설정값을 따른다** — 예전엔 .accessory로 하드코딩돼 있어서
         // menuBarOnly 설정이 로드·저장은 되는데 실제로 적용되는 곳이 없는 죽은 상태였다.

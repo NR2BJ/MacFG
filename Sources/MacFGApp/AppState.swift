@@ -577,8 +577,17 @@ public final class AppState {
         MetalFlowEngine.motionSmoothness = Float(motionSmoothness)
         if d.object(forKey: "s.bsoft") != nil { boundarySoftness = d.double(forKey: "s.bsoft") }
         MetalFlowEngine.boundarySoftness = Float(boundarySoftness)
-        // 배치는 업스케일 모드에서 파생
-        selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+        // 배치는 업스케일 모드에서 파생 — 단, `s.placement`가 있으면 그것이 이긴다.
+        // 파생 규칙만 있으면 뷰어 창 배치를 무인으로 재현할 방법이 없어서(업스케일을 켜야만
+        // 뷰어가 되는데 그러면 GPU 부하가 같이 바뀌어 A/B가 교란된다) 뷰어 전용 문제
+        // (마우스 진입 시 프레임 드랍 제보)를 시험할 수 없었다.
+        //   defaults write com.macfg.MacFG s.placement -string viewer
+        //   defaults delete com.macfg.MacFG s.placement     ← 파생 규칙으로 복귀
+        if let forced = d.string(forKey: "s.placement") {
+            selectedOverlayPlacement = (forced == "viewer" || forced == "beside") ? .viewerWindow : .coverSource
+        } else {
+            selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+        }
     }
 
     /// 오클루전 방향별 워프 토글 (실험) — 정적 var를 워프가 매 쌍 읽으므로 캡처 중에도 즉시 반영.
@@ -1188,7 +1197,29 @@ public final class AppState {
         }
     }
 
+
+    /// 렌더 전용 상태를 만지는 곳에서 스레드를 확인한다. **트랩하지 않고 로그만 남긴다** —
+    /// 크래시는 이미 나고 있고, 필요한 건 "누가 범인인가"이지 또 한 번의 크래시가 아니다.
+    ///
+    /// 배경: stablePool / timeline / prevStable 은 락 없이 렌더 스레드 전용이라는 전제로 쓰인다.
+    /// 그 전제가 깨지면 배열 버퍼가 교체되는 사이 옛 버퍼를 인덱싱해 **이미 해제된 텍스처를
+    /// retain** 하게 되고, 그게 실제 크래시로 관측됐다(2026-08-05, 좀비 확인:
+    /// `-[AGXG16GFamilyTexture retain]: message sent to deallocated instance`).
+    /// 크래시 지점은 acquireStableTexture와 MetalFlowEngine.encodePair 두 곳으로 서로 다른데,
+    /// 이는 특정 배열의 버그가 아니라 **공유 상태에 대한 레이스**라는 신호다.
+    nonisolated private func checkRenderThread(_ site: String) {
+        guard raceCheckEnabled else { return }
+        let name = Thread.current.name ?? ""
+        guard name != "MacFG.Render" else { return }
+        // 호출 경로를 남긴다 — 정적 호출부는 둘 다 렌더 스레드 클로저 안이라
+        // 코드만 읽어서는 이 경로를 못 찾는다. 위반은 드물어 스택 수집 비용이 무해하다.
+        let stack = Thread.callStackSymbols.prefix(14).map { $0.split(separator: " ").dropFirst(3).prefix(6).joined(separator: " ") }
+        DiagnosticLog.shared.log("[RACE] \(site) — 렌더 스레드가 아님: '\(name.isEmpty ? "(무명)" : name)' main=\(Thread.isMainThread)\n  " + stack.joined(separator: "\n  "))
+    }
+    @ObservationIgnored nonisolated(unsafe) private let raceCheckEnabled = Knob.string("MACFG_DIAGBUILD") == "1"
+
     nonisolated private func resetScheduler() {
+        checkRenderThread("resetScheduler")
         uiDetector?.reset()   // 불연속(재시작/리사이즈) — 정지-UI 누적도 리셋
         timeline = []
         inFlightTextures = [:]
@@ -1634,6 +1665,7 @@ public final class AppState {
     /// 인코딩 CPU가 한 번에 8ms를 넘겨 다음 vsync 콜백을 삼키는 것을 막는다. 나머지는
     /// pendingIngest에 남아 다음 호출로 이월 (타임스탬프 보존, 표시는 latencyOffset 뒤라 무해).
     nonisolated private func drainAndIngest(maxCount: Int) {
+        checkRenderThread("drainAndIngest")
         // **인제스트 시간을 잰다 — 지금까지 아무도 안 쟀던 구간.**
         // CAMetalDisplayLink는 렌더 스레드 런루프의 소스이고, 이 인제스트는 performAsync로
         // **같은 런루프**에 올라간다. 링크는 큐잉을 하지 않아서, 다음 vsync 전에 서비스되지
@@ -2333,6 +2365,7 @@ public final class AppState {
 
     /// 사용 중이지 않은 풀 텍스처 획득 (타임라인/직전 소스/마지막 표시/인플라이트 제외)
     nonisolated private func acquireStableTexture(width: Int, height: Int) -> (any MTLTexture)? {
+        checkRenderThread("acquireStableTexture")
         if width != stablePoolWidth || height != stablePoolHeight {
             stablePool = []
             stablePoolWidth = width
@@ -2395,9 +2428,9 @@ public final class AppState {
         let tickCPUAvg = diagTickCPUSum / 240.0
         let pointerEvents = PointerTapStats.drain()
         let ingAvg = diagIngestSamples > 0 ? diagIngestSum / Double(diagIngestSamples) : 0
-        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) mouse=%llu ing=%.2f/%.1fms ingOver=%d",
+        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) mouse=%llu foreign=%llu ing=%.2f/%.1fms ingOver=%d",
                                tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax,
-                               pointerEvents, ingAvg, diagIngestMax, diagIngestOver)
+                               pointerEvents, renderDriver.foreignTickDrops, ingAvg, diagIngestMax, diagIngestOver)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
         // 콘텐츠 간격 통계 (wobble 지표)

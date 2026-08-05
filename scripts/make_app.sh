@@ -62,6 +62,23 @@ for m in 180 216 240 288 360 432 540; do
   fi
 done
 
+# 진단 빌드: MACFG_DIAGENV=1 이면 malloc/zombie 계측 환경변수를 **번들에** 심는다.
+#
+# 왜 번들인가: 이 변수들은 프로세스 시작 전에 있어야 해서 셸에서 띄우며 주는 게 보통인데,
+# macOS 26은 앱을 띄운 프로세스를 메뉴바 항목 소유자로 기록해서 셸 실행이 반복되면
+# 허용 목록이 깨진다(2026-07-25, 복구에 하루). LSEnvironment는 Launch Services가
+# Finder 실행에도 적용하므로 셸 없이 같은 효과를 낸다.
+#
+# NSZombieEnabled: 해제된 ObjC 객체를 좀비로 남겨, 죽은 객체를 만졌을 때 트랩 대신
+#   "message sent to deallocated instance <클래스> 0x…" 를 남긴다. 지금 크래시는
+#   swift_unknownObjectRetain 트랩이라 **어떤 객체가 죽었는지 알 수 없다** — 좀비가 그걸 준다.
+#   메모리를 반환하지 않으므로 릴리즈에는 절대 넣지 않는다.
+LSENV=""
+if [ "${MACFG_DIAGENV:-0}" = "1" ]; then
+  LSENV=$'\n    <key>LSEnvironment</key><dict>\n      <key>NSZombieEnabled</key><string>YES</string>\n      <key>MallocScribble</key><string>1</string>\n      <key>MACFG_DIAGBUILD</key><string>1</string>\n    </dict>'
+  echo "   ⚠︎ 진단 환경변수 삽입 (NSZombieEnabled, MallocScribble) — 릴리즈용 아님"
+fi
+
 cat > "$APP/Contents/Info.plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -82,7 +99,7 @@ cat > "$APP/Contents/Info.plist" << PLIST
     <key>LSUIElement</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSHumanReadableCopyright</key><string>MIT License</string>
+    <key>NSHumanReadableCopyright</key><string>MIT License</string>${LSENV}
 </dict>
 </plist>
 PLIST

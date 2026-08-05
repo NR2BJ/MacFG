@@ -29,6 +29,11 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
     private let threadReady = DispatchSemaphore(value: 0)
     private var link: CAMetalDisplayLink?
     private var handler: ((Tick) -> Void)?
+    /// 렌더 스레드 자신 — 콜백이 정말 이 스레드에서 왔는지 확인하는 데 쓴다.
+    /// threadReady 세마포어가 happens-before를 만들어, 기동 이후 읽기는 안전하다.
+    private var renderThread: Thread?
+    /// 다른 스레드에서 배달돼 버린 콜백 수 (진단)
+    private(set) nonisolated(unsafe) var foreignTickDrops: UInt64 = 0
 
     /// 렌더 스레드 기동 (1회) — 런루프를 더미 소스로 유지
     private func ensureThread() {
@@ -40,7 +45,7 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
         let t = Thread { [weak self] in
             guard let self else { return }
             let rl = CFRunLoopGetCurrent()
-            self.lock.lock(); self.runLoop = rl; self.lock.unlock()
+            self.lock.lock(); self.runLoop = rl; self.renderThread = Thread.current; self.lock.unlock()
             self.threadReady.signal()
             var ctx = CFRunLoopSourceContext()
             if let src = CFRunLoopSourceCreate(nil, 0, &ctx) {
@@ -130,6 +135,33 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
 
     private var cbCount = 0
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        // **렌더 스레드가 아니면 버린다.**
+        //
+        // 링크를 전용 스레드 런루프에 붙여도(attach의 `link.add(to: RunLoop.current …)`),
+        // AppKit의 UpdateCycle이 **메인 스레드에서도** 같은 콜백을 때린다. 실측 스택
+        // (2026-08-05, 좀비 빌드):
+        //   CA::Display::DisplayLink::dispatch_deferred_display_links
+        //   → stepTransactionFlush → __CFRUNLOOP_IS_CALLING_OUT_TO_AN_OBSERVER_CALLBACK_FUNCTION__
+        //   → metalDisplayLink(needsUpdate:) → onDisplayLinkTick → drainAndIngest
+        //
+        // 그러면 핸들러가 렌더 스레드와 메인 스레드에서 **동시에** 돌면서, 락 없이
+        // "렌더 스레드 전용"으로 다루던 상태(stablePool·timeline·prevStable·엔진 링)를 같이
+        // 만진다. 배열이 교체되는 사이 옛 버퍼를 인덱싱하면 이미 해제된 텍스처를 retain 하게 되고,
+        // 그게 실제 크래시다 — 좀비로 확인:
+        //   *** -[AGXG16GFamilyTexture retain]: message sent to deallocated instance
+        // 터지는 지점이 acquireStableTexture와 MetalFlowEngine.encodePair로 서로 달랐던 것도
+        // 특정 배열의 버그가 아니라 공유 상태 레이스였기 때문이다.
+        //
+        // 마우스를 움직이면 메인 런루프의 CA 트랜잭션 플러시가 잦아져 재현율이 급등한다
+        // ("마우스 들락날락하면 앱이 꺼진다"는 제보의 정체).
+        //
+        // 버려도 되는 이유: 메인發 배달은 전체의 0.4%다(45초에 22회 vs 초당 ~140틱).
+        // 렌더 스레드가 자기 콜백을 정상적으로 받고 있으므로 페이싱에 영향이 없다.
+        lock.lock(); let rt = renderThread; lock.unlock()
+        if let rt, Thread.current !== rt {
+            foreignTickDrops &+= 1
+            return
+        }
         cbCount += 1
         if cbCount <= 3 || cbCount % 600 == 0 {
             DiagnosticLog.shared.log("[DRIVER] update #\(cbCount) target=\(update.targetPresentationTimestamp)")

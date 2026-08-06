@@ -27,13 +27,23 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 오검출 → 보간 폐기 → 25~50ms 구멍(실측 cut=1~9/2s). 진짜 하드컷은 교집합이 ~0이라 안전.
     private let sceneCutIntersectionThreshold = 0.25
 
-    /// flow 밀도 (긴 변 목표). 앱 시작 시 1회 설정(--flow-base) 후 읽기 전용 — 락 불필요.
+    /// flow 밀도 (긴 변 목표).
+    ///
+    /// **"시작 시 1회 설정 후 읽기 전용 — 락 불필요"는 사실이 아니다** (예전 주석을 정정).
+    /// 실사용에선 AutoFlowScaler와 거버너가 **캡처 중에** 이 값을 바꾼다 — MainActor 쓰기
+    /// (AppState의 applyGovernorDials)와 렌더 스레드 읽기(아래 워프 인코딩)가 교차한다.
+    /// Double 스칼라라 찢어진 값이 나오지는 않고 크래시 부류도 아니지만, 한 쌍을 인코딩하는
+    /// 도중에 값이 바뀔 수 있다는 뜻이다. 그 전제로 읽어라.
     /// 4K 쌍당 실측 (M4): gather 최적화 전 8.3ms → 후 5.6ms (base 960). 1080p 3.7ms.
     /// 960 = 60fps 예산(16.7ms) 내 최대 밀도 — 기본값. 1280은 30fps 이하 콘텐츠용 여지.
     // 기본 1440 (구 960) — MetalFlow(고전 광학흐름)는 4K에서도 flow를 1440p로 6.2ms에 돌린다
-    // (RIFE 신경 predict 288p=12ms의 절반, 예산 대폭 여유). flow 해상도가 높을수록 **빠른 모션의
-    // 큰 변위**를 잘 잡아 저더가 준다 — RIFE는 predict 비용 때문에 288p에 갇혀 빠른 4K 모션이
-    // 부들거리는데, MetalFlow는 그 캡이 없다. 소스보다 크면 min(1.0, base/long)로 소스 res에 캡.
+    // (RIFE 신경 predict 288p=12ms의 절반, 예산 대폭 여유). 소스보다 크면 min(1.0, base/long)로 캡.
+    //
+    // **"flow 해상도가 높을수록 저더가 준다"는 반박됐다** (df7e6bf 실측): 같은 클립에서
+    // 480 = 23.33dB vs 1440 = 23.20dB 로 오히려 낮은 쪽이 미세하게 좋았다. 그래서 같은 커밋이
+    // 사다리 천장을 800으로 내렸다. 이 기본값 1440은 그 사실을 알고도 남겨둔 것이다 —
+    // 실사용에선 AutoFlowScaler 천장(800)이 먼저 걸리고, InterpBench는 --flow-base 미지정 시
+    // 헤더에 flow base를 안 찍어서 기본값을 바꾸면 과거 출력과 구분이 불가능해진다.
     /// MACFG_MFFLOWBASE로 오프라인 A/B 가능 — 다른 MF 노브는 전부 env 게이트가 있는데 이것만
     /// 빠져 있어 벤치에서 flow 해상도를 고정 비교할 수 없었다(실측 시도가 전부 같은 값으로 돌았다).
     /// 실사용에선 AutoFlowScaler/거버너가 이 값을 덮어쓴다.

@@ -306,9 +306,10 @@ public final class OverlayWindow: NSObject {
             window.title = title
             // 메뉴바(24)·Dock(20) 위로 — 화면 전체를 덮음. Firefox PiP(.floating 3)도 당연히 아래.
             // 레벨은 노브로 바꿀 수 있다 (측정용). 기본은 shielding — 메뉴바(24)·Dock(20) 위를 덮기 위함.
-            // 다른 앱이 전체화면 Space를 쥐면 이 창이 그 Space에 못 올라가는 문제를 추적 중이라
-            // 레벨이 원인인지 한 빌드로 여러 값을 시험할 수 있어야 한다.
             //   defaults write com.macfg.MacFG env.MACFG_VIEWERLEVEL -string 1000   (screenSaver)
+            // **레벨은 전체화면 Space 문제의 원인이 아니다 — 2026-08-06에 기각됐다.**
+            // shielding(2147483628)과 screenSaver(1000) 둘 다 onActiveSpace=false로 같았다.
+            // 이 노브는 그 기각을 재확인하는 용도로만 남는다. 자세한 것은 setVisible의 주석 참조.
             window.level = NSWindow.Level(rawValue: Knob.int("MACFG_VIEWERLEVEL") ?? Int(CGShieldingWindowLevel()))
             window.isOpaque = true
             window.backgroundColor = .black

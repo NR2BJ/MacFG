@@ -216,10 +216,19 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var stgCb2Gpu = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgWork = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgCount = 0
-    /// present 커맨드 버퍼 GPU 시간 — **지금까지 유일하게 안 재던 구간.**
-    /// 실측(2026-08-05)으로 여기가 천장임이 확정됐다: 보간을 완전히 끄고(cb2gpu=0, chain=1.1ms)
-    /// present만 매 틱 하게 했더니 틱이 130Hz → 100Hz로 무너지고 갭이 20 → 70이 됐다.
-    /// 즉 틱 굶주림의 원인은 보간 부하가 아니라 present 자체의 처리량이다.
+    /// present 커맨드 버퍼 GPU 시간 — 지금까지 유일하게 안 재던 구간.
+    ///
+    /// **주의 — 이 계측이 처음 내놓은 결론은 철회됐다(63853b1).**
+    /// 2026-08-05에 "present만 매 틱 하면 틱이 130→100Hz로 무너진다"를 관측하고 present 처리량이
+    /// 천장이라고 적었으나, 그 A/B는 조건마다 앱을 재시작해 그 사이 라이브 방송 콘텐츠가 흘러갔다.
+    /// 두 시기의 실제 차이는 capIngest 13.8ms vs 1.9ms였고 우리 GPU 비용은 같았다. 같은 실행 안에서
+    /// 등짝으로 다시 재니 보간 ON + 매 틱 present에서 tick 132Hz / present 122·표시 97로
+    /// **재현되지 않았다**. 조건별 재시작 A/B는 이 프로젝트에서 신뢰할 수 없다 —
+    /// 한 실행 안 창별 상관으로 봐라(scripts/correlate.py). 관련 상관은 아래 1552/1688행.
+    ///
+    /// 계측 자체는 유효하니 남긴다. 측정이 틀린 게 아니라 해석이 틀렸다.
+    /// 그리고 **"그러므로 present 경로는 무죄"로 읽지 마라** — present 측 손실은 별개로 살아 있는
+    /// 사안이다(2246~2261행의 slip 실측 7,696프레임, 1638행 부근).
     @ObservationIgnored nonisolated(unsafe) private var stgPresentGpu = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgPresentCount = 0
     @ObservationIgnored private let stageLock = NSLock()
@@ -622,7 +631,8 @@ public final class AppState {
             logger.warning("attachRenderDriver: no surface")
             return
         }
-        renderSurface = surface
+        // **AppKit 접근(NSScreen)은 반드시 여기서, 메인에서.** 아래 perform 블록은 렌더 스레드에서
+        // 돌므로 그 안에서 outputScreen을 읽으면 렌더 스레드가 AppKit을 만지게 된다.
         mirrorRefreshRate = Double(overlayManager?.outputScreen?.maximumFramesPerSecond ?? 120)
         let attachW = Int(surface.metalLayer.drawableSize.width)
         // **부착 조건을 남긴다.** 이게 없어서 "왜 120이 안 나오나"를 추적하는 내내 정작
@@ -633,6 +643,20 @@ public final class AppState {
             + " drawable=\(attachW)x\(Int(surface.metalLayer.drawableSize.height))"
             + " maxDrawables=\(surface.metalLayer.maximumDrawableCount)"
             + " vsync=\(surface.metalLayer.displaySyncEnabled)")
+        // **renderSurface 교체는 렌더 스레드에서 한다.**
+        // 이 시점엔 옛 CAMetalDisplayLink가 아직 살아 있다 — invalidate는 바로 아래
+        // renderDriver.attach의 performSync 안에서야 실행된다. 그 사이 렌더 스레드는
+        // presentEntry의 `guard let surface = renderSurface`로 이 필드를 retain한다.
+        // 배치 전환 경로에서는 직전에 OverlayManager가 overlayWindow를 nil로 만들어
+        // 이 필드가 옛 RenderSurface의 **마지막 강참조**이므로, 메인에서 대입하는 순간
+        // dealloc이 시작되고 렌더 스레드가 해제 중인 객체를 retain하게 된다 —
+        // 2026-08-05 크래시(-[AGXG16GFamilyTexture retain] on deallocated instance)와 같은 서명.
+        // 드라이버가 안 돌 때(생애 최초 attach)는 perform이 조용한 no-op이라 직접 대입해야 한다.
+        if renderDriver.isRunning {
+            renderDriver.perform { [weak self] in self?.renderSurface = surface }
+        } else {
+            renderSurface = surface
+        }
         renderDriver.attach(layer: surface.metalLayer) { [weak self] tick in
             self?.onDisplayLinkTick(
                 timestamp: tick.timestamp,
@@ -1218,15 +1242,31 @@ public final class AppState {
         guard raceCheckEnabled else { return }
         let name = Thread.current.name ?? ""
         guard name != "MacFG.Render" else { return }
+        // **레이트 리밋.** 스택 수집(callStackSymbols)은 싸지 않다. "위반은 드물다"는 전제는
+        // 당시 알려진 0.4% 비율에 맞춘 것이고, 미지의 고빈도 위반에서는 이 계측 자체가 앱을 세운다.
+        // 처음 3회 + 이후 600회마다만 남긴다 (RenderDriver의 폐기 로그와 같은 공식).
+        let n = raceHits.withLock { $0[site, default: 0] += 1; return $0[site] ?? 0 }
+        guard n <= 3 || n % 600 == 0 else { return }
         // 호출 경로를 남긴다 — 정적 호출부는 둘 다 렌더 스레드 클로저 안이라
         // 코드만 읽어서는 이 경로를 못 찾는다. 위반은 드물어 스택 수집 비용이 무해하다.
         let stack = Thread.callStackSymbols.prefix(14).map { $0.split(separator: " ").dropFirst(3).prefix(6).joined(separator: " ") }
         DiagnosticLog.shared.log("[RACE] \(site) — 렌더 스레드가 아님: '\(name.isEmpty ? "(무명)" : name)' main=\(Thread.isMainThread)\n  " + stack.joined(separator: "\n  "))
     }
-    @ObservationIgnored nonisolated(unsafe) private let raceCheckEnabled = Knob.string("MACFG_DIAGBUILD") == "1"
+    /// 레이스 검사 활성 여부. **개발 로그 토글에도 묶는다.**
+    /// 예전엔 `MACFG_DIAGBUILD` 환경변수 전용이었는데, 환경변수는 Finder 더블클릭으로 켠 .app에
+    /// 전달되지 않는다 — 즉 검사기가 있는데 **실사용 빌드에서 구조적으로 도달 불가**였다.
+    /// 같은 함정을 stageDbg가 이미 겪고 UserDefaults 폴백으로 고쳤다(위 주석 참조).
+    /// site별 위반 횟수 — 스택 수집 레이트 리밋용
+    @ObservationIgnored private let raceHits = OSAllocatedUnfairLock(initialState: [String: Int]())
+    @ObservationIgnored nonisolated(unsafe) private var raceCheckEnabled =
+        Knob.string("MACFG_DIAGBUILD") == "1" || UserDefaults.standard.bool(forKey: "s.devlog")
 
     nonisolated private func resetScheduler() {
-        checkRenderThread("resetScheduler")
+        // 드라이버가 안 돌 때는 이 상태를 만지는 스레드가 우리뿐이라 메인 호출이 **의도된** 것이다
+        // (startCapture의 else 분기). 그 정상 경로를 위반으로 찍으면 캡처를 시작할 때마다
+        // [RACE]가 나와서, 진짜 위반이 섞여 들어와도 아무도 안 보게 된다 — 검사기를 켜는 것보다
+        // 나쁜 결과다. 그래서 드라이버가 도는 동안에만 검사한다.
+        if renderDriver.isRunning { checkRenderThread("resetScheduler") }
         uiDetector?.reset()   // 불연속(재시작/리사이즈) — 정지-UI 누적도 리셋
         timeline = []
         inFlightTextures = [:]
@@ -2901,7 +2941,9 @@ public final class AppState {
     /// U2 전체화면/PiP 재타깃: 소스 앱(PID)의 온스크린 창 중 디스플레이를 거의 덮는(≥92%)
     /// 전체화면 창이 새로 나타나면 그리로 무중단 재타깃, 사라지면 원 창 복귀. YouTube 등 HTML5
     /// 전체화면이 새 창을 만들어 원 창엔 검정+썸네일만 남는 문제 대응. statsTimer(0.5s)에서 호출.
-    /// MACFG_NO_RETARGET로 비활성. 영역캡처 중엔 비활성(크롭이 원 창 기준이라).
+    /// **MACFG_RETARGET=1일 때만 동작하는 opt-in이다** (기본 OFF). 예전 주석은 "MACFG_NO_RETARGET로
+    /// 비활성"이라 적혀 있었는데 그런 노브는 존재한 적이 없고 극성도 반대였다 — 아래 guard 참조.
+    /// 영역캡처 중엔 비활성(크롭이 원 창 기준이라).
     private func detectFullscreenRetarget() {
         // MACFG_RETARGET=1일 때만 동작 (기본 OFF — 일반 캡처에서 PiP/잔재 창 오탐으로 회귀).
         // 소스 앱이 만든 전체화면 창(f키 플레이어 전체화면)을 전 화면 후보에서 추적해 재타깃.

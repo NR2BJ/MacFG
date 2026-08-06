@@ -305,7 +305,11 @@ public final class OverlayWindow: NSObject {
             )
             window.title = title
             // 메뉴바(24)·Dock(20) 위로 — 화면 전체를 덮음. Firefox PiP(.floating 3)도 당연히 아래.
-            window.level = NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+            // 레벨은 노브로 바꿀 수 있다 (측정용). 기본은 shielding — 메뉴바(24)·Dock(20) 위를 덮기 위함.
+            // 다른 앱이 전체화면 Space를 쥐면 이 창이 그 Space에 못 올라가는 문제를 추적 중이라
+            // 레벨이 원인인지 한 빌드로 여러 값을 시험할 수 있어야 한다.
+            //   defaults write com.macfg.MacFG env.MACFG_VIEWERLEVEL -string 1000   (screenSaver)
+            window.level = NSWindow.Level(rawValue: Knob.int("MACFG_VIEWERLEVEL") ?? Int(CGShieldingWindowLevel()))
             window.isOpaque = true
             window.backgroundColor = .black
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -669,7 +673,50 @@ public final class OverlayWindow: NSObject {
     /// 표시/숨김
     public func setVisible(_ visible: Bool) {
         if visible {
-            window.orderFront(nil)
+            // **orderFrontRegardless** — orderFront가 아니다.
+            // MacFG는 LSUIElement 백그라운드 앱이라 스스로 활성화되지 않는다. 그 상태에서
+            // orderFront(nil)는 "우리 앱이 활성화될 때" 앞으로 나오는 것으로 지연될 수 있고,
+            // 다른 앱이 전체화면 Space를 쥐고 있으면 창이 데스크톱 Space에 남는다.
+            // 실측 2026-08-06(소스 전체화면): isVisible=true인데 onActiveSpace=false,
+            // occlusion=hidden → 화면에 안 보이고 CAMetalDisplayLink도 발화하지 않아
+            // 파이프라인 전체가 조용히 멈췄다([DRIVER] update 0줄, interpEnc=0).
+            // Regardless는 앱 활성화와 무관하게 즉시 올린다 — 전체화면 위에 뜨는 유틸리티들이
+            // 쓰는 방식이다.
+            window.orderFrontRegardless()
+            // **창이 실제로 보이는 Space에 올라갔는지 확인한다.**
+            // 소스가 macOS 전체화면(자기 Space)이면 우리 창이 데스크톱 Space에 남아
+            // 화면에 안 나오고, 그러면 CAMetalDisplayLink도 발화하지 않아 파이프라인 전체가
+            // 조용히 멈춘다([DRIVER] update 0줄, [SCHED] 0줄 — 실측 2026-08-06).
+            // collectionBehavior에 canJoinAllSpaces가 걸려 있는데도 그렇다면 그 사실 자체가
+            // 필요한 정보다. orderFront 직후는 아직 반영 전이라 한 박자 뒤에 본다.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self else { return }
+                let occ = self.window.occlusionState.contains(.visible) ? "visible" : "hidden"
+                DiagnosticLog.shared.log(
+                    "[WIN] style=\(self.style == .viewer ? "viewer" : "cover") "
+                    + "isVisible=\(self.window.isVisible) onActiveSpace=\(self.window.isOnActiveSpace) "
+                    + "occlusion=\(occ) level=\(self.window.level.rawValue) behavior=\(self.window.collectionBehavior.rawValue) "
+                    + "screen=\(self.window.screen?.localizedName ?? "nil") frame=\(self.window.frame)")
+                // **활성 Space에 못 올라갔으면 조용히 두지 않는다.**
+                //
+                // 다른 앱이 macOS 전체화면(자기 Space)을 쥐고 있으면 우리 출력 창은 그 Space에
+                // 올라가지 못한다. 그러면 화면에 아무것도 안 보이고, 레이어가 화면에 없으니
+                // CAMetalDisplayLink도 발화하지 않아 파이프라인 전체가 침묵한다
+                // ([DRIVER] update 0줄, interpEnc=0). 증상만 보면 "보간이 갑자기 안 된다"이다.
+                //
+                // 2026-08-06에 아래를 전부 시험했고 **모두 실패**했다(같은 재현: Finder를 소스로
+                // 잡고 ⌃⌘F, onActiveSpace=false / occlusion=hidden 고정):
+                //   · orderFront(nil) → orderFrontRegardless()
+                //   · 창 레벨 shielding(2147483628) → screenSaver(1000)
+                //   · collectionBehavior 재적용 후 재-orderFront
+                // collectionBehavior는 내내 257(canJoinAllSpaces|fullScreenAuxiliary)로 살아 있었다.
+                // 즉 창 속성으로는 넘을 수 없는 벽이고, 해법은 다른 층(U4 가상 디스플레이)에 있다.
+                if !self.window.isOnActiveSpace {
+                    DiagnosticLog.shared.log(
+                        "[WIN] ⚠︎ 출력 창이 활성 Space에 없다 — 소스가 macOS 전체화면이면 표시가 불가능하다. "
+                        + "링크가 발화하지 않아 보간도 멈춘다. (창 속성으로는 해결 불가 — 2026-08-06 실측)")
+                }
+            }
             if style == .viewer {
                 // 첫 프레임 레이아웃(레터박스 확정) 후 진입 — 매핑 준비 완료 보장
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in

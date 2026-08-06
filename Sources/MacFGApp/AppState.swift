@@ -329,7 +329,15 @@ public final class AppState {
     /// 매 틱 강제 재present (측정용, MACFG_ALWAYSPRESENT) — present 레이트와 틱 굶주림의 인과 분리.
     @ObservationIgnored nonisolated(unsafe) private let alwaysRepresent = Knob.string("MACFG_ALWAYSPRESENT") == "1"
     /// N틱마다 한 번만 present (측정용, MACFG_PRESENTEVERY). 1이면 매 틱(기본).
-    @ObservationIgnored nonisolated(unsafe) private let presentEveryN = Knob.int("MACFG_PRESENTEVERY") ?? 1
+    ///
+    /// `alt`를 주면 진단 창(240틱)마다 1↔2를 **교대**한다. 조건마다 앱을 재시작하는 A/B는
+    /// 라이브 소스에서 신뢰할 수 없다 — 방송 콘텐츠가 흘러가 소스 fps가 60에서 23으로 바뀌면
+    /// 두 조건이 다른 세계가 된다(2026-08-07 실측으로 한 번 날림). 한 실행 안에서 교대하면
+    /// 콘텐츠 드리프트가 양쪽에 동일하게 실린다.
+    ///   defaults write com.macfg.MacFG env.MACFG_PRESENTEVERY -string alt
+    @ObservationIgnored nonisolated(unsafe) private var presentEveryN = Knob.int("MACFG_PRESENTEVERY") ?? 1
+    @ObservationIgnored nonisolated(unsafe) private let presentEveryAlternates =
+        Knob.string("MACFG_PRESENTEVERY") == "alt"
 
     /// 사용자가 고른 flow 해상도 (거버너 상한 계산의 기준값)
     @ObservationIgnored private var userFlowBase: Double = MetalFlowEngine.flowBaseLongSide
@@ -2579,7 +2587,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) every=\(presentEveryN) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2617,6 +2625,7 @@ public final class AppState {
         diagPresentDropped = 0
         diagSlipHist = [0, 0, 0, 0]
         diagDupTargetSlot = 0
+        if presentEveryAlternates { presentEveryN = presentEveryN == 1 ? 2 : 1 }
         diagInterpPresentCount = 0
         diagPoolExhaustCount = 0
         diagInterpEncodedCount = 0

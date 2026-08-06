@@ -160,6 +160,12 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
         lock.lock(); let rt = renderThread; lock.unlock()
         if let rt, Thread.current !== rt {
             foreignTickDrops &+= 1
+            // **버린 사실 자체를 남긴다.** 버린 콜백은 [SCHED]의 foreign=N으로만 보이는데,
+            // 그 로그는 틱이 돌아야 나온다 — 즉 "전부 버려서 틱이 아예 없는" 상태에서는
+            // 진단이 원리적으로 도달 불가다(실측 2026-08-06 전체화면에서 그 함정에 빠졌다).
+            if foreignTickDrops <= 3 || foreignTickDrops % 600 == 0 {
+                DiagnosticLog.shared.log("[DRIVER] 외부 스레드 콜백 폐기 #\(foreignTickDrops) (thread=\(Thread.current.name ?? "(무명)") main=\(Thread.isMainThread))")
+            }
             return
         }
         cbCount += 1

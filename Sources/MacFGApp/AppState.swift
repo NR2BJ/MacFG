@@ -789,7 +789,14 @@ public final class AppState {
         // 창 목록에 대상이 뜰 때까지 재시도 (최대 15초)
         for _ in 0..<30 {
             refreshWindowList()
-            if let target = availableWindows.first(where: { $0.displayName.lowercased().contains(titleSub) }) {
+            // **가장 큰 매치를 고른다** (first가 아니라).
+            // 소스가 macOS 전체화면이면 같은 앱의 창 목록에 제목 없는 3840x68짜리 조각 창이
+            // 함께 뜨는데(실측 2026-08-06, Firefox 전체화면), first는 그걸 잡아 캡처가 시작은
+            // 되지만 프레임이 한 장도 안 온다 — 사용자에겐 "전체화면 소스는 보간도 안 되고
+            // 정보 오버레이도 안 뜬다"로 보인다. 면적이 가장 큰 창이 언제나 사용자가 의도한 창이다.
+            if let target = availableWindows
+                .filter({ $0.displayName.lowercased().contains(titleSub) })
+                .max(by: { $0.width * $0.height < $1.width * $1.height }) {
                 selectedWindowID = target.windowID
                 selectedWindowName = target.displayName
                 DiagnosticLog.shared.log("[AUTO] capturing '\(target.displayName)' mode=\(selectedRenderMode.rawValue) placement=\(selectedOverlayPlacement.rawValue)")

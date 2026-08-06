@@ -159,14 +159,30 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
             throw CaptureError.windowNotFound
         }
-        let excluded = content.windows.filter { excludingWindowIDs.contains($0.windowID) }
+        var excluded = content.windows.filter { excludingWindowIDs.contains($0.windowID) }
+        // **제외가 0개면 한 번 다시 본다.**
+        // 전체화면 전환은 (a) viewer 창 재생성 → (b) 디스플레이 캡처 전환 순으로 30ms 안에
+        // 일어나는데, 갓 만들어진 창은 SCShareableContent 스냅샷에 아직 안 들어와 있을 수 있다.
+        // 그러면 우리 출력이 캡처에 포함돼 **자기 출력을 되먹는다** — 전체화면이라 우리 창이
+        // 화면을 꽉 채우므로 되먹임이 눈에 안 띄고, 대신 합성 부하만 배로 늘어 프레임이 밀린다
+        // (실측 2026-08-06: 전체화면에서 미표시 46% vs 창 모드 15%).
+        if excluded.isEmpty && !excludingWindowIDs.isEmpty {
+            try? await Task.sleep(for: .milliseconds(120))
+            if let retry = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) {
+                excluded = retry.windows.filter { excludingWindowIDs.contains($0.windowID) }
+                DiagnosticLog.shared.log("[SCK-DISPLAY] 제외 목록 재시도 → \(excluded.count)개 (요청 \(excludingWindowIDs.count)개)")
+            }
+        }
         self.captureRect = nil
         self.captureScale = Self.findScaleFactor(for: display.frame)
         let w = display.width, h = display.height          // 디스플레이는 이미 픽셀 단위
         try await stream.updateContentFilter(SCContentFilter(display: display, excludingWindows: excluded))
         try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
         isDisplayCapture = true
-        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h), 제외 창 \(excluded.count)개")
+        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h), 제외 창 \(excluded.count)/\(excludingWindowIDs.count)개")
+        if excluded.isEmpty && !excludingWindowIDs.isEmpty {
+            DiagnosticLog.shared.log("[SCK-DISPLAY] ⚠︎ 자기 창을 하나도 제외하지 못했다 — 되먹임 위험")
+        }
     }
 
     /// 디스플레이 캡처 중인지 — 전체화면 이탈 시 창 캡처로 되돌릴지 판단용

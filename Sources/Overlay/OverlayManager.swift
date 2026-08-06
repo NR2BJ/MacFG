@@ -164,7 +164,16 @@ public final class OverlayManager {
     public var scaleStatus: String? { overlayWindow?.scaleStatus }
 
     /// 정보 오버레이 (단축키 토글) 표시/갱신 — nil이면 숨김.
-    public func setInfoOverlay(_ text: String?) { overlayWindow?.setInfoOverlay(text) }
+    ///
+    /// **마지막 문구를 기억한다.** 정보 라벨은 출력 창의 서브뷰인데, 배치가 바뀌면
+    /// setPlacement가 창을 통째로 재생성해 라벨이 같이 사라진다. 소스가 전체화면으로 가면
+    /// 자동으로 viewer로 전환되므로(AUTOFS), 정보 오버레이를 켜 둔 채 전체화면에 들어가면
+    /// **오버레이가 조용히 없어졌다** — 실사용 제보 2026-08-06. 창을 다시 만든 뒤 복원한다.
+    public func setInfoOverlay(_ text: String?) {
+        lastInfoText = text
+        overlayWindow?.setInfoOverlay(text)
+    }
+    private var lastInfoText: String?
 
     /// 현재 출력 창의 렌더 표면 (렌더 스레드가 직접 사용 — A2)
     public var currentRenderSurface: RenderSurface? { overlayWindow?.surface }
@@ -209,6 +218,8 @@ public final class OverlayManager {
         overlay.sourcePID = sourcePID
         overlay.sourceWindowID = trackedWindowID ?? 0
         self.overlayWindow = overlay
+        // 창을 새로 만들었으면 정보 오버레이를 복원한다 (라벨은 창에 붙어 있어 같이 사라진다)
+        if let t = lastInfoText { overlay.setInfoOverlay(t) }
 
         applyOcclusionPolicy()
         pollAndUpdateFrame()

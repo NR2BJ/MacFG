@@ -1866,6 +1866,16 @@ public final class AppState {
                 self.stageLock.lock(); self.stgCb1Gpu += g; self.stgLastCb1Gpu = g; self.stageLock.unlock()
             }
         }
+        // **소스 버퍼를 blit이 끝날 때까지 붙잡는다.**
+        // slot.texture는 CVPixelBuffer의 IOSurface를 제로카피로 감싼 것인데, Metal이 붙잡는 건
+        // IOSurface뿐이고 **CVPixelBufferPool의 재활용 판정은 CVPixelBuffer의 참조수**를 본다.
+        // SCK 콜백이 반환되면 버퍼가 풀로 돌아가고, 인제스트→blit 실행까지 5~15ms가 걸리는데
+        // 소스는 10ms마다 오므로, 그 사이 같은 표면에 다음 프레임이 쓰이면 blit 결과에 두 프레임이
+        // 섞인다 — 보간을 꺼도 보이는 "프레임 중첩"의 구조적 원인.
+        // 완료 핸들러가 클로저 컨텍스트로 버퍼를 잡고 있다가 GPU가 다 읽은 뒤에 놓아준다.
+        if let srcBuffer = slot.pixelBuffer {
+            cb.addCompletedHandler { _ in withExtendedLifetime(srcBuffer) {} }
+        }
         cb.commit()
         guard let cb2 = workQueue.makeCommandBuffer() else {
             lastAcceptedTimestamp = previousAcceptedTs

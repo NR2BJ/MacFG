@@ -335,7 +335,9 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
         }
 
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        let slot = FrameSlot(texture: texture, timestamp: timestamp, width: width, height: height, contentChanged: contentChanged, contentFingerprint: fingerprint, colorSpace: cachedColorSpace)
+        // pixelBuffer를 함께 싣는다 — texture가 이 버퍼의 IOSurface를 제로카피로 가리키므로,
+        // 소비(=stable blit)가 끝날 때까지 살아 있어야 풀이 같은 표면에 다음 프레임을 덮어쓰지 않는다.
+        let slot = FrameSlot(texture: texture, timestamp: timestamp, width: width, height: height, contentChanged: contentChanged, contentFingerprint: fingerprint, colorSpace: cachedColorSpace, pixelBuffer: pixelBuffer)
         onFrame(slot)
     }
 

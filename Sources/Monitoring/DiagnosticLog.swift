@@ -24,8 +24,12 @@ public final class DiagnosticLog: @unchecked Sendable {
         dateFormatter.timeZone = TimeZone.current
 
         // 무인 테스트(auto-capture/env)나 설정 저장값이면 시작부터 켬
-        let testMode = Knob.string("MACFG_DIAG") != nil
-            || CommandLine.arguments.contains("--auto-capture-title")
+        // 자동 캡처는 CLI 인자와 **defaults 둘 다** 테스트 신호로 친다.
+        // defaults 경로(s.autocapturetitle)는 나중에 추가됐는데 이 판정에 빠져 있어서,
+        // 무인 테스트를 걸어놓고 "왜 로그가 안 남지"로 한 사이클을 날렸다(2026-08-07).
+        let autoCapture = CommandLine.arguments.contains("--auto-capture-title")
+            || !(UserDefaults.standard.string(forKey: "s.autocapturetitle") ?? "").isEmpty
+        let testMode = Knob.string("MACFG_DIAG") != nil || autoCapture
         let on = testMode || UserDefaults.standard.bool(forKey: "s.devlog")
         enabledFlag.withLock { $0 = on }
         if on { queue.async { [weak self] in self?.openHandle() } }

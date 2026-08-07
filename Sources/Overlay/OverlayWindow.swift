@@ -278,7 +278,22 @@ public final class OverlayWindow: NSObject {
             window.level = .floating
             window.isOpaque = false
             window.backgroundColor = .clear
-            window.ignoresMouseEvents = true
+            // 기본은 통과(true) — 커버는 "보기만" 하는 오버레이라 소스 조작을 방해하면 안 된다.
+            //
+            // MACFG_COVEREATMOUSE=1이면 **삼킨다.** 실측 근거(2026-08-07, 한 실행 내 교차):
+            //   실제 브라우저 소스: 마우스를 움직이면 소스 공급이 59.8 → 13.2장/s로 무너지고
+            //     (중복 프레임 비율 58% → 17%), 표시가 89.9 → 11.3/s가 되며 resync 8회, srcInt 최대 210ms.
+            //   결정적 소스(TestPattern): 같은 마우스 부하에서 48.0 → 48.0, 표시 83.0 → 83.4, resync 0.
+            // 즉 이 부하에서 우리 파이프라인은 무죄이고(틱은 143Hz로 정상), 소스 앱이 마우스를
+            // 처리하느라 영상을 진행시키지 못했다. 삼키면 그 현상이 사라진다(59.2장/s 유지, resync 0).
+            //
+            // **다만 이 실측의 마우스는 진짜 마우스가 아니다.** 합성 CGEvent로 만들었고
+            // kCGMouseEventDeltaX/Y·Subtype·Number가 비어 있다 — 실제 HID 마우스가 채우는 필드다.
+            // 사용자는 "보간을 안 켜고 파이어폭스에서 마우스를 까딱여도 네이티브 영상은 안 떨어진다"고
+            // 보고했고, 그게 맞다면 위 붕괴는 **합성 이벤트의 산물**일 수 있다.
+            // 진짜 마우스로 재현되기 전까지 이 노브를 기본값으로 켜지 마라.
+            // 그리고 소스 조작 통과는 커버 배치의 의도된 동작이다 — 성능을 이유로 바꾸지 않는다.
+            window.ignoresMouseEvents = Knob.string("MACFG_COVEREATMOUSE") != "1"
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.hasShadow = false
             window.alphaValue = 1.0

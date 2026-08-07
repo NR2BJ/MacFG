@@ -35,15 +35,40 @@ public final class DiagnosticLog: @unchecked Sendable {
         if on { queue.async { [weak self] in self?.openHandle() } }
     }
 
-    /// queue에서만 호출 — 파일 초기화 + 핸들 오픈
+    /// 한 로그 파일이 커질 수 있는 상한. 넘으면 잘라내고 그 사실을 남긴다.
+    /// 실측 기준 ~1.2KB/s(시간당 4MB)라 이 값은 며칠치다 — 디스크를 채우는 사고만 막는 안전장치.
+    private let maxBytes: UInt64 = 256 * 1024 * 1024
+
+    /// queue에서만 호출 — 핸들 오픈. **파일을 덮어쓰지 않는다.**
+    ///
+    /// 예전엔 실행할 때마다 `atomically: true`로 써서 파일을 잘라냈다. 그런데 이 앱의 A/B는
+    /// "설정 바꾸고 재시작"이 기본 절차라, 앱을 다시 켜는 순간 **직전 조건의 데이터가 사라졌다** —
+    /// 실제로 CAS on/off 비교에서 off 쪽 로그를 통째로 날릴 뻔했다(2026-08-07).
+    /// 세션 경계는 앱 실행이 아니라 **개발자 모드 토글**이다: setEnabled(false)가 파일을 지우므로,
+    /// 모드를 켜 두는 동안의 모든 실행이 한 파일에 누적된다.
     private func openHandle() {
-        let header = "=== MacFG Diagnostic Log — \(Date()) ===\n"
-        try? header.write(to: fileURL, atomically: true, encoding: .utf8)
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: fileURL.path) {
+            fm.createFile(atPath: fileURL.path, contents: nil)
+        }
+        // 상한을 넘었으면 여기서만 잘라낸다 (무한 증가 방지)
+        if let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
+           let size = attrs[.size] as? UInt64, size > maxBytes {
+            try? Data().write(to: fileURL)
+            let note = "=== (이전 로그가 \(size / 1024 / 1024)MB를 넘어 잘라냈습니다) ===\n"
+            try? note.write(to: fileURL, atomically: false, encoding: .utf8)
+        }
         handle = try? FileHandle(forWritingTo: fileURL)
         _ = try? handle?.seekToEnd()
+        // 실행 경계 표식 — 여러 실행이 한 파일에 쌓이므로 구간을 가를 수 있어야 한다.
+        let header = "\n===== MacFG 실행 시작 \(Date()) (pid \(ProcessInfo.processInfo.processIdentifier)) =====\n"
+        if let d = header.data(using: .utf8) { try? handle?.write(contentsOf: d) }
     }
 
-    /// 개발자 모드 토글 — on이면 파일 생성·기록, off면 핸들 닫고 파일 삭제(기록 중단)
+    /// 개발자 모드 토글 — on이면 파일 생성·기록, off면 핸들 닫고 **파일 삭제**(기록 중단).
+    ///
+    /// **여기가 유일한 세션 경계다.** 앱 재시작은 파일을 지우지 않고 이어서 쓴다(openHandle 주석 참조).
+    /// 즉 "켠 뒤 끄기 전까지"의 모든 실행이 한 파일에 누적되고, 끄는 순간 흔적이 사라진다.
     public func setEnabled(_ on: Bool) {
         UserDefaults.standard.set(on, forKey: "s.devlog")
         enabledFlag.withLock { $0 = on }

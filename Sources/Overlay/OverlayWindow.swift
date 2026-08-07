@@ -705,17 +705,33 @@ public final class OverlayWindow: NSObject {
                 // CAMetalDisplayLink도 발화하지 않아 파이프라인 전체가 침묵한다
                 // ([DRIVER] update 0줄, interpEnc=0). 증상만 보면 "보간이 갑자기 안 된다"이다.
                 //
-                // 2026-08-06에 아래를 전부 시험했고 **모두 실패**했다(같은 재현: Finder를 소스로
-                // 잡고 ⌃⌘F, onActiveSpace=false / occlusion=hidden 고정):
+                // **원인은 창 속성이 아니라 activation policy였다 (2026-08-07 확정).**
+                //
+                // 2026-08-06에 창 속성 세 가지를 시험했고 전부 실패했다:
                 //   · orderFront(nil) → orderFrontRegardless()
                 //   · 창 레벨 shielding(2147483628) → screenSaver(1000)
                 //   · collectionBehavior 재적용 후 재-orderFront
                 // collectionBehavior는 내내 257(canJoinAllSpaces|fullScreenAuxiliary)로 살아 있었다.
-                // 즉 창 속성으로는 넘을 수 없는 벽이고, 해법은 다른 층(U4 가상 디스플레이)에 있다.
+                // 그래서 "창 속성으로는 넘을 수 없는 벽"이라고 결론냈는데, **틀렸다.**
+                //
+                // 그 측정들은 전부 `s.menubaronly = false` 상태에서 이뤄졌다 — 자동화 편의로 꺼둔
+                // 테스트 설정이고 되돌리는 걸 잊었다. 그 값은 AppState가 앱을 `.regular`로 올리고
+                // `activate(ignoringOtherApps: true)`까지 부르게 한다. 그 상태에서는 우리 창이
+                // 다른 앱의 전체화면 Space에 올라가지 못한다.
+                //
+                // `s.menubaronly = true`(=기본값, LSUIElement 상주)로 되돌리고 같은 재현을 하면:
+                //   onActiveSpace=true / occlusion=visible / SCShareableContent 목록에도 등장
+                //   ("제외 창 0/2개" → "1/2개") / CAMetalDisplayLink 정상 발화.
+                // 7월 커밋(b82551a, 정책이 .accessory 하드코딩이던 시기)에 "뷰어가 전체화면 소스
+                // 위에 정상 합성됨"이 기록돼 있던 것과도 일치한다 — 같은 창 속성인데 7월엔 됐다.
+                //
+                // 교훈: 배경 상주 앱(LSUIElement)이어야 다른 앱의 전체화면 Space 위에 뜬다.
+                // 메뉴바 전용 설정을 끄면 그 능력을 잃는다.
                 if !self.window.isOnActiveSpace {
                     DiagnosticLog.shared.log(
-                        "[WIN] ⚠︎ 출력 창이 활성 Space에 없다 — 소스가 macOS 전체화면이면 표시가 불가능하다. "
-                        + "링크가 발화하지 않아 보간도 멈춘다. (창 속성으로는 해결 불가 — 2026-08-06 실측)")
+                        "[WIN] ⚠︎ 출력 창이 활성 Space에 없다 — 화면에 안 나오고 링크도 발화하지 않는다. "
+                        + "가장 흔한 원인: 메뉴바 전용 설정이 꺼져 있음(앱이 .regular라 다른 앱의 "
+                        + "전체화면 Space에 못 올라간다). 확인: defaults read com.macfg.MacFG s.menubaronly")
                 }
             }
             if style == .viewer {

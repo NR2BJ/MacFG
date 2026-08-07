@@ -1552,6 +1552,18 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagSkipEngineNil = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipNoPrev = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipContentFast = 0
+    /// t 결정 진단 — "보간 0장"이 **어느 가지에서** 나왔는지 가른다.
+    /// mult: 정수배가 0장을 내 비정수 경로로 넘긴 횟수 (절벽 조건에 들어왔다는 뜻)
+    /// grid: 비정수 경로까지 갔는데도 0장인 횟수 (여기가 진짜 막힌 곳)
+    /// ratioMin/Max: 소스간격/슬롯간격 비율 관측 범위 — 절벽(1.5 근처)에 걸리는지 직접 보여준다
+    @ObservationIgnored nonisolated(unsafe) private var diagTMultFell = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagTGridEmpty = 0
+    @ObservationIgnored nonisolated(unsafe) private var diagTRatioMin = 999.0
+    @ObservationIgnored nonisolated(unsafe) private var diagTRatioMax = 0.0
+    /// 표시 상한을 넘어 생산을 줄인 횟수 (부족분 상한이 발동한 쌍 수)
+    @ObservationIgnored nonisolated(unsafe) private var diagTOverSupply = 0
+    /// 쌍당 1장 미만일 때 몇 쌍마다 한 장을 낼지 세는 카운터
+    @ObservationIgnored nonisolated(unsafe) private var pairSkipCounter = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipBigGap = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipDiscontinuity = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipEngineFail = 0
@@ -2011,6 +2023,7 @@ public final class AppState {
                         // 스냅도 개선 없음 실측 (소스 프레임이 소스 그리드에 있어 혼합 케이던스)
                         tValues = (1...count).map { Float($0) / Float(count + 1) }
                     }
+                    if tValues.isEmpty { diagTMultFell += 1 }
                 }
                 // **정수배가 아무것도 못 내면 여기서 멈추지 않는다.**
                 // maxUseful = round(interval / displayInterval)은 "디스플레이가 소스 프레임당 정수
@@ -2057,7 +2070,55 @@ public final class AppState {
                         slotTime += displayInterval
                     }
                 }
+                if tValues.isEmpty { diagTGridEmpty += 1 }
                 }   // ← tValues.isEmpty 폴스루 블록 끝
+
+                // **표시 상한을 넘는 생산을 막는다 — 부족분만 만든다.**
+                //
+                // 실측(2026-08-07, 실사용 마우스가 창 경계를 넘나들 때):
+                //   정상   src 110/창, 보간  98 → 표시 89/s, 갭 15, tick 136Hz
+                //   붕괴   src 175/창, 보간 211 → 표시 49/s, 갭 59, tick 103Hz
+                //   회복   src 100/창, 보간  92 → 표시 94/s, 갭  3, tick 142Hz
+                // 경계를 넘으면 소스 창이 호버 전이로 프레임을 쏟아내고(110 → 202), 우리가 그 위에
+                // **쌍당 1장을 그대로 얹어** 초당 165장을 인코딩한다. 화면은 144장만 받는다.
+                // 넘치는 만큼은 만들자마자 버려지는데 GPU는 이미 썼으므로, 틱이 굶고 표시가 반토막난다.
+                //
+                // 규칙: 필요한 것은 배율이 아니라 **부족분**이다.
+                //   필요 = 주사율 − 소스율,  쌍당 = 필요 / 소스율
+                // 소스가 이미 주사율의 절반을 넘으면 쌍당 1장 미만이 정답이라, 그 경우는
+                // **몇 쌍마다 한 장**으로 낸다(pairSkipCounter). 소스가 주사율을 넘으면 0장이다 —
+                // 더 만들 이유가 없다.
+                //
+                // 이 상한은 **세 경로 공통**으로 마지막에 건다. 경로별로 걸면 설정에 따라 다른
+                // 분기를 타면서 새어나간다(거버너 t 상한에서 이미 겪은 실수).
+                if !tValues.isEmpty, displayInterval > 0 {
+                    let iv = sourceIntervalEMA > 0 ? sourceIntervalEMA : gap
+                    let srcHz = iv > 0 ? 1.0 / iv : 0
+                    let refreshHz = 1.0 / displayInterval
+                    let deficitHz = max(0, refreshHz - srcHz)
+                    let perPair = srcHz > 0 ? deficitHz / srcHz : Double(tValues.count)
+                    if perPair < 0.05 {
+                        tValues = []                       // 소스만으로 주사율을 채운다
+                        diagTOverSupply += 1
+                    } else if perPair < 1.0 {
+                        // 쌍당 1장 미만 — N쌍마다 한 장만 낸다 (N = round(1/perPair))
+                        let n = max(2, Int((1.0 / perPair).rounded()))
+                        pairSkipCounter += 1
+                        if pairSkipCounter % n != 0 { tValues = []; diagTOverSupply += 1 }
+                        else { tValues = [0.5] }
+                    } else if tValues.count > Int(perPair) {
+                        let cap = max(1, Int(perPair))
+                        let stride = Double(tValues.count) / Double(cap)
+                        tValues = (0..<cap).map { tValues[min(Int(Double($0) * stride), tValues.count - 1)] }
+                        diagTOverSupply += 1
+                    }
+                }
+                // 비율 관측 — 절벽(1.5 근처)에 실제로 걸리는지 보여준다
+                if displayInterval > 0 {
+                    let iv = sourceIntervalEMA > 0 ? sourceIntervalEMA : gap
+                    let r = iv / displayInterval
+                    if r > 0, r < 50 { diagTRatioMin = min(diagTRatioMin, r); diagTRatioMax = max(diagTRatioMax, r) }
+                }
                 // 폴백은 큰 갭 + 불운한 그리드 위상일 때만. 작은 갭(≤1.5슬롯)은 소스 두 장이
                 // 이미 인접 슬롯을 채우므로 [0.5] 폴백이 잉여 프레임 → 큐 적체(e2e +40ms 실측)
                 if tValues.isEmpty && gap > displayInterval * 1.5 { tValues = [0.5] }
@@ -2620,7 +2681,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) every=\(presentEveryN) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2657,6 +2718,7 @@ public final class AppState {
         diagPresentCount = 0
         diagPresentDropped = 0
         diagSlipHist = [0, 0, 0, 0]
+        diagTMultFell = 0; diagTGridEmpty = 0; diagTRatioMin = 999.0; diagTRatioMax = 0.0; diagTOverSupply = 0
         diagDupTargetSlot = 0
         if presentEveryAlternates { presentEveryN = presentEveryN == 1 ? 2 : 1 }
         diagInterpPresentCount = 0

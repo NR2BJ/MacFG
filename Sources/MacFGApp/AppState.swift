@@ -2011,7 +2011,18 @@ public final class AppState {
                         // 스냅도 개선 없음 실측 (소스 프레임이 소스 그리드에 있어 혼합 케이던스)
                         tValues = (1...count).map { Float($0) / Float(count + 1) }
                     }
-                } else if gap / displayInterval > 1.5,
+                }
+                // **정수배가 아무것도 못 내면 여기서 멈추지 않는다.**
+                // maxUseful = round(interval / displayInterval)은 "디스플레이가 소스 프레임당 정수
+                // 개수만 표시할 수 있다"고 가정하는데 사실이 아니다. 144Hz에서 소스 96fps면 실제로는
+                // 프레임당 1.5장을 낼 수 있는데 반올림이 1이 되어 count = 1×1−1 = 0 —
+                // **보간이 절벽처럼 완전히 꺼진다**(90fps 1장 → 96fps 0장).
+                // 실사용 증상(제보 2026-08-07): 마우스를 움직이면 소스 창의 호버 리페인트로 측정
+                // 소스율이 96fps 위로 올라가고 그 순간 보간이 죽어 **출력이 120 → 96fps로 떨어진다**
+                // ("소스는 오히려 올라가는데 출력만 떨어진다"). 아래 비정수 경로는 60→144(쌍당 2.4슬롯)
+                // 같은 조합을 이미 처리하므로, 정수배가 표현 못 하는 구간을 그쪽에 맡기면 절벽이 사라진다.
+                if tValues.isEmpty {
+                if gap / displayInterval > 1.5,
                           abs(gap / displayInterval - (gap / displayInterval).rounded()) < 0.12,
                           (gap / displayInterval).rounded() <= 9 {
                     // **정수 배율(스냅된 gap = 표시 슬롯의 정수배: 60→120=2, 30→120=4, 24→120=5)**
@@ -2046,6 +2057,7 @@ public final class AppState {
                         slotTime += displayInterval
                     }
                 }
+                }   // ← tValues.isEmpty 폴스루 블록 끝
                 // 폴백은 큰 갭 + 불운한 그리드 위상일 때만. 작은 갭(≤1.5슬롯)은 소스 두 장이
                 // 이미 인접 슬롯을 채우므로 [0.5] 폴백이 잉여 프레임 → 큐 적체(e2e +40ms 실측)
                 if tValues.isEmpty && gap > displayInterval * 1.5 { tValues = [0.5] }

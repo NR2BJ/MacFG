@@ -14,4 +14,12 @@ pkill -f "/Applications/MacFG.app" 2>/dev/null || true
 sleep 1
 rm -rf /Applications/MacFG.app
 cp -R "$ROOT/dist/MacFG.app" /Applications/
+# LaunchServices/Spotlight 재등록.
+# rm -rf + cp -R 를 빠르게 반복하면 등록이 어긋나 **Finder 검색·Launchpad에서 앱이 사라진다**
+# (실측 2026-08-07: mdls가 kMDItemDisplayName=null을 반환, 사용자가 "앱 폴더에 없다"고 제보).
+# 번들 자체는 멀쩡하고 더블클릭도 되지만 찾을 수가 없으니 실사용에선 없어진 것과 같다.
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+[ -x "$LSREG" ] && "$LSREG" -f /Applications/MacFG.app >/dev/null 2>&1
+touch /Applications/MacFG.app
+
 echo "설치됨: /Applications/MacFG.app ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/MacFG.app/Contents/Info.plist))"

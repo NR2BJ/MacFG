@@ -895,10 +895,29 @@ public final class AppState {
         // performAsync는 틱과 같은 런루프라 절대 겹치지 않음 → 무락 전제 보존.
         // MACFG_CBINGEST=0이면 기존(틱 drain 전용) 경로로 폴백.
         if Knob.string("MACFG_CBINGEST") != "0" {
+            // **프레임마다 런루프를 깨우지 않는다 — 이미 예약돼 있으면 합친다.**
+            //
+            // 실측(2026-08-07, 실사용 마우스가 창 경계를 넘을 때):
+            //   평상시  도착 172/창 → 수용 103, 중복거름 69   갭  6, tick 140Hz
+            //   경계    도착 208/창 → 수용 196, 중복거름 12   갭 57, tick 111Hz
+            // 마우스가 호버 하이라이트·컨트롤바를 건드려 **매 프레임이 실제로 조금씩 달라지므로**
+            // 중복 필터가 40% → 6%로 무너지고, 수용 프레임이 두 배가 된다. drainAndIngest 자체는
+            // 여전히 싸지만(ing 평균 0.06ms), **런루프를 깨우는 횟수가 초당 98번**이 되고 그것이
+            // 같은 런루프의 vsync 콜백을 삼킨다. 실제로 이 구간에서 우리 GPU 점유는 오히려
+            // 33% → 22%로 **내려간다** — GPU 포화가 아니라 런루프 경합이다.
+            //
+            // 합치면 대기 중인 프레임은 어차피 pendingIngest에 쌓여 있고 한 번의 drain이
+            // maxCount만큼 가져가므로 지연 손해가 없다. 깨우기만 줄인다.
             captureManager.onFrameAvailable = { [weak self] in
                 guard let self else { return }
+                // 이미 예약된 인제스트가 있으면 그것이 처리한다 (compare-and-set)
+                guard self.ingestScheduled.withLock({ was in
+                    let already = was; was = true; return !already
+                }) else { return }
                 self.renderDriver.performAsync { [weak self] in
-                    guard let self, self.isCapturingMirror else { return }
+                    guard let self else { return }
+                    self.ingestScheduled.withLock { $0 = false }
+                    guard self.isCapturingMirror else { return }
                     self.drainAndIngest(maxCount: 4)
                 }
             }
@@ -1564,6 +1583,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagTOverSupply = 0
     /// 쌍당 1장 미만일 때 몇 쌍마다 한 장을 낼지 세는 카운터
     @ObservationIgnored nonisolated(unsafe) private var pairSkipCounter = 0
+    /// 인제스트 블록이 이미 렌더 런루프에 예약돼 있는가 — 프레임마다 깨우는 것을 합친다.
+    @ObservationIgnored private let ingestScheduled = OSAllocatedUnfairLock(initialState: false)
     @ObservationIgnored nonisolated(unsafe) private var diagSkipBigGap = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipDiscontinuity = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipEngineFail = 0

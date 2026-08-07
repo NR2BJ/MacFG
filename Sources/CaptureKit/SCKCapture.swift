@@ -153,7 +153,11 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     /// 합성 결과 그대로** 얻는다 — 크롭 같은 추정 보정 없이 정직하게 보이는 것을 보여준다.
     ///
     /// 우리 오버레이/뷰어 창은 반드시 제외해야 한다 (안 그러면 자기 출력을 되먹는 무한 거울).
-    public func updateToDisplayCapture(displayID: CGDirectDisplayID, excludingWindowIDs: [CGWindowID]) async throws {
+    /// - Parameter requiredWindowID: **반드시** 제외돼야 하는 창(=우리 출력 창). 0이면 검사 생략.
+    ///   이게 빠지면 우리 출력을 우리가 다시 캡처해 되먹임 거울이 된다.
+    public func updateToDisplayCapture(displayID: CGDirectDisplayID,
+                                       excludingWindowIDs: [CGWindowID],
+                                       requiredWindowID: CGWindowID = 0) async throws {
         guard let stream else { throw CaptureError.notCapturing }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
@@ -166,12 +170,25 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         // 그러면 우리 출력이 캡처에 포함돼 **자기 출력을 되먹는다** — 전체화면이라 우리 창이
         // 화면을 꽉 채우므로 되먹임이 눈에 안 띄고, 대신 합성 부하만 배로 늘어 프레임이 밀린다
         // (실측 2026-08-06: 전체화면에서 미표시 46% vs 창 모드 15%).
-        if excluded.isEmpty && !excludingWindowIDs.isEmpty {
+        // **판정 기준은 "몇 개 빠졌나"가 아니라 "출력 창이 빠졌나"다.**
+        // 예전 조건은 `excluded.isEmpty`였는데, 우리 창이 둘 이상이면 설정 창 하나만 잡혀도
+        // 비어 있지 않아 재시도가 안 걸린다 — 실사용에서 "제외 1/2개"인 채로 진행됐고,
+        // 빠진 쪽이 출력 창이면 화면이 멈춘 것처럼 보이고 노이즈가 누적된다(제보 2026-08-07).
+        // 갓 만든 창은 SCShareableContent 스냅샷에 늦게 들어오므로 짧게 여러 번 다시 본다.
+        func hasRequired(_ list: [SCWindow]) -> Bool {
+            requiredWindowID == 0 || list.contains { $0.windowID == requiredWindowID }
+        }
+        var attempt = 0
+        while !hasRequired(excluded) && attempt < 5 {
+            attempt += 1
             try? await Task.sleep(for: .milliseconds(120))
-            if let retry = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) {
-                excluded = retry.windows.filter { excludingWindowIDs.contains($0.windowID) }
-                DiagnosticLog.shared.log("[SCK-DISPLAY] 제외 목록 재시도 → \(excluded.count)개 (요청 \(excludingWindowIDs.count)개)")
-            }
+            guard let retry = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            else { break }
+            excluded = retry.windows.filter { excludingWindowIDs.contains($0.windowID) }
+        }
+        if attempt > 0 {
+            DiagnosticLog.shared.log("[SCK-DISPLAY] 제외 재조회 \(attempt)회 → \(excluded.count)/\(excludingWindowIDs.count)개"
+                + (hasRequired(excluded) ? " (출력 창 확보)" : " **출력 창 여전히 미포함**"))
         }
         self.captureRect = nil
         self.captureScale = Self.findScaleFactor(for: display.frame)
@@ -179,9 +196,22 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         try await stream.updateContentFilter(SCContentFilter(display: display, excludingWindows: excluded))
         try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
         isDisplayCapture = true
-        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h), 제외 창 \(excluded.count)/\(excludingWindowIDs.count)개")
-        if excluded.isEmpty && !excludingWindowIDs.isEmpty {
-            DiagnosticLog.shared.log("[SCK-DISPLAY] ⚠︎ 자기 창을 하나도 제외하지 못했다 — 되먹임 위험")
+        // **어느 창이 빠졌는지까지 남긴다.**
+        // "제외 N/M개"만으로는 빠진 게 설정 창인지 **출력 뷰어**인지 알 수 없는데, 그 차이가
+        // 전부다: 출력 창이 안 빠지면 우리 출력을 우리가 다시 캡처해 **되먹임 거울**이 된다.
+        // 전체화면에서는 뷰어가 화면을 꽉 채우므로 되먹임이 눈에 안 띄고, 대신 진짜 콘텐츠가
+        // 영영 안 잡혀 **화면이 멈춘 것처럼** 보이며 세대마다 워프 오차가 누적돼 노이즈가 쌓인다
+        // (실사용 제보 2026-08-07: "화면 자체가 멈춰" + 전면 노이즈).
+        let foundIDs = Set(excluded.map { $0.windowID })
+        let missing = excludingWindowIDs.filter { !foundIDs.contains($0) }
+        DiagnosticLog.shared.log("[SCK-DISPLAY] → display \(displayID) \(w)x\(h), 제외 창 \(excluded.count)/\(excludingWindowIDs.count)개"
+            + " 요청=\(excludingWindowIDs) 적용=\(Array(foundIDs).sorted())"
+            + (missing.isEmpty ? "" : " **누락=\(missing)**"))
+        if requiredWindowID != 0 && !foundIDs.contains(requiredWindowID) {
+            DiagnosticLog.shared.log("[SCK-DISPLAY] ⚠︎ **출력 창(\(requiredWindowID))이 캡처에서 제외되지 않았다** — "
+                + "자기 출력을 되먹어 화면이 멈춘 것처럼 보이고 노이즈가 누적된다")
+        } else if !missing.isEmpty {
+            DiagnosticLog.shared.log("[SCK-DISPLAY] 우리 창 \(missing.count)개 미제외(출력 창은 아님) — 되먹임 위험 낮음")
         }
     }
 

@@ -44,6 +44,10 @@ public final class OverlayManager {
 
     /// MacFG 자신이 띄운 창들의 CGWindowID — 디스플레이 캡처 제외 목록용.
     /// 오버레이/뷰어뿐 아니라 설정 창 등 이 앱의 모든 창을 포함해야 되먹임이 없다.
+    /// 현재 출력(오버레이/뷰어) 창의 CGWindowID — 0이면 아직 없음.
+    /// 디스플레이 캡처 제외에서 **이것만은 반드시** 빠지면 안 된다: 빠지면 우리 출력을 되먹는다.
+    public var outputWindowID: CGWindowID { overlayWindow?.cgWindowID ?? 0 }
+
     public var ownWindowIDs: [CGWindowID] {
         // windowNumber는 Int이고 오프스크린/미실현 창은 음수일 수 있다 — UInt32 변환이
         // 트랩을 내므로 compactMap으로 안전하게 거른다 (음수를 filter로 막았어도 map에서

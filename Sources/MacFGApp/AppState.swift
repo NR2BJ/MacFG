@@ -2902,9 +2902,13 @@ public final class AppState {
                     guard let scr = om.sourceScreen,
                           let num = scr.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
                     else { return }
+                    // 출력 창 ID를 함께 남긴다 — 위 [SCK-DISPLAY] 누락 목록과 대조해
+                    // "빠진 게 하필 출력 창인가"를 즉시 판정할 수 있게.
+                    DiagnosticLog.shared.log("[SCK-DISPLAY] 출력 창 id=\(om.outputWindowID) 전체=\(om.ownWindowIDs)")
                     try await captureManager.updateToDisplayCapture(
                         displayID: CGDirectDisplayID(num.uint32Value),
-                        excludingWindowIDs: om.ownWindowIDs)
+                        excludingWindowIDs: om.ownWindowIDs,
+                        requiredWindowID: om.outputWindowID)
                     pendingShowReset = true   // 해상도/소스가 바뀌었으니 스케줄러 재락
                 } else {
                     // 역방향(디스플레이→창)은 updateContentFilter로는 스트림이 죽는다 —

@@ -79,9 +79,9 @@ public final class CaptureManager: Sendable {
     }
 
     /// 디스플레이 캡처로 무중단 전환 (SCK 전용) — 소스가 자체 Space 전체화면일 때.
-    public func updateToDisplayCapture(displayID: CGDirectDisplayID, excludingWindowIDs: [CGWindowID]) async throws {
+    public func updateToDisplayCapture(displayID: CGDirectDisplayID, excludingWindowIDs: [CGWindowID], requiredWindowID: CGWindowID = 0) async throws {
         guard _activeMethod == .screenCaptureKit else { throw CaptureError.notCapturing }
-        try await sckCapture.updateToDisplayCapture(displayID: displayID, excludingWindowIDs: excludingWindowIDs)
+        try await sckCapture.updateToDisplayCapture(displayID: displayID, excludingWindowIDs: excludingWindowIDs, requiredWindowID: requiredWindowID)
     }
 
     /// 현재 디스플레이 캡처 중인지 (SCK 전용, 그 외엔 false)

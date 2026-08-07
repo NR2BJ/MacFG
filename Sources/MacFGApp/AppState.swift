@@ -231,6 +231,8 @@ public final class AppState {
     /// 사안이다(2246~2261행의 slip 실측 7,696프레임, 1638행 부근).
     @ObservationIgnored nonisolated(unsafe) private var stgPresentGpu = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgPresentCount = 0
+    /// 직전 진단 창의 벽시계 길이 [s] — 슬롯당 정규화에 필요(present 발생률 산출)
+    @ObservationIgnored nonisolated(unsafe) private var diagLastLogWallSpan: Double = 0
     @ObservationIgnored private let stageLock = NSLock()
     /// 직전 cb1 GPU 시간 — 스파이크 한 프레임을 단계별로 찍기 위해 값 자체를 들고 있는다
     /// (누적합만으론 어느 단계가 튀었는지 알 수 없다).
@@ -2172,10 +2174,28 @@ public final class AppState {
                     self.stgCapIngest = 0; self.stgCb1Gpu = 0; self.stgCb2Gpu = 0; self.stgWork = 0; self.stgCount = 0
                     self.stgPresentGpu = 0; self.stgPresentCount = 0
                     self.stageLock.unlock()
+                    // **슬롯당으로 정규화해서 함께 찍는다.**
+                    // 위 값들은 분모가 서로 다르다: cb1/cb2는 stgCount(=인제스트된 **소스 프레임**당,
+                    // 60fps면 초당 60), present는 stgPresentCount(=**present**당, 초당 100+).
+                    // 그런데 사람은 한 줄에 나란히 있으면 더해서 읽는다 — 실제로 그렇게 읽어
+                    // "우리 GPU가 슬롯 6.94ms를 100% 채운다"는 틀린 결론을 냈다(2026-08-07 정정).
+                    // 진짜 예산 점유는 각 항을 **자기 발생률 × 슬롯 시간**으로 환산해야 나온다.
+                    // 참고: MetalFlow에서 splitQueue는 꺼져 있어 cb1·cb2는 workQueue 직렬이지만
+                    // present는 presentQueue라 **동시에** 돈다 — 합계는 상한이지 실제 직렬 시간이 아니다.
+                    let slotMs = 1000.0 / max(self.mirrorRefreshRate, 60)
+                    let srcHz = self.sourceIntervalEMA > 0 ? 1.0 / self.sourceIntervalEMA : 0
+                    let presHz = pn > 0 && self.diagLastLogWallSpan > 0
+                        ? Double(pn) / self.diagLastLogWallSpan : 0
+                    let cb1PerSlot = c1 * srcHz * slotMs / 1000.0
+                    let cb2PerSlot = c2 * srcHz * slotMs / 1000.0
+                    let presPerSlot = pg * presHz * slotMs / 1000.0
+                    let occ = cb1PerSlot + cb2PerSlot + presPerSlot
                     DiagnosticLog.shared.log(String(format:
-                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f present=%.2f(n=%d) work=%.1f (대기=%.1f) chain=%.1f(%.2f×간격) ms/frame (n=120)",
+                        "[STAGE] capIngest=%.1f cb1gpu=%.1f cb2gpu=%.1f present=%.2f(n=%d) work=%.1f (대기=%.1f) chain=%.1f(%.2f×간격) ms/frame (n=120)"
+                        + " | 슬롯당(%.2fms): cb1=%.2f cb2=%.2f present=%.2f 합=%.2f(%.0f%%) src=%.0fHz pres=%.0fHz",
                         ci, c1, c2, pg, pn, wk, max(0, wk - ci - c1 - c2), c1 + c2,
-                        (c1 + c2) / max(1.0, self.sourceIntervalEMA * 1000.0)))
+                        (c1 + c2) / max(1.0, self.sourceIntervalEMA * 1000.0),
+                        slotMs, cb1PerSlot, cb2PerSlot, presPerSlot, occ, occ / slotMs * 100, srcHz, presHz))
                 } else {
                     self.stageLock.unlock()
                 }
@@ -2520,6 +2540,7 @@ public final class AppState {
         let wallSpan = diagLastLogWall > 0 ? nowWall - diagLastLogWall : 0
         let tickHz = wallSpan > 0 ? 240.0 / wallSpan : 0
         lastTickHz = tickHz   // 거버너 신호용 (다음 창에서 읽음)
+        diagLastLogWallSpan = wallSpan
         diagLastLogWall = nowWall
         let tickCPUAvg = diagTickCPUSum / 240.0
         let pointerEvents = PointerTapStats.drain()

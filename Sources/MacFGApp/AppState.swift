@@ -272,7 +272,14 @@ public final class AppState {
         // ① MetalFlow flow 해상도 — 자동 스케일러가 기기 성능에 맞춰 정한 값(수동 지정 시 그 값)에
         //    거버너 상한을 씌운 것. 거버너는 상한만 내리고, 그 안에서 스케일러가 움직인다.
         //    엔진 자율 사다리(RIFE)는 건드리지 않는다 (같은 다이얼 이중 조작 = 발진).
-        let desired = autoFlowScaler.manualOverride ? userFlowBase : autoFlowScaler.current
+        // MACFG_FLOWBASE는 이 줄보다 우선한다. 이게 없으면 flow 해상도를 **어떤 방법으로도**
+        // 고정할 수 없다: MetalFlowEngine의 MACFG_MFFLOWBASE는 이 함수가 매 창 덮어쓰고,
+        // --flow-base는 CLI 전용인데 이 앱은 Finder로만 띄울 수 있고(셸 실행은 메뉴바 권한을
+        // 오염시킨다), MACFG_AUTOFLOW=0은 스케일러를 현재값에 고정할 뿐 값을 못 정한다.
+        // flow 해상도는 base²에 비례하는 최대 단일 다이얼이라(800→480이면 flow 비용 0.36배),
+        // 측정에서 이걸 못 돌리면 남은 항목들의 기여도를 가릴 수 없다.
+        let desired = Knob.double("MACFG_FLOWBASE")
+            ?? (autoFlowScaler.manualOverride ? userFlowBase : autoFlowScaler.current)
         let base = min(desired, loadGovernor.flowBaseCap ?? desired)
         if MetalFlowEngine.flowBaseLongSide != base {
             MetalFlowEngine.flowBaseLongSide = base
@@ -338,6 +345,41 @@ public final class AppState {
     /// 콘텐츠 드리프트가 양쪽에 동일하게 실린다.
     ///   defaults write com.macfg.MacFG env.MACFG_PRESENTEVERY -string alt
     @ObservationIgnored nonisolated(unsafe) private var presentEveryN = Knob.int("MACFG_PRESENTEVERY") ?? 1
+
+    // ── 적응 페이싱 ──
+    //
+    // 확정된 사실: 표시 실패는 우리 잘못이 아니다. GPU는 100% 목표 슬롯보다 일찍 끝나고
+    // (gpuLate 24167샘플 전수), 목표 슬롯 중복도 미표시 1789/s 중 5/s뿐이다. 한 실행 안
+    // 40창에서 r(WindowServer CPU, 미표시) = **+0.858**, r(WS, tick) = −0.852 —
+    // 컴포지터가 포화되면 우리가 제때 넘긴 프레임이 버려진다.
+    //
+    // 그런데 **덜 내밀면 나아지는지는 확정하지 못했다.** 같은 실행 안에서는
+    // r(present/s, 미표시) = −0.323으로 오히려 음수고(공급이 원인이 아님), 설정 간 비교에서는
+    // 65장/s일 때 손실 3.8% / 117장/s일 때 25%로 크게 다르다(다만 보간 on/off라 교란됨).
+    // 이 세션에서 메커니즘을 여덟 번 틀렸으므로, 메커니즘을 가정하는 컨트롤러는 쓰지 않는다.
+    //
+    // 대신 **결과를 직접 오른다**: 목적함수는 초당 실제 표시 프레임 수다. 공급 배율을 조금씩
+    // 흔들어 표시가 늘어나는 방향을 유지하고, 나빠지면 방향을 뒤집는다. 감축이 도움이 안 되면
+    // 스스로 1.0으로 돌아오므로 최악의 경우가 현재 동작이다.
+    // 위상 누산기로 게이팅하므로 남는 present는 **균등 간격**이 된다 — 예전에 등간격으로 낸
+    // 실측(MACFG_PRESENTEVERY=3)에서 미표시가 정확히 0이었던 것이 이 형태의 근거다.
+    /// **기본 꺼짐 — 이 컨트롤러는 실측에서 무효였다.**
+    ///
+    /// 배율을 0.75까지 내려도 present/s가 112~115로 전혀 줄지 않았다(1.1.8 실행 26창).
+    /// 이유: 틱을 건너뛰어도 타임라인의 due 엔트리는 그대로 남아 **다음 틱에 그냥 나간다.**
+    /// 공급을 줄인 게 아니라 미룬 것이라, 총량은 같고 간격만 더 뭉쳤다.
+    /// 공급을 진짜로 줄이려면 present 게이트가 아니라 **생산(t 값 개수)** 쪽을 줄여야 한다.
+    /// 켜면 다음 측정이 오염되므로 기본값을 껐다. 다시 시험하려면:
+    ///   defaults write com.macfg.MacFG env.MACFG_PACEADAPT -string 1
+    @ObservationIgnored nonisolated(unsafe) private var paceAdaptive = Knob.string("MACFG_PACEADAPT") == "1"
+    @ObservationIgnored nonisolated(unsafe) private var paceScale: Double = 1.0
+    @ObservationIgnored nonisolated(unsafe) private var pacePhase: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var paceDir: Double = -0.05
+    @ObservationIgnored nonisolated(unsafe) private var paceShown = 0
+    @ObservationIgnored nonisolated(unsafe) private var paceWindowStart: CFTimeInterval = 0
+    @ObservationIgnored nonisolated(unsafe) private var paceLastRate: Double = -1
+    /// 진단용 — [SCHED]에 pace=배율/표시율로 찍는다.
+    @ObservationIgnored nonisolated(unsafe) private var paceLastShownRate: Double = 0
     @ObservationIgnored nonisolated(unsafe) private let presentEveryAlternates =
         Knob.string("MACFG_PRESENTEVERY") == "alt"
 
@@ -1555,6 +1597,18 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagTick: Int = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSourceCount = 0
     @ObservationIgnored nonisolated(unsafe) private var diagDupSkipCount = 0
+    /// 수용된 프레임의 변화 크기 분포 — [<0.1%, <0.5%, <2%, <10%, >=10%].
+    ///
+    /// 지문이 "바뀌었다"고 답한 프레임들이 실제로 **얼마나** 바뀌었는지 본다. 앞쪽 칸이 크면
+    /// 영상이 아니라 UI 리페인트(캐럿·스크롤바·크롬)를 소스 프레임으로 세고 있다는 뜻이고,
+    /// 그게 입력 케이던스를 모니터 주사율 쪽으로 부풀려 보간 배수를 무너뜨린다는 가설의 증거다.
+    /// 판단은 데이터를 보고 — 이 세션에서 이미 여섯 개 가설이 추측만으로 죽었다.
+    @ObservationIgnored nonisolated(unsafe) private var diagChangeHist = [0, 0, 0, 0, 0]
+    /// 소스 케이던스 고정으로 걸러낸 프레임 수 (영상 프레임 사이에 낀 UI 갱신).
+    @ObservationIgnored nonisolated(unsafe) private var diagSrcLockSkip = 0
+    /// present용 GPU가 목표 표시 슬롯 대비 몇 칸 늦게 끝났나 — [-1칸(여유), 0칸(정시), +1, +2, +3이상].
+    /// stageLock으로 보호(완료 핸들러는 임의 스레드).
+    @ObservationIgnored nonisolated(unsafe) private var diagGpuLateHist = [0, 0, 0, 0, 0]
     @ObservationIgnored nonisolated(unsafe) private var diagTsRejectCount = 0        // 타임스탬프 비전진으로 스킵 (중복 프레임 재전송)
     @ObservationIgnored nonisolated(unsafe) private var diagPresentCount = 0
     @ObservationIgnored nonisolated(unsafe) private var diagInterpPresentCount = 0
@@ -1685,6 +1739,7 @@ public final class AppState {
             // 답이다. 세지 않으면 glass 간격만 보고 "표시가 20ms 균일하다"고 읽게 되는데,
             // 실제로는 present를 10ms마다 하고 그중 절반이 버려지는 상태일 수 있다.
             guard record.presentedAt > 0 else { diagPresentDropped += 1; continue }
+            paceShown += 1   // 적응 페이싱의 목적함수 — **실제로 화면에 나간** 장수만 센다
             performanceMonitor.recordRenderTime()
             presentedTimes.append(record.presentedAt)
             if presentedTimes.count > 240 { presentedTimes.removeFirst(120) }
@@ -1720,7 +1775,35 @@ public final class AppState {
         // MACFG_PRESENTEVERY=N: N틱마다 한 번만 present. **측정 전용.**
         // 가르려는 것: 표시 실패(presentedTime==0)가 우리가 과잉 공급해서인가, 컴포지터의
         // 외부 천장인가. 공급을 절반으로 줄였을 때 표시 fps가 오르면 전자, 그대로면 후자다.
-        if presentEveryN <= 1 || diagTick % presentEveryN == 0 {
+        // 적응 페이싱 — 표시 프레임 수를 목적함수로 공급 배율을 언덕오르기. 0.8초마다 평가한다
+        // (짧으면 콘텐츠 변동을 개선으로 오독하고, 길면 반응이 굼뜨다).
+        if paceAdaptive {
+            let now = CACurrentMediaTime()
+            if paceWindowStart == 0 { paceWindowStart = now }
+            let span = now - paceWindowStart
+            if span >= 0.8 {
+                let rate = Double(paceShown) / span
+                if paceLastRate >= 0 {
+                    // 유의미한 악화일 때만 방향을 뒤집는다 — 잡음에 끌려 진동하지 않도록.
+                    if rate < paceLastRate - 1.5 { paceDir = -paceDir }
+                }
+                paceLastRate = rate
+                paceLastShownRate = rate
+                paceScale = min(1.0, max(0.55, paceScale + paceDir))
+                // 상/하한에 닿으면 방향을 되돌린다 (끝에 붙어 정체하지 않도록).
+                if paceScale >= 1.0 || paceScale <= 0.55 { paceDir = -paceDir }
+                paceShown = 0
+                paceWindowStart = now
+            }
+        }
+        var paceAllows = true
+        if paceAdaptive, paceScale < 0.999 {
+            // 위상 누산기 — 남기는 present가 균등 간격이 되도록. (매 N틱 스킵은 배율이
+            // 정수 역수가 아닐 때 뭉친다.)
+            pacePhase += paceScale
+            if pacePhase >= 1.0 { pacePhase -= 1.0 } else { paceAllows = false }
+        }
+        if paceAllows, presentEveryN <= 1 || diagTick % presentEveryN == 0 {
             presentDueEntry(targetTimestamp: targetTimestamp, drawable: drawable)
         }
         // 링크 재부착 직후 강제 재present — 정적 콘텐츠는 새 프레임이 없어 presentDueEntry가
@@ -1842,6 +1925,28 @@ public final class AppState {
 
         // 타임스탬프 역행/중복 제거
         if slot.timestamp <= lastAcceptedTimestamp + 0.0005 { diagTsRejectCount += 1; return }
+
+        // **소스 케이던스 고정 (MACFG_SRCFPS, 0/미설정 = 끔).**
+        //
+        // 세상의 영상 소스는 24/25/30/50/60뿐인데, 우리가 재는 "소스율"은 그것이 아니라
+        // **창 표면이 갱신된 횟수**다. 마우스를 움직이면 소스 앱이 호버 리페인트로 영상 프레임
+        // 사이에 갱신을 끼워 넣어 측정 소스율이 92~110fps로 뛴다(실측). 그 프레임들은 가짜가
+        // 아니다 — 진짜로 픽셀이 바뀐다(지문 변화율로 확인: 수용분의 93.7%가 화면 10% 이상 변화).
+        // 문제는 진위가 아니라 **간격**이다: 쌍 간격이 16.7ms에서 9ms로 좁아지면 표시 슬롯
+        // 기준 2.4슬롯이 1.3슬롯이 되고, 원본 양보 구간을 빼면 보간을 놓을 자리가 사라진다.
+        // 그래서 보간 생성이 55 → 23장/s로 반토막 나고 출력만 떨어진다.
+        //
+        // 영상 케이던스를 알면 그 사이에 끼는 갱신은 받지 않으면 된다. 잃는 것은 영상 한 프레임
+        // 안에서의 UI 변화가 한 프레임 늦게 보이는 것뿐이고, 얻는 것은 보간이 꺼지지 않는 것이다.
+        // 임계를 0.75×로 두어 실제 케이던스의 지터(SCK 배달 흔들림)는 통과시킨다.
+        if let srcFps = Knob.double("MACFG_SRCFPS"), srcFps >= 1 {
+            let lockedInterval = 1.0 / srcFps
+            if lastAcceptedTimestamp > 0,
+               slot.timestamp - lastAcceptedTimestamp < lockedInterval * 0.75 {
+                diagSrcLockSkip += 1
+                return
+            }
+        }
         // 수용 정책: 픽셀 변화(fingerprint) 우선. SCK status는 fingerprint가 없을 때만 폴백.
         // (게이트를 1/120으로 연 뒤 SCK가 60fps 창에도 status=complete를 ~112fps로 남발하는 것을
         //  실측 — status를 믿으면 간격 EMA가 반토막나 "이미 빠른 콘텐츠" 가드가 보간을 꺼버림)
@@ -1873,6 +1978,9 @@ public final class AppState {
         lastAcceptedFingerprint = slot.contentFingerprint
         performanceMonitor.recordFrameArrival()
         diagSourceCount += 1
+        // 변화 크기 분포 누적 (계측 전용 — 동작에는 아직 쓰지 않는다)
+        let cr = slot.changeRatio
+        diagChangeHist[cr < 0.001 ? 0 : cr < 0.005 ? 1 : cr < 0.02 ? 2 : cr < 0.10 ? 3 : 4] += 1
 
         // 타임스탬프를 콘텐츠 케이던스 그리드에 스냅 (양자화 지터 제거)
         let snappedTs = snapTimestamp(raw: slot.timestamp, rawDelta: delta)
@@ -2083,9 +2191,29 @@ public final class AppState {
                     // 정수배율 조건을 못 맞추고 이 분기로 빠지면, 벌어진 갭을 슬롯마다 채워 t×6까지
                     // 나온다. 그게 절반 폐기되며 σ 13ms 저더의 원인(실측). 억제 중엔 2장까지만.
                     let vsyncCap = gapExpansionAllowed ? 8 : 2
-                    while slotTime < snappedTs - displayInterval * 0.6 && tValues.count < vsyncCap {
+                    // **양보 구간 배율 (MACFG_YIELD, 기본 1.0 = 기존 동작).**
+                    //
+                    // 위 상수 0.4/0.6은 합쳐서 정확히 1슬롯을 원본에 양보한다. 그 1슬롯이
+                    // 두 증상의 공통 원인이다:
+                    //   60fps → 쌍 간격 2.4슬롯, 양보 후 1.4 → 보간 1장 → **출력이 120에서 멈춘다**
+                    //           (144를 채우려면 쌍당 1.4장이 필요한데 양보 구간이 2번째를 막는다)
+                    //   96fps → 쌍 간격 1.5슬롯, 양보 후 0.5 → **0장, 보간이 통째로 꺼진다**
+                    // 후자가 사용자 제보의 정체다 — 마우스를 움직이면 소스 창 리페인트로 측정
+                    // 소스율이 92~99fps로 뛰고(실측), 그 순간 fast 스킵이 초당 70회 발동하며
+                    // 보간 생성이 55 → 23/s로 반토막 난다.
+                    //
+                    // 이 상수가 들어간 근거는 "쌍당 1.4장이 과생성이라 큐가 적체된다(e2e +30ms)"
+                    // 였는데, 그 적체는 present한 프레임의 20~46%를 컴포지터가 버리던 상황에서
+                    // 측정된 것이다. 그 원인은 따로 규명됐으므로(캡처가 WindowServer의 프레임당
+                    // 예산을 잠식) 이 상수도 다시 재야 한다. 그래서 지우지 않고 다이얼로 만든다.
+                    //
+                    // 하한을 갭 비율로도 걸어, 갭이 좁을 때 양보가 갭 전체를 삼키지 않게 한다.
+                    let yieldScale = min(max(Knob.double("MACFG_YIELD") ?? 1.0, 0.0), 1.0)
+                    let yieldA = min(displayInterval * 0.4 * yieldScale, gap * 0.25)
+                    let yieldB = min(displayInterval * 0.6 * yieldScale, gap * 0.35)
+                    while slotTime < snappedTs - yieldB && tValues.count < vsyncCap {
                         let t = (slotTime - prev.timestamp) / gap
-                        if slotTime > prev.timestamp + displayInterval * 0.4 && t > 0.02 {
+                        if slotTime > prev.timestamp + yieldA && t > 0.02 {
                             tValues.append(Float(t))
                         }
                         slotTime += displayInterval
@@ -2397,7 +2525,18 @@ public final class AppState {
         let stageDbgRef = stageDbg
         cb.addCompletedHandler { [weak self] buf in
             presentingRef.withLock { $0.removeValue(forKey: ObjectIdentifier(presentTex)) }
-            guard stageDbgRef, let self else { return }
+            guard let self else { return }
+            // **미표시의 직접 원인 판별.** 드로어블은 이 콜백의 표시 슬롯에 이미 바인딩돼 있어
+            // (그래서 present(atTime:)이 불법이다), GPU가 그 슬롯을 넘겨서 끝나면 표시를 놓치고
+            // 다음 슬롯으로 밀려 뒤 present와 충돌한다. 여기서 "GPU가 목표 슬롯보다 몇 칸 늦게
+            // 끝났나"를 세면, 그 비율이 미표시 비율과 맞는지로 원인을 가를 수 있다:
+            //   맞으면  → GPU 오버런이 원인 (고칠 곳은 생산 리드타임/작업량)
+            //   안 맞으면 → 제때 끝났는데도 버려진 것 (고칠 곳은 컴포지터/위상)
+            let lateSlots = Int(((buf.gpuEndTime - targetRef) / slotSec).rounded(.down))
+            self.stageLock.lock()
+            self.diagGpuLateHist[min(max(lateSlots + 1, 0), 4)] += 1
+            self.stageLock.unlock()
+            guard stageDbgRef else { return }
             let g = (buf.gpuEndTime - buf.gpuStartTime) * 1000.0
             guard g > 0, g < 500 else { return }
             self.stageLock.lock()
@@ -2702,7 +2841,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) gpuLate=\(diagGpuLateHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2734,6 +2873,9 @@ public final class AppState {
 
         diagSourceCount = 0
         diagDupSkipCount = 0
+        diagChangeHist = [0, 0, 0, 0, 0]
+        diagSrcLockSkip = 0
+        stageLock.lock(); diagGpuLateHist = [0, 0, 0, 0, 0]; stageLock.unlock()
         diagTsRejectCount = 0
         _ = wallSpan
         diagPresentCount = 0

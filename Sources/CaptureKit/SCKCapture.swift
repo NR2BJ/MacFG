@@ -75,7 +75,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         let w = regionPt.width > 0 ? Int(regionPt.width * scaleFactor) : 1920
         let h = regionPt.height > 0 ? Int(regionPt.height * scaleFactor) : 1080
         let config = Self.makeConfig(width: w, height: h, sourceRect: captureRect)
-        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) region=\(captureRect.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" } ?? "full") → config \(w)x\(h)")
+        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) region=\(captureRect.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" } ?? "full") → config \(w)x\(h) fps상한=\(Knob.int("MACFG_SCKFPS") ?? 120) 캡처배율=\(Knob.double("MACFG_CAPSCALE") ?? 1.0)")
 
         let handler = StreamOutputHandler(device: device) { [weak self] slot in
             guard let self else { return }
@@ -118,15 +118,37 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     /// 공용 스트림 설정 — startCapture와 updateConfiguration이 공유
     private static func makeConfig(width: Int, height: Int, sourceRect: CGRect? = nil) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        config.width = max(width, 2)
-        config.height = max(height, 2)
+        // MACFG_CAPSCALE — 캡처 **출력 해상도** 배율 (기본 1.0 = 소스 픽셀 그대로).
+        //
+        // 확정된 원인 구조: present는 공짜인데(프로브 실측, WindowServer +1.3포인트)
+        // 캡처는 +36포인트다. 그리고 캡처만으로도, 많이 내미는 것만으로도 프레임은 안 죽는다 —
+        // 둘이 겹칠 때만 죽는다(캡처 중 64장/s present → 미표시 3.8% / 114장/s → 20%).
+        // WindowServer의 프레임당 예산(144Hz면 6.94ms)을 캡처 작업이 잠식해 합성이 마감을
+        // 놓치는 구조다. 그래서 줄여야 할 것은 캡처 **빈도**가 아니라 캡처 **작업량**이다
+        // (빈도는 실측으로 기각됐다 — 120→90에서 오히려 나빠졌다).
+        // 0.5면 SCK가 옮기는 픽셀이 1/4이 된다. 보간 입력 해상도도 같이 낮아지므로
+        // 화질은 손해지만, 출력은 업스케일로 만회할 수 있다.
+        let capScale = min(max(Knob.double("MACFG_CAPSCALE") ?? 1.0, 0.25), 1.0)
+        config.width = max(Int(Double(width) * capScale), 2)
+        config.height = max(Int(Double(height) * capScale), 2)
         // 영역 캡처: 소스 창 좌상단 기준 크롭 (pt). 지정 시 영상 영역만 잘라 캡처.
         if let sourceRect { config.sourceRect = sourceRect }
         config.captureResolution = .best
         config.pixelFormat = kCVPixelFormatType_32BGRA
         // 1/60 게이트는 콘텐츠 60fps와 위상이 어긋나면 맥놀이로 프레임을 걸러냄 (실측 57-58fps 구멍).
         // 1/120으로 열고 중복 제거는 소비자(status+fingerprint)가 담당.
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
+        //
+        // **다만 그 결정의 WindowServer 비용을 아무도 재지 않았다.** 캡처는 WindowServer가
+        // 수행하는 일이고, 4K 창을 초당 120장 뜨는 것은 공짜가 아니다. 실측(2026-08-08):
+        //   TestPattern(4K 60fps)만 실행           → WindowServer 41.1%
+        //   + 별도 프로브가 4K를 초당 114장 present → 42.4%  (present는 사실상 공짜)
+        //   MacFG 캡처 중                          → 77%   (+36포인트)
+        // 그리고 받은 프레임의 42.7%는 지문이 동일해 그대로 버려진다 — 60fps 소스에서
+        // 쓸모없는 4K 캡처를 초당 45장 더 시키고 있다는 뜻이다. 그 부하가 컴포지터를 포화시키고
+        // (한 실행 안 r(WindowServer CPU, 미표시) = +0.858), 우리가 제때 넘긴 프레임이 버려진다.
+        // 우리 GPU·CPU·보간 연산·해상도·창 설정은 모두 측정으로 배제됐다.
+        let fpsCap = Knob.int("MACFG_SCKFPS").map { min(max($0, 24), 240) } ?? 120
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fpsCap))
         config.queueDepth = 8
         config.showsCursor = false
         config.capturesAudio = false
@@ -302,6 +324,12 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
     private var detailFrameCount = 0   // 캡처당 리셋(핸들러 새로 생성) — 소스 디테일 진단
     /// 첫 프레임 어태치먼트에서 추출한 캡처 색공간 (이후 프레임에 재사용)
     private var cachedColorSpace: CGColorSpace?
+    /// 변화율 산출용 격자 표본 — 직전/현재를 번갈아 쓰며(swap) 매 프레임 할당을 피한다.
+    /// SCK는 프레임을 단일 직렬 큐로 배달하므로 이 상태는 락 없이 안전하다.
+    private var prevSamples: [UInt8] = []
+    private var curSamples: [UInt8] = []
+    private var prevSampleCols = 0
+    private var prevSampleRows = 0
 
     init(device: any MTLDevice, onFrame: @escaping (FrameSlot) -> Void) {
         self.device = device
@@ -358,8 +386,8 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
             }
         }
 
-        // 콘텐츠 fingerprint 계산 (보간 파이프라인 내부 중복 감지용)
-        let fingerprint = Self.computeFingerprint(pixelBuffer: pixelBuffer, width: width, height: height)
+        // 콘텐츠 fingerprint + 직전 프레임 대비 변화율 (보간 파이프라인 내부 중복/케이던스 판정용)
+        let (fingerprint, changeRatio) = fingerprintAndChange(pixelBuffer: pixelBuffer, width: width, height: height)
 
         // CVPixelBuffer → IOSurface 백킹 MTLTexture (제로카피)
         guard let ioSurface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
@@ -383,7 +411,7 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
         // pixelBuffer를 함께 싣는다 — texture가 이 버퍼의 IOSurface를 제로카피로 가리키므로,
         // 소비(=stable blit)가 끝날 때까지 살아 있어야 풀이 같은 표면에 다음 프레임을 덮어쓰지 않는다.
-        let slot = FrameSlot(texture: texture, timestamp: timestamp, width: width, height: height, contentChanged: contentChanged, contentFingerprint: fingerprint, colorSpace: cachedColorSpace, pixelBuffer: pixelBuffer)
+        let slot = FrameSlot(texture: texture, timestamp: timestamp, width: width, height: height, contentChanged: contentChanged, contentFingerprint: fingerprint, changeRatio: changeRatio, colorSpace: cachedColorSpace, pixelBuffer: pixelBuffer)
         onFrame(slot)
     }
 
@@ -413,38 +441,79 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
     /// 격자 샘플링은 주기적 콘텐츠(체커보드 등)와 정렬되어 실제 이동을 놓치는 앨리어싱 실측
     /// (60fps 패턴이 47fps로 판정) — 산포 좌표는 어떤 이동이든 다수 샘플을 교차한다.
     /// 양자화(>>2)로 압축 노이즈 무시.
-    private static func computeFingerprint(pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> UInt64 {
+    /// 콘텐츠 지문과 **직전 프레임 대비 변화율**을 함께 낸다.
+    ///
+    /// 지문 하나로는 "바뀌었다/아니다"라는 이진 판정밖에 못 하는데, 그 스위치 하나가 서로 다른
+    /// 두 요구를 동시에 떠맡고 있었다:
+    ///
+    /// 1. **민감해야 한다** — 작은 국소 변화(텍스트 선택 ~100×15px)를 놓치면 dup-skip으로
+    ///    화면이 멈춘다(실측: 가로 드래그 5초 정지). 그래서 랜덤 384점을 8k 격자로 바꿨다.
+    /// 2. **둔감해야 한다** — 민감하면 캐럿 깜빡임·스크롤바·브라우저 크롬 같은 UI 리페인트도
+    ///    새 소스 프레임으로 세어, 60fps 영상 창인데 입력 케이던스가 111fps로 잡힌다(실측).
+    ///    그러면 보간 배수가 무너지고(생성/입력 1.60→0.78) 4K에서는 쓸모없는 flow 계산까지
+    ///    두 배로 든다.
+    ///
+    /// 변화의 **크기**를 같이 재면 둘을 분리할 수 있다 — 영상이 진행하면 표본의 상당수가 바뀌고,
+    /// UI만 깜빡이면 1% 미만이 바뀐다. 표시는 지금처럼 모든 변화를 받아 멈춤을 막고(요구 1),
+    /// 케이던스 추정만 큰 변화로 게이팅하면 된다(요구 2). 판정은 소비자(AppState)가 한다.
+    ///
+    /// 추가 비용은 격자 표본 8k×3바이트를 다음 프레임까지 보관하고 점별로 비교하는 것뿐이다.
+    private func fingerprintAndChange(pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> (hash: UInt64, changeRatio: Float) {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
-              width > 0, height > 0 else { return 0 }
+              width > 0, height > 0 else { return (0, 1) }
         let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
 
         var hash: UInt64 = 0xcbf29ce484222325 // FNV-1a offset basis
-        // 균등 격자 샘플 (~8k점). 랜덤 384점은 작은 국소 변화(가로 텍스트 선택 몇 글자,
-        // ~100×15px)를 확률적으로 놓쳐 프레임을 dup-skip → 화면 정지(실측: 가로 드래그 5초 멈춤,
-        // 세로는 줄 단위 큰 변화라 잡혀서 부드러움). 격자로 전 영역을 ~10-30px 간격 커버해
-        // 작은 변화도 반드시 샘플에 걸리게 한다.
+        // 균등 격자 샘플 (~8k점). 전 영역을 ~10-30px 간격으로 덮어 작은 변화도 표본에 걸리게 한다.
         let target = 8000
         let aspect = Double(width) / Double(max(height, 1))
         let cols = min(max(Int((Double(target) * aspect).squareRoot()), 16), width)
         let rows = min(max(target / max(cols, 1), 16), height)
-        for row in 0..<rows {
-            let y = (row * height + height / 2) / rows
-            let rowBase = y * bytesPerRow
-            for col in 0..<cols {
-                let x = (col * width + width / 2) / cols
-                let offset = rowBase + x * 4
-                // B, G, R만 사용 (A는 항상 255)
-                for i in 0..<3 {
-                    let quantized = ptr[offset + i] >> 2
-                    hash ^= UInt64(quantized)
-                    hash &*= 0x100000001b3 // FNV-1a prime
+
+        // 해상도가 바뀌면 격자 자체가 달라져 점별 비교가 무의미하다 — 표본을 버리고 다시 시작.
+        let sampleCount = rows * cols * 3
+        if prevSampleCols != cols || prevSampleRows != rows {
+            prevSampleCols = cols
+            prevSampleRows = rows
+            prevSamples = []
+        }
+        let hasPrev = prevSamples.count == sampleCount
+        if curSamples.count != sampleCount {
+            curSamples = [UInt8](repeating: 0, count: sampleCount)
+        }
+        var changed = 0
+
+        curSamples.withUnsafeMutableBufferPointer { cur in
+            prevSamples.withUnsafeBufferPointer { prev in
+                var s = 0
+                for row in 0..<rows {
+                    let y = (row * height + height / 2) / rows
+                    let rowBase = y * bytesPerRow
+                    for col in 0..<cols {
+                        let x = (col * width + width / 2) / cols
+                        let offset = rowBase + x * 4
+                        // B, G, R만 사용 (A는 항상 255). 양자화(>>2)로 압축 노이즈 무시.
+                        for i in 0..<3 {
+                            let quantized = ptr[offset + i] >> 2
+                            hash ^= UInt64(quantized)
+                            hash &*= 0x100000001b3 // FNV-1a prime
+                            cur[s] = quantized
+                            if hasPrev, prev[s] != quantized { changed += 1 }
+                            s += 1
+                        }
+                    }
                 }
             }
         }
-        return hash
+        swap(&prevSamples, &curSamples)
+
+        // 첫 프레임(비교 대상 없음)은 변화 100%로 본다 — 케이던스 게이트가 초기에 프레임을
+        // 삼켜 파이프라인이 시작조차 못 하는 것을 막는다.
+        let ratio = hasPrev ? Float(changed) / Float(sampleCount) : 1
+        return (hash, ratio)
     }
 }

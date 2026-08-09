@@ -119,6 +119,40 @@ private final class ShaderCache: @unchecked Sendable {
 public enum OverlayStyleConstants {
     /// 표준 macOS 창 모서리 반경 (pt) — 검은 조각 경계 곡선 피팅으로 실측 14.1pt (2026-07-02)
     public nonisolated(unsafe) static var cornerRadius: CGFloat = 14
+
+    /// 커버를 **완전 불투명**으로 두고, 대신 소스를 1pt 덜 덮어 오클루전 판정을 피한다.
+    ///
+    /// 지금 커버는 블렌딩을 세 겹으로 강요한다 — `window.isOpaque=false`,
+    /// `metalLayer.isOpaque=false`(둥근 모서리 SDF), `alphaValue=0.999`(오클루전 우회).
+    /// 그 대가가 실측됐다: 캡처 중 **WindowServer 77%**(최대 87%)로 기준선 43%의 두 배이고,
+    /// 우리 프로세스는 31.7%에 불과하다. 그리고 미표시(present했는데 화면에 안 나옴)의 원인이
+    /// 우리 쪽이 아님도 확정됐다 — GPU는 **100%** 목표 슬롯보다 일찍 끝나고(오버런 0건),
+    /// 목표 슬롯 중복도 미표시 1789/s 중 5/s뿐이다. 제때 만들어 넘긴 프레임을 컴포지터가 버린다.
+    ///
+    /// alpha<1은 두 가지를 동시에 강요한다: (1) 우리 레이어를 매 프레임 블렌딩하고,
+    /// (2) 우리가 불투명 오클루더가 아니므로 **가려진 아래 창들도 계속 그리게** 한다.
+    /// 둘 다 픽셀 수에 비례해서 4K가 1080p의 4배다(붕괴 확률 1.5% vs 36.5%, 위험비 24배).
+    ///
+    /// 그런데 오클루전 판정은 "완전히 덮였는가"라서, **1pt만 덜 덮으면** 소스는 계속 렌더링하고
+    /// 우리는 불투명일 수 있다. 그러면 컴포지터는 블렌딩도 건너뛰고 아래 창도 건너뛴다.
+    /// 대가: 창 위쪽에 1pt 실소스가 보이고(브라우저면 툴바 영역), 모서리 SDF가 알파를 못 쓰므로
+    /// 둥근 모서리가 검은 직각이 된다.
+    static let opaqueCover = Knob.string("MACFG_OPAQUECOVER") == "1"
+
+    /// 드로어블 backing 해상도 배율 (1.0 = 지금대로 창 크기 × 배율).
+    ///
+    /// **남은 단 하나의 변수를 가르기 위한 것.** 지금까지 배제된 것:
+    /// 우리 GPU(슬롯 예산의 35%, 오버런 0건), 렌더 스레드 CPU(코어의 4.7%),
+    /// 보간 연산 자체(blend 엔진으로 1/15로 줄여도 표시가 95.5 → 100.6/s로 오차 수준),
+    /// 드로어블 풀(poolMiss=0), 목표 슬롯 중복(미표시 1789/s 중 5/s), 반투명 합성(OPAQUECOVER 무효).
+    /// 남은 것은 **초당 114장의 8.0MP 표면을 컴포지터에 넘기는 행위 자체**다
+    /// (한 실행 안 r(WindowServer CPU, 미표시) = +0.858).
+    ///
+    /// 0.5로 두면 장수는 그대로인데 픽셀은 1/4이 된다. 그래도 떨어지면 원인은 픽셀 처리량이
+    /// 아니라 **present 횟수당 고정비**이고, 나아지면 픽셀 처리량이다. 둘은 해결책이 정반대다 —
+    /// 전자는 장수를 줄여야 하고 후자는 해상도를 낮추면 된다.
+    /// 화질은 컴포지터 업스케일만큼 나빠진다(진단용).
+    static let drawScale = min(max(Knob.double("MACFG_DRAWSCALE") ?? 1.0, 0.25), 1.0)
 }
 
 public enum OverlayStyle: Sendable {
@@ -276,8 +310,8 @@ public final class OverlayWindow: NSObject {
                 defer: false
             )
             window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = .clear
+            window.isOpaque = OverlayStyleConstants.opaqueCover
+            window.backgroundColor = OverlayStyleConstants.opaqueCover ? .black : .clear
             // 기본은 통과(true) — 커버는 "보기만" 하는 오버레이라 소스 조작을 방해하면 안 된다.
             //
             // MACFG_COVEREATMOUSE=1이면 **삼킨다.** 실측 근거(2026-08-07, 한 실행 내 교차):
@@ -300,7 +334,9 @@ public final class OverlayWindow: NSObject {
 
             // 모서리 마스킹은 셰이더 SDF로 수행 (CALayer.cornerRadius는 CAMetalLayer
             // 직접 스캔아웃에서 무시됨 — 실측). 컴포지터가 알파를 쓰도록 비불투명 레이어.
-            metalLayer.isOpaque = false
+            // opaqueCover에서는 그 알파를 포기한다 — 모서리가 검은 직각이 되는 대신
+            // 컴포지터가 이 레이어를 블렌딩 없이 스캔아웃한다.
+            metalLayer.isOpaque = OverlayStyleConstants.opaqueCover
 
             let contentView = NSView(frame: window.contentView!.bounds)
             contentView.wantsLayer = true
@@ -360,7 +396,10 @@ public final class OverlayWindow: NSObject {
                 sharpness: 0, upscaleMode: .off,
                 contentBounds: CGRect(origin: .zero, size: window.frame.size),
                 contentsScale: NSScreen.main?.backingScaleFactor ?? 2.0,
-                cornerRadiusPt: OverlayStyleConstants.cornerRadius
+                // opaqueCover면 모서리 SDF를 끈다. 불투명 레이어에서는 알파가 무시되고
+                // rgb만 0으로 곱해져 모서리가 **검게** 남는다 — 마스킹을 아예 안 하면
+                // 직각이 되는 대신 소스 픽셀이 그대로 보여 그쪽이 덜 눈에 띈다.
+                cornerRadiusPt: OverlayStyleConstants.opaqueCover ? 0 : OverlayStyleConstants.cornerRadius
             )
         )
 
@@ -562,7 +601,8 @@ public final class OverlayWindow: NSObject {
         // 계속 그리고 매 프레임 블렌딩한다. 불투명이면 그 아래를 통째로 건너뛸 수 있다.
         // 부작용(의도됨): 소스 창이 occluded 판정돼 렌더링을 멈춘다 — 그래서 이 측정은
         // MACFG_ALWAYSPRESENT=1과 함께 써서 마지막 프레임을 계속 내보내며 효율만 본다.
-        if Knob.string("MACFG_NOOCCBYPASS") == "1" {
+        if Knob.string("MACFG_NOOCCBYPASS") == "1" || OverlayStyleConstants.opaqueCover {
+            // opaqueCover는 alpha 대신 **기하**로 오클루전을 피한다(updateFrame의 1pt 인셋).
             window.alphaValue = 1.0
             return
         }
@@ -594,7 +634,17 @@ public final class OverlayWindow: NSObject {
             $0.contentBounds = bounds
             $0.contentsScale = scale
         }
-        if metalLayer.drawableSize.width < 1 || metalLayer.drawableSize.height < 1 {
+        let ds = OverlayStyleConstants.drawScale
+        if ds < 0.999 {
+            // 배율이 걸리면 시딩 조건(<1)이 아니라 **매번** 맞춘다 — 다른 경로가 드로어블을
+            // 풀사이즈로 되돌려도 다음 갱신에서 되잡는다.
+            let w = max(bounds.width * scale * ds, 64)
+            let h = max(bounds.height * scale * ds, 64)
+            if abs(metalLayer.drawableSize.width - w) > 1 || abs(metalLayer.drawableSize.height - h) > 1 {
+                metalLayer.drawableSize = CGSize(width: w, height: h)
+                DiagnosticLog.shared.log("[DRAWSCALE] 드로어블 \(Int(w))x\(Int(h)) (배율 \(ds))")
+            }
+        } else if metalLayer.drawableSize.width < 1 || metalLayer.drawableSize.height < 1 {
             metalLayer.drawableSize = CGSize(
                 width: max(bounds.width * scale, 64),
                 height: max(bounds.height * scale, 64)
@@ -605,6 +655,13 @@ public final class OverlayWindow: NSObject {
     /// 오버레이 위치/크기 갱신 (overlay 스타일 전용 — 뷰어는 사용자가 제어)
     public func updateFrame(_ frame: CGRect) {
         guard style == .overlay else { return }
+        var frame = frame
+        if OverlayStyleConstants.opaqueCover, frame.height > 2 {
+            // 소스를 1pt 덜 덮어 "완전히 가려짐" 판정을 피한다 — 그래야 소스 앱이 계속
+            // 렌더링한다(alpha<1이 하던 일). AppKit 원점은 좌하단이라 height를 줄이면
+            // 위쪽에 1pt가 남는다. 브라우저면 툴바 영역이라 눈에 띄지 않는다.
+            frame.size.height -= 1
+        }
         window.setFrame(frame, display: false)
         metalLayer.frame = NSRect(origin: .zero, size: frame.size)
         // contentsScale을 대상 화면에 맞게 갱신

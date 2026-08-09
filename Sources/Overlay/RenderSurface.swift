@@ -126,8 +126,11 @@ public final class RenderSurface: @unchecked Sendable {
             lock.lock(); _scaleStatus = nil; lock.unlock()
         }
 
-        let texW = CGFloat(source.width)
-        let texH = CGFloat(source.height)
+        // MACFG_DRAWSCALE — 드로어블 픽셀만 줄인다(장수는 그대로). 컴포지터 픽셀 처리량이
+        // 병목인지 present 횟수당 고정비가 병목인지를 가르는 진단 다이얼.
+        let ds = OverlayStyleConstants.drawScale
+        let texW = (CGFloat(source.width) * ds).rounded()
+        let texH = (CGFloat(source.height) * ds).rounded()
         if metalLayer.drawableSize.width != texW || metalLayer.drawableSize.height != texH {
             metalLayer.drawableSize = CGSize(width: texW, height: texH)
         }
@@ -249,8 +252,8 @@ public final class RenderSurface: @unchecked Sendable {
         // 드로어블 backing 해상도 = 레이어 표시 크기 × 배율. 첫 캡처에 창이 전체화면 되기 전
         // stale bounds로 drawableSize가 작게(예: 960×540) 시딩되고 갱신 안 돼, 업스케일한
         // 3840 콘텐츠가 540p 드로어블에 눌려 흐리게 출력되던 버그 수정 — frame과 별개로 검사.
-        let dw = max(fit.width * scale, 64.0)
-        let dh = max(fit.height * scale, 64.0)
+        let dw = max(fit.width * scale * OverlayStyleConstants.drawScale, 64.0)
+        let dh = max(fit.height * scale * OverlayStyleConstants.drawScale, 64.0)
         let drawableWrong = abs(metalLayer.drawableSize.width - dw) > 1 || abs(metalLayer.drawableSize.height - dh) > 1
         if metalLayer.frame != fit || metalLayer.contentsScale != scale || drawableWrong {
             CATransaction.begin()

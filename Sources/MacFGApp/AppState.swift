@@ -1604,6 +1604,9 @@ public final class AppState {
     /// 그게 입력 케이던스를 모니터 주사율 쪽으로 부풀려 보간 배수를 무너뜨린다는 가설의 증거다.
     /// 판단은 데이터를 보고 — 이 세션에서 이미 여섯 개 가설이 추측만으로 죽었다.
     @ObservationIgnored nonisolated(unsafe) private var diagChangeHist = [0, 0, 0, 0, 0]
+    /// 부족분 크레딧 — 쌍마다 perPair씩 쌓고 실제로 낸 장수만큼 차감한다.
+    /// 정수 절단으로는 표현 못 하는 비정수 배율(60→144 = 쌍당 1.4장)을 내기 위한 것.
+    @ObservationIgnored nonisolated(unsafe) private var overSupplyCredit: Double = 0
     /// 소스 케이던스 고정으로 걸러낸 프레임 수 (영상 프레임 사이에 낀 UI 갱신).
     @ObservationIgnored nonisolated(unsafe) private var diagSrcLockSkip = 0
     /// present용 GPU가 목표 표시 슬롯 대비 몇 칸 늦게 끝났나 — [-1칸(여유), 0칸(정시), +1, +2, +3이상].
@@ -1636,7 +1639,6 @@ public final class AppState {
     /// 표시 상한을 넘어 생산을 줄인 횟수 (부족분 상한이 발동한 쌍 수)
     @ObservationIgnored nonisolated(unsafe) private var diagTOverSupply = 0
     /// 쌍당 1장 미만일 때 몇 쌍마다 한 장을 낼지 세는 카운터
-    @ObservationIgnored nonisolated(unsafe) private var pairSkipCounter = 0
     /// 인제스트 블록이 이미 렌더 런루프에 예약돼 있는가 — 프레임마다 깨우는 것을 합친다.
     @ObservationIgnored private let ingestScheduled = OSAllocatedUnfairLock(initialState: false)
     @ObservationIgnored nonisolated(unsafe) private var diagSkipBigGap = 0
@@ -2208,7 +2210,12 @@ public final class AppState {
                     // 예산을 잠식) 이 상수도 다시 재야 한다. 그래서 지우지 않고 다이얼로 만든다.
                     //
                     // 하한을 갭 비율로도 걸어, 갭이 좁을 때 양보가 갭 전체를 삼키지 않게 한다.
-                    let yieldScale = min(max(Knob.double("MACFG_YIELD") ?? 1.0, 0.0), 1.0)
+                    // 기본값 0.5 — 무인 A/B(2026-08-09, 결정적 소스, 조건당 20창)에서 모든 지표가 개선됐다:
+                    //   소스100: 표시 124.1 → 133.1/s, 미표시 5.6 → 1.6%, multFell 6.6 → 1.7/s
+                    //   흔들림 σ: 2.82 → 2.05ms (양보를 줄이면 출렁인다던 원 우려와 **정반대**)
+                    //   e2e 58 → 55ms (과생성으로 큐가 적체된다던 원 근거도 재현되지 않음)
+                    // 0.25·0.0도 재봤으나 0.5보다 낫지 않았다(표시 130.5 / 130.6).
+                    let yieldScale = min(max(Knob.double("MACFG_YIELD") ?? 0.5, 0.0), 1.0)
                     let yieldA = min(displayInterval * 0.4 * yieldScale, gap * 0.25)
                     let yieldB = min(displayInterval * 0.6 * yieldScale, gap * 0.35)
                     while slotTime < snappedTs - yieldB && tValues.count < vsyncCap {
@@ -2235,7 +2242,7 @@ public final class AppState {
                 // 규칙: 필요한 것은 배율이 아니라 **부족분**이다.
                 //   필요 = 주사율 − 소스율,  쌍당 = 필요 / 소스율
                 // 소스가 이미 주사율의 절반을 넘으면 쌍당 1장 미만이 정답이라, 그 경우는
-                // **몇 쌍마다 한 장**으로 낸다(pairSkipCounter). 소스가 주사율을 넘으면 0장이다 —
+                // **몇 쌍마다 한 장**으로 낸다(크레딧). 소스가 주사율을 넘으면 0장이다 —
                 // 더 만들 이유가 없다.
                 //
                 // 이 상한은 **세 경로 공통**으로 마지막에 건다. 경로별로 걸면 설정에 따라 다른
@@ -2246,20 +2253,33 @@ public final class AppState {
                     let refreshHz = 1.0 / displayInterval
                     let deficitHz = max(0, refreshHz - srcHz)
                     let perPair = srcHz > 0 ? deficitHz / srcHz : Double(tValues.count)
+                    // **쿼터는 정수가 아니라 크레딧으로 준다.**
+                    //
+                    // 예전에는 `tValues.count > Int(perPair)`로 잘랐는데, 절단이 곧 상한이 된다:
+                    // 60fps→144Hz는 perPair가 정확히 1.4인데 Int(1.4)=1이라 **쌍당 영영 1장**이고
+                    // 출력이 120에서 멈춘다. 1.4를 내려면 어떤 쌍은 1장, 어떤 쌍은 2장이어야 한다.
+                    // (실측 2026-08-09: mult=3, 소스 48/s에서 쌍당 2장이 나와야 하는데 생성이
+                    //  51/s에 머물렀고 over가 창당 38~76회 발동 중이었다 — 이 절단이 원인이다.)
+                    //
+                    // 크레딧은 쌍마다 perPair씩 쌓이고 **실제로 낸 만큼만** 차감한다. 그래서
+                    // perPair<1이면 몇 쌍마다 한 장이 되고(옛 pairSkipCounter 분기를 흡수),
+                    // perPair>1이면 정수부와 소수부가 자연히 섞인다. 상한 8은 정지 화면 뒤
+                    // 크레딧이 쌓여 재생 재개 시 몰아치는 것을 막는다.
                     if perPair < 0.05 {
                         tValues = []                       // 소스만으로 주사율을 채운다
                         diagTOverSupply += 1
-                    } else if perPair < 1.0 {
-                        // 쌍당 1장 미만 — N쌍마다 한 장만 낸다 (N = round(1/perPair))
-                        let n = max(2, Int((1.0 / perPair).rounded()))
-                        pairSkipCounter += 1
-                        if pairSkipCounter % n != 0 { tValues = []; diagTOverSupply += 1 }
-                        else { tValues = [0.5] }
-                    } else if tValues.count > Int(perPair) {
-                        let cap = max(1, Int(perPair))
-                        let stride = Double(tValues.count) / Double(cap)
-                        tValues = (0..<cap).map { tValues[min(Int(Double($0) * stride), tValues.count - 1)] }
-                        diagTOverSupply += 1
+                    } else {
+                        overSupplyCredit = min(overSupplyCredit + perPair, 8.0)
+                        let allow = Int(overSupplyCredit)
+                        if allow <= 0 {
+                            tValues = []
+                            diagTOverSupply += 1
+                        } else if tValues.count > allow {
+                            let stride = Double(tValues.count) / Double(allow)
+                            tValues = (0..<allow).map { tValues[min(Int(Double($0) * stride), tValues.count - 1)] }
+                            diagTOverSupply += 1
+                        }
+                        overSupplyCredit -= Double(tValues.count)
                     }
                 }
                 // 비율 관측 — 절벽(1.5 근처)에 실제로 걸리는지 보여준다

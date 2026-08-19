@@ -406,7 +406,7 @@ public final class OverlayWindow: NSObject {
         if style == .viewer {
             window.delegate = self
             window.acceptsMouseMovedEvents = true
-            interactionView?.owner = self
+            interactionView?.owner = mouseInputSuppressed ? nil : self
         }
 
         logger.info("OverlayWindow created (style=\(String(describing: style)))")
@@ -446,7 +446,34 @@ public final class OverlayWindow: NSObject {
     /// 이 스위치는 **회피책이자 결정적 실험**이다 — 끄고도 죽으면 상대커서는 무죄다.
     private static let relativePointerDisabled = UserDefaults.standard.bool(forKey: "s.norelptr")
 
+    /// 마우스 입력 전달 억제 (설정창 토글 "마우스 입력", 기본 켬=전달).
+    ///
+    /// 끄면 뷰어가 소스로 아무 이벤트도 보내지 않는다 — 상대커서 탭도, 레거시 포워딩도.
+    /// 왜 토글인가: 이 프로젝트에서 잡은 크래시가 전부 마우스 유발이었고(렌더 스레드 레이스,
+    /// 탭 refcon 힙 손상, 경계 재활성화), 마우스가 소스 리페인트를 부르면 입력 케이던스도
+    /// 오염된다. 영상 감상엔 마우스 전달이 필요 없는 경우가 많고, 모델 최적화 측정은
+    /// 마우스 변수를 빼야 깨끗하다. 삭제 대신 토글로 두면 쓸 때만 켤 수 있다.
+    /// (커버 배치의 클릭 통과는 OS 레벨이라 이 토글과 무관 — 뷰어 전용.)
+    private var mouseInputSuppressed =
+        UserDefaults.standard.object(forKey: "s.mouseinput") != nil
+        && !UserDefaults.standard.bool(forKey: "s.mouseinput")
+
+    /// 설정창 토글의 라이브 반영. 뷰어가 떠 있는 동안 꺼도/켜도 즉시 적용된다.
+    public func setMouseInputEnabled(_ enabled: Bool) {
+        mouseInputSuppressed = !enabled
+        guard style == .viewer else { return }
+        if enabled {
+            interactionView?.owner = self
+            if window.isVisible { enterRelativePointer() }
+        } else {
+            exitRelativePointer()               // 탭 해제 + 클릭투과 복구
+            interactionView?.owner = nil        // 레거시 포워딩도 차단
+            DiagnosticLog.shared.log("[RELPTR] 마우스 입력 전달 꺼짐 (설정)")
+        }
+    }
+
     private func enterRelativePointer() {
+        guard !mouseInputSuppressed else { return }   // 설정 토글 — 전달 자체가 꺼짐
         guard !Self.relativePointerDisabled else {
             DiagnosticLog.shared.log("[RELPTR] 비활성 (s.norelptr) — 상대커서 진입 생략")
             return
@@ -475,7 +502,8 @@ public final class OverlayWindow: NSObject {
         guard style == .viewer else { return }
         relativePointer.disable()
         window.ignoresMouseEvents = false
-        interactionView?.owner = self   // 옛 경로 복원 (폴백용)
+        // 옛 경로 복원 (폴백용) — 단, 설정으로 전달이 꺼져 있으면 복원하지 않는다
+        interactionView?.owner = mouseInputSuppressed ? nil : self
     }
 
     // MARK: - 마우스 역매핑 (뷰어 → 소스) — 레거시 postToPid 경로(상대커서 모드에선 미사용)

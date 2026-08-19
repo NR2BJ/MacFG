@@ -236,6 +236,11 @@ public final class OverlayManager {
     }
 
     /// 캡처 색공간 기록 — 실제 적용은 화면 일치 여부와 함께 결정
+    /// 설정창 "마우스 입력" 토글 → 출력 창에 즉시 반영.
+    public func setMouseInputEnabled(_ enabled: Bool) {
+        overlayWindow?.setMouseInputEnabled(enabled)
+    }
+
     public func setCaptureColorSpace(_ colorSpace: CGColorSpace?) {
         captureColorSpace = colorSpace
         applyColorPolicy()

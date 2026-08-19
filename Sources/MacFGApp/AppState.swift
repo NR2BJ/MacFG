@@ -1979,11 +1979,14 @@ public final class AppState {
         // 두면 아주 느린 장면이 영원히 임계 아래여서 화면이 멈출 수 있다 — 이 저장소가 지문을
         // 랜덤 384점으로 뒀을 때 겪은 실패다(가로 드래그 5초 정지). 연속 스킵을 4장으로 묶어
         // 정지 시간을 소스 간격 4배(60fps면 67ms) 이내로 구조적으로 못박는다.
-        // 기본 0.002(0.2%) — 결정적 재현에서 모션을 나르는 프레임이 94.4 → 109.8/s(+16%),
-        // multFell 48.8 → 2.4/s. 마우스가 정지해 있으면 영상 프레임은 전부 2~10% 구간이라
-        // 아무것도 걸러지지 않는다(실측: 정지 시 <0.1% 프레임 0.0%). 0.005·0.01도 재봤으나
-        // 차이가 없어 두 무리 사이 빈 구간의 아래쪽인 0.002를 택했다. 0으로 두면 꺼진다.
-        let uiGateValue = Knob.double("MACFG_UIGATE") ?? 0.002
+        // **기본 꺼짐 — 실사용 로그로 기각됐다 (2026-08-20).** 결정적 재현(30px 마커)에서는
+        // UI 갱신이 변화 <0.1%에 몰려 크기로 갈렸지만, 실제 브라우저의 호버 리페인트는
+        // 화면의 10% 이상을 다시 그린다(부풀림 구간 수용분의 65.6%가 ≥10% 칸 — 호버
+        // 하이라이트·플레이어 컨트롤은 큰 영역이다). 그 세션에서 이 게이트는 부풀림 구간에서
+        // 2.4장/s밖에 못 잡고 정상 구간에서 7.1장/s를 지연시켰다 — 신호가 틀렸다.
+        // 영상 프레임과 리페인트를 가르는 것은 크기가 아니라 **도착 간격**이다(아래 SRCFPS 게이트).
+        // 크기로 갈리는 콘텐츠를 위해 노브는 남긴다.
+        let uiGateValue = Knob.double("MACFG_UIGATE") ?? 0
         if uiGateValue > 0,
            slot.changeRatio > 0, slot.changeRatio < Float(uiGateValue),
            uiGateStreak < 4 {
@@ -1993,7 +1996,16 @@ public final class AppState {
         }
         uiGateStreak = 0
 
-        if let srcFps = Knob.double("MACFG_SRCFPS"), srcFps >= 1 {
+        // **기본 60 — 세상의 영상 소스는 24/25/30/50/60뿐이다** (사용자 지침: "맥에서 60프레임
+        // 이상 소스를 입력으로 받을 일 없다"). 60fps 영상의 프레임 간격은 16.7ms이므로, 직전
+        // 수용분에서 12.5ms(0.75×) 안에 또 오는 갱신은 영상 진행이 아니라 사이에 낀 UI
+        // 리페인트다. 크기 게이트(위)와 달리 이 구분은 실사용에서도 성립한다 — 리페인트가
+        // 아무리 넓은 영역을 다시 그려도 영상 케이던스 그리드 밖에 도착한다는 사실은 변하지 않는다.
+        // 결정적 재현 실측(소스100fps 조건): multFell 46→0, 미표시 1.1%, tick 143.9.
+        // 정지 화면을 만들 수 없는 구조다: 느린 장면은 애초에 간격이 넓어 전부 수용된다.
+        // 120fps를 진짜로 받아야 하는 특수 소스는 노브로 올린다(0 = 끔).
+        let srcFpsCap = Knob.double("MACFG_SRCFPS") ?? 60
+        if case let srcFps = srcFpsCap, srcFps >= 1 {
             let lockedInterval = 1.0 / srcFps
             if lastAcceptedTimestamp > 0,
                slot.timestamp - lastAcceptedTimestamp < lockedInterval * 0.75 {

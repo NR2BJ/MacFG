@@ -11,6 +11,7 @@ struct WindowPickerView: View {
             VStack(alignment: .leading, spacing: 18) {
                 statusCard
                 interpolationSection
+                outputSection
                 upscalingSection
                 shortcutSection
                 appSection
@@ -180,29 +181,6 @@ struct WindowPickerView: View {
                         .onChange(of: appState.occlusionDirectional) { appState.updateOcclusionDirectional() }
                 }
 
-                field(L("Mouse input to source", "마우스 입력 전달", "マウス入力の転送"),
-                      hint: L("Viewer: forward mouse to the source app.",
-                              "뷰어: 마우스를 소스 앱으로 전달.",
-                              "ビューア: マウスをソースアプリへ転送。"),
-                      detail: L("On: clicks and movement over the viewer are forwarded to the source (relative pointer). Off: the viewer sends nothing — the source never repaints from hover, input cadence stays clean, and the event tap (a past crash source) never runs. Turn off for pure video watching or measurements.",
-                                "켜면 뷰어 위의 클릭·이동이 소스로 전달됩니다(상대커서). 끄면 아무것도 보내지 않습니다 — 소스가 호버로 리페인트하지 않아 입력 케이던스가 깨끗해지고, 이벤트 탭(과거 크래시 원인)도 아예 돌지 않습니다. 순수 영상 감상이나 측정 시 끄세요.",
-                                "オンにするとビューア上のクリック·移動がソースへ転送されます(相対ポインタ)。オフでは何も送りません — ホバー再描画がなくなり入力ケイデンスが安定し、イベントタップ(過去のクラッシュ原因)も動きません。視聴専用や測定時はオフに。")) {
-                    Toggle(L("Enable", "켜기", "有効"), isOn: $appState.mouseInputEnabled)
-                        .toggleStyle(.switch).labelsHidden()
-                        .onChange(of: appState.mouseInputEnabled) { appState.updateMouseInput() }
-                }
-
-                field(L("Keep overlay while multitasking", "멀티태스킹 중 오버레이 유지", "マルチタスク中もオーバーレイ維持"),
-                      hint: L("Cover mode: don't hide when you click another app.",
-                              "Cover 모드: 다른 앱을 클릭해도 숨기지 않음.",
-                              "Coverモード: 他アプリをクリックしても隠さない。"),
-                      detail: L("By default the Cover overlay hides when you switch to another app so it doesn't block it (single-monitor safety). Turn on to keep watching the interpolated output while working in other windows — it stays on top of the source area.",
-                                "기본값은 다른 앱으로 전환하면 Cover 오버레이가 그 앱을 안 가리려고 숨습니다(단일 모니터 안전장치). 켜면 다른 창에서 작업하면서도 보간 출력을 계속 볼 수 있습니다 — 소스 영역 위에 유지됩니다.",
-                                "既定では他アプリに切り替えるとCoverオーバーレイが非表示になります(単一モニタの安全策)。オンにすると他ウィンドウで作業しながら補間出力を見続けられます。")) {
-                    Toggle(L("Enable", "켜기", "有効"), isOn: $appState.coverKeepVisible)
-                        .toggleStyle(.switch).labelsHidden()
-                        .onChange(of: appState.coverKeepVisible) { appState.refreshOverlayVisibility() }
-                }
             }
         }
     }
@@ -226,6 +204,39 @@ struct WindowPickerView: View {
     }
 
     // MARK: - Upscaling
+
+    // MARK: - Output behaviour (engine-independent)
+
+    /// 엔진과 무관한 출력 동작. 이전에는 두 항목 모두 `selectedRenderMode == .metalFlow`
+    /// 블록 안에 있어서 신경망·AppleFI를 쓰면 화면에서 사라졌다 — 둘 다 보간 방식과
+    /// 아무 상관이 없는 설정이라 명백한 오배치였다(사용자 지적).
+    private var outputSection: some View {
+        section(L("Output behaviour", "출력 동작", "出力の挙動")) {
+            field(L("Mouse input to source", "마우스 입력 전달", "マウス入力の転送"),
+                  hint: L("Viewer: forward mouse to the source app.",
+                          "뷰어: 마우스를 소스 앱으로 전달.",
+                          "ビューア: マウスをソースアプリへ転送。"),
+                  detail: L("On: clicks and movement over the viewer are forwarded to the source (relative pointer). Off: the viewer sends nothing — the source never repaints from hover, input cadence stays clean, and the event tap (a past crash source) never runs. Turn off for pure video watching or measurements.",
+                            "켜면 뷰어 위의 클릭·이동이 소스로 전달됩니다(상대커서). 끄면 아무것도 보내지 않습니다 — 소스가 호버로 리페인트하지 않아 입력 케이던스가 깨끗해지고, 이벤트 탭(과거 크래시 원인)도 아예 돌지 않습니다. 순수 영상 감상이나 측정 시 끄세요.",
+                            "オンにするとビューア上のクリック·移動がソースへ転送されます(相対ポインタ)。オフでは何も送りません — ホバー再描画がなくなり入力ケイデンスが安定し、イベントタップ(過去のクラッシュ原因)も動きません。視聴専用や測定時はオフに。")) {
+                Toggle(L("Enable", "켜기", "有効"), isOn: $appState.mouseInputEnabled)
+                    .toggleStyle(.switch).labelsHidden()
+                    .onChange(of: appState.mouseInputEnabled) { appState.updateMouseInput() }
+            }
+
+            field(L("Keep overlay while multitasking", "멀티태스킹 중 오버레이 유지", "マルチタスク中もオーバーレイ維持"),
+                  hint: L("Cover mode: don't hide when you click another app.",
+                          "Cover 모드: 다른 앱을 클릭해도 숨기지 않음.",
+                          "Coverモード: 他アプリをクリックしても隠さない。"),
+                  detail: L("By default the Cover overlay hides when you switch to another app so it doesn't block it (single-monitor safety). Turn on to keep watching the interpolated output while working in other windows — it stays on top of the source area.",
+                            "기본값은 다른 앱으로 전환하면 Cover 오버레이가 그 앱을 안 가리려고 숨습니다(단일 모니터 안전장치). 켜면 다른 창에서 작업하면서도 보간 출력을 계속 볼 수 있습니다 — 소스 영역 위에 유지됩니다.",
+                            "既定では他アプリに切り替えるとCoverオーバーレイが非表示になります(単一モニタの安全策)。オンにすると他ウィンドウで作業しながら補間出力を見続けられます。")) {
+                Toggle(L("Enable", "켜기", "有効"), isOn: $appState.coverKeepVisible)
+                    .toggleStyle(.switch).labelsHidden()
+                    .onChange(of: appState.coverKeepVisible) { appState.refreshOverlayVisibility() }
+            }
+        }
+    }
 
     private var upscalingSection: some View {
         section(L("Upscaling & sharpness", "업스케일 & 샤픈", "アップスケール & シャープ")) {

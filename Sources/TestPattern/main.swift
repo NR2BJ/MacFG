@@ -27,7 +27,26 @@ final class PatternView: NSView {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .inVisibleRect], owner: self))
     }
-    override func mouseMoved(with e: NSEvent)  { NSLog("[TP-MOUSE] moved (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
+    /// 마우스 이동에 반응해 즉시 한 프레임 진행 — **브라우저의 호버 리페인트 재현용**(--hover-repaint).
+    ///
+    /// 실사용 소스(브라우저)는 마우스가 움직이면 영상 프레임 사이에 창 갱신을 끼워 넣어,
+    /// 우리가 재는 소스율이 60 → 90~110fps로 뛴다. 그 상승이 보간 예산을 잠식하는지를
+    /// 재려면 그 조건을 결정적으로 만들 소스가 필요한데, TestPattern은 고정 fps라 마우스에
+    /// 무반응이었다. 이 플래그가 그 간극을 메운다 — 실제 브라우저 없이, 콘텐츠 드리프트 없이
+    /// "마우스 움직이면 소스율이 오르는" 상태를 정확히 재현한다.
+    var hoverRepaint = false
+    /// UI 마커 위치(드로어블 픽셀). 음수면 그리지 않는다.
+    var uiMark = SIMD2<Float>(-1, -1)
+    override func mouseMoved(with e: NSEvent)  {
+        NSLog("[TP-MOUSE] moved (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))")
+        if hoverRepaint {
+            // **frameIndex를 진행시키지 않는다** — 영상은 멈춘 채 UI만 바뀌는 상태를 만든다.
+            let scale = window?.backingScaleFactor ?? 1
+            uiMark = SIMD2<Float>(Float(e.locationInWindow.x * scale),
+                                  Float((bounds.height - e.locationInWindow.y) * scale))
+            render()
+        }
+    }
     override func mouseDown(with e: NSEvent)   { NSLog("[TP-MOUSE] DOWN (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
     override func mouseUp(with e: NSEvent)     { NSLog("[TP-MOUSE] UP (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y)))") }
     override func scrollWheel(with e: NSEvent) { NSLog("[TP-MOUSE] SCROLL (\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) dy=\(Int(e.scrollingDeltaY))") }
@@ -65,7 +84,8 @@ final class PatternView: NSView {
 
         fragment float4 fmain(VOut in [[stage_in]], constant uint& frame [[buffer(0)]],
                               constant float2& res [[buffer(1)]],
-                              constant uint& complexMode [[buffer(2)]]) {
+                              constant uint& complexMode [[buffer(2)]],
+                              constant float2& uiMark [[buffer(3)]]) {
             float2 px = in.uv * res;
             float3 c = float3(0.13, 0.13, 0.15); // 배경
 
@@ -131,6 +151,14 @@ final class PatternView: NSView {
                 bool on = ((frame >> bit) & 1u) == 1u;
                 c = on ? float3(1.0, 1.0, 0.0) : float3(0.05);
             }
+            // UI 마커 — **영상 프레임은 그대로 두고 화면의 아주 작은 영역만 바꾼다.**
+            // 브라우저의 호버 리페인트가 정확히 이 모양이다: 영상은 같은 프레임인데
+            // 창 표면이 갱신돼 우리 지문이 "새 프레임"으로 통과시킨다. 프레임을 통째로
+            // 진행시키면(초기 재현) 추가 프레임이 진짜 모션을 담아 실제보다 유리해진다.
+            if (uiMark.x >= 0.0) {
+                float2 d = in.uv * res - uiMark;
+                if (dot(d, d) < 900.0) return float4(1.0, 0.0, 0.0, 1.0);
+            }
             return float4(c, 1.0);
         }
         """
@@ -190,6 +218,8 @@ final class PatternView: NSView {
         enc.setFragmentBytes(&frame, length: 4, index: 0)
         enc.setFragmentBytes(&res, length: 8, index: 1)
         enc.setFragmentBytes(&cm, length: 4, index: 2)
+        var mk = uiMark
+        enc.setFragmentBytes(&mk, length: 8, index: 3)
         enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         enc.endEncoding()
         cb.present(drawable)
@@ -231,6 +261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "MacFG Test Pattern"
         view = PatternView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        view.hoverRepaint = args.contains("--hover-repaint")
         view.contentFPS = fps
         view.jitterMs = jitter
         view.complexMode = complexFlag

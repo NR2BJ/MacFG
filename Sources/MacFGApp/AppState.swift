@@ -1609,6 +1609,10 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var overSupplyCredit: Double = 0
     /// 소스 케이던스 고정으로 걸러낸 프레임 수 (영상 프레임 사이에 낀 UI 갱신).
     @ObservationIgnored nonisolated(unsafe) private var diagSrcLockSkip = 0
+    /// UI 전용 갱신(영상 미진행)으로 판정해 걸러낸 프레임 수.
+    @ObservationIgnored nonisolated(unsafe) private var diagUiGateSkip = 0
+    /// 연속으로 건너뛴 수 — 4장에서 강제 수용해 정지를 구조적으로 막는다.
+    @ObservationIgnored nonisolated(unsafe) private var uiGateStreak = 0
     /// present용 GPU가 목표 표시 슬롯 대비 몇 칸 늦게 끝났나 — [-1칸(여유), 0칸(정시), +1, +2, +3이상].
     /// stageLock으로 보호(완료 핸들러는 임의 스레드).
     @ObservationIgnored nonisolated(unsafe) private var diagGpuLateHist = [0, 0, 0, 0, 0]
@@ -1941,6 +1945,54 @@ public final class AppState {
         // 영상 케이던스를 알면 그 사이에 끼는 갱신은 받지 않으면 된다. 잃는 것은 영상 한 프레임
         // 안에서의 UI 변화가 한 프레임 늦게 보이는 것뿐이고, 얻는 것은 보간이 꺼지지 않는 것이다.
         // 임계를 0.75×로 두어 실제 케이던스의 지터(SCK 배달 흔들림)는 통과시킨다.
+        // **UI 전용 갱신 게이트 (MACFG_UIGATE = 변화율 임계, 0/미설정 = 끔).**
+        //
+        // 소스 앱은 마우스가 움직이면 영상 프레임 사이에 창 갱신을 끼워 넣는다. 그 프레임들은
+        // 진짜다(픽셀이 바뀐다) — 다만 **영상이 진행하지 않는다.** 그런데 우리는 그것을 새 소스
+        // 프레임으로 세므로 쌍 간격이 16.7ms에서 9ms로 좁아지고, 표시 슬롯 기준 2.4 → 1.3슬롯이
+        // 되어 보간을 놓을 자리가 사라진다. 결과는 영상 모션이 덜 매끄러워지는 것이다.
+        //
+        // 결정적 재현(2026-08-09, TestPattern --hover-repaint: 영상은 그대로 두고 작은 영역만 갱신):
+        //   마우스 정지: 인식 53fps, 소스 48.0/s, 보간 생성 **83.6/s**, 표시 128.2/s
+        //   마우스 회전: 인식 106fps, 소스 76.1/s, 보간 생성 **47.1/s**, 표시 121.3/s
+        //   영상 모션을 나르는 프레임(진짜 소스 48 + 보간)이 131 → 95로 28% 줄어든다.
+        //
+        // 그런데 둘은 **변화 크기로 깨끗하게 갈린다**. 같은 실행의 지문 변화율 분포:
+        //   마우스 정지: 변화 <0.1%인 프레임 0.0%
+        //   마우스 회전: 변화 <0.1%인 프레임 **56.3%** (영상 프레임은 2~10% 구간)
+        // 그래서 임계 아래 갱신은 받지 않는다. 잃는 것은 그 UI 변화가 영상 한 프레임만큼
+        // 늦게 보이는 것뿐이고, 얻는 것은 보간 예산이 온전히 남는 것이다.
+        //
+        // 주의: 실제 브라우저의 호버 리페인트가 이 재현보다 넓은 영역을 다시 그릴 수 있다.
+        // 임계를 너무 높이면 진짜 영상 프레임(작은 움직임의 정지 장면)까지 버린다 — 기본 0.2%는
+        // 위 분포에서 두 무리 사이의 빈 구간이다.
+        // **누적으로 판정한다 — 단순 임계는 정지 화면을 만든다.**
+        // changeRatio는 *직전에 배달된* 프레임 대비 값이라, 게이트로 건너뛰면 그 차이가
+        // 어디에도 남지 않는다. 그러면 아주 느린 장면(작은 물체만 움직이는 영상)은 매 프레임이
+        // 임계 아래여서 **영원히 수용되지 않고 화면이 멈춘다.** 이 저장소는 지문을 랜덤 384점으로
+        // 뒀을 때 같은 실패를 이미 겪었다(가로 드래그 5초 정지).
+        // 누적하면 두 성질이 동시에 선다: 큰 변화(영상 진행)는 즉시 통과하고, 작은 변화는
+        // 쌓여서 결국 통과하므로 정지가 원천적으로 불가능하다. UI 리페인트는 그 사이 대부분
+        // 걸러진다(0.02%짜리가 10장 모여야 한 번 통과 = 배달의 90%가 사라진다).
+        // 임계 판정 + **연속 스킵 상한**. 누적식(스킵된 변화율을 더해 임계에 도달하면 수용)도
+        // 재봤으나 임계식보다 결과가 나빴다(표시 88.9 vs 131.3, σ 3.81 vs 2.39). 다만 임계식만
+        // 두면 아주 느린 장면이 영원히 임계 아래여서 화면이 멈출 수 있다 — 이 저장소가 지문을
+        // 랜덤 384점으로 뒀을 때 겪은 실패다(가로 드래그 5초 정지). 연속 스킵을 4장으로 묶어
+        // 정지 시간을 소스 간격 4배(60fps면 67ms) 이내로 구조적으로 못박는다.
+        // 기본 0.002(0.2%) — 결정적 재현에서 모션을 나르는 프레임이 94.4 → 109.8/s(+16%),
+        // multFell 48.8 → 2.4/s. 마우스가 정지해 있으면 영상 프레임은 전부 2~10% 구간이라
+        // 아무것도 걸러지지 않는다(실측: 정지 시 <0.1% 프레임 0.0%). 0.005·0.01도 재봤으나
+        // 차이가 없어 두 무리 사이 빈 구간의 아래쪽인 0.002를 택했다. 0으로 두면 꺼진다.
+        let uiGateValue = Knob.double("MACFG_UIGATE") ?? 0.002
+        if uiGateValue > 0,
+           slot.changeRatio > 0, slot.changeRatio < Float(uiGateValue),
+           uiGateStreak < 4 {
+            uiGateStreak += 1
+            diagUiGateSkip += 1
+            return
+        }
+        uiGateStreak = 0
+
         if let srcFps = Knob.double("MACFG_SRCFPS"), srcFps >= 1 {
             let lockedInterval = 1.0 / srcFps
             if lastAcceptedTimestamp > 0,
@@ -2861,7 +2913,7 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) gpuLate=\(diagGpuLateHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) gpuLate=\(diagGpuLateHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2895,6 +2947,7 @@ public final class AppState {
         diagDupSkipCount = 0
         diagChangeHist = [0, 0, 0, 0, 0]
         diagSrcLockSkip = 0
+        diagUiGateSkip = 0
         stageLock.lock(); diagGpuLateHist = [0, 0, 0, 0, 0]; stageLock.unlock()
         diagTsRejectCount = 0
         _ = wallSpan

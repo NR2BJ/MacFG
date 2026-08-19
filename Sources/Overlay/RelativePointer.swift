@@ -204,8 +204,19 @@ final class RelativePointer {
                 // 재시작을 유발하는지가 미해결이다. 재시작은 콜백/스트림 교체를 동반하므로
                 // 크래시 후보(M-C)의 발화 조건이다. 이 줄이 `Capture stopped` 직전에 몰리면
                 // "포인터 → 재활성 → 재시작 → 손상"의 다리가 확인된다.
-                DiagnosticLog.shared.log("[RELPTR] 화면 재진입 → 소스 활성화 (pid=\(pid))")
-                DispatchQueue.main.async { NSRunningApplication(processIdentifier: pid)?.activate() }
+                // **이미 활성이면 부르지 않는다.** 커서가 잠깐 화면 밖으로 나갔다 오는 것만으로는
+                // 소스의 활성 상태가 바뀌지 않으므로, 이 호출은 거의 항상 불필요한 재활성이다.
+                // 그런데 앱 활성화는 창 순서·키 창 전환을 동반해 **소스 창 전체 리페인트**를 부르고,
+                // 그것이 캡처로 그대로 들어와 측정 소스율을 60 → 90~110fps로 밀어올린다.
+                // 사용자 관찰이 이 경로를 정확히 지목한다: "뷰어 창 안/밖을 왔다갔다 할 때만
+                // 입력 프레임이 오르고, 뷰어 위에서 마우스를 돌릴 땐 안 오른다" — 경계를 넘을 때만
+                // 일어나는 일이 이것뿐이다.
+                DispatchQueue.main.async {
+                    guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+                    guard !app.isActive else { return }
+                    DiagnosticLog.shared.log("[RELPTR] 화면 재진입 → 소스 활성화 (pid=\(pid))")
+                    app.activate()
+                }
             }
         }
 

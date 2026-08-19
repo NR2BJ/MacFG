@@ -327,7 +327,12 @@ public final class OverlayWindow: NSObject {
             // 보고했고, 그게 맞다면 위 붕괴는 **합성 이벤트의 산물**일 수 있다.
             // 진짜 마우스로 재현되기 전까지 이 노브를 기본값으로 켜지 마라.
             // 그리고 소스 조작 통과는 커버 배치의 의도된 동작이다 — 성능을 이유로 바꾸지 않는다.
-            window.ignoresMouseEvents = Knob.string("MACFG_COVEREATMOUSE") != "1"
+            // 설정에서 마우스 입력을 끄면 커버도 통과시키지 않는다 — 그래야 "마우스 입력"이라는
+            // 이름값을 한다. ignoresMouseEvents=false면 이 창이 이벤트를 받아 **삼키므로**
+            // 소스에 도달하지 않고, 소스는 호버 리페인트를 하지 않는다.
+            // (통과가 커버의 의도된 동작인 것은 맞다 — 그래서 기본은 켬이고, 끄는 것은 사용자 선택이다.)
+            window.ignoresMouseEvents = !mouseInputSuppressed && Knob.string("MACFG_COVEREATMOUSE") != "1"
+            DiagnosticLog.shared.log("[MOUSE] 커버 생성: 통과=\(window.ignoresMouseEvents) 억제=\(mouseInputSuppressed)")
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.hasShadow = false
             window.alphaValue = 1.0
@@ -461,6 +466,13 @@ public final class OverlayWindow: NSObject {
     /// 설정창 토글의 라이브 반영. 뷰어가 떠 있는 동안 꺼도/켜도 즉시 적용된다.
     public func setMouseInputEnabled(_ enabled: Bool) {
         mouseInputSuppressed = !enabled
+        if style == .overlay {
+            // 커버: OS 레벨 클릭 통과를 그대로 켜고 끈다. 끄면 이 창이 이벤트를 삼켜
+            // 소스가 마우스를 보지 못한다(호버 리페인트 차단).
+            window.ignoresMouseEvents = enabled && Knob.string("MACFG_COVEREATMOUSE") != "1"
+            DiagnosticLog.shared.log("[MOUSE] 커버 통과 = \(window.ignoresMouseEvents)")
+            return
+        }
         guard style == .viewer else { return }
         if enabled {
             interactionView?.owner = self

@@ -212,17 +212,6 @@ struct WindowPickerView: View {
     /// 아무 상관이 없는 설정이라 명백한 오배치였다(사용자 지적).
     private var outputSection: some View {
         section(L("Output behaviour", "출력 동작", "出力の挙動")) {
-            field(L("Mouse input to source", "마우스 입력 전달", "マウス入力の転送"),
-                  hint: L("Viewer: forward mouse to the source app.",
-                          "뷰어: 마우스를 소스 앱으로 전달.",
-                          "ビューア: マウスをソースアプリへ転送。"),
-                  detail: L("On: clicks and movement over the viewer are forwarded to the source (relative pointer). Off: the viewer sends nothing — the source never repaints from hover, input cadence stays clean, and the event tap (a past crash source) never runs. Turn off for pure video watching or measurements.",
-                            "켜면 뷰어 위의 클릭·이동이 소스로 전달됩니다(상대커서). 끄면 아무것도 보내지 않습니다 — 소스가 호버로 리페인트하지 않아 입력 케이던스가 깨끗해지고, 이벤트 탭(과거 크래시 원인)도 아예 돌지 않습니다. 순수 영상 감상이나 측정 시 끄세요.",
-                            "オンにするとビューア上のクリック·移動がソースへ転送されます(相対ポインタ)。オフでは何も送りません — ホバー再描画がなくなり入力ケイデンスが安定し、イベントタップ(過去のクラッシュ原因)も動きません。視聴専用や測定時はオフに。")) {
-                Toggle(L("Enable", "켜기", "有効"), isOn: $appState.mouseInputEnabled)
-                    .toggleStyle(.switch).labelsHidden()
-                    .onChange(of: appState.mouseInputEnabled) { appState.updateMouseInput() }
-            }
 
             field(L("Keep overlay while multitasking", "멀티태스킹 중 오버레이 유지", "マルチタスク中もオーバーレイ維持"),
                   hint: L("Cover mode: don't hide when you click another app.",

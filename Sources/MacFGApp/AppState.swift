@@ -155,8 +155,6 @@ public final class AppState {
     /// 핵심 사용이라). off면 제3앱 최전면 시 오버레이 숨김+보간 정지(GPU 양보, 단일모니터 전체화면
     /// Cover 트랩 회피용). 창 소스는 소스 영역만 덮으니 켜둬도 안전; 트랩 시 보간/오버레이 단축키로 escape.
     var coverKeepVisible: Bool = true
-    /// 마우스 입력 전달 (뷰어 → 소스). 끄면 탭·포워딩 전부 차단 — 측정/감상 전용 모드.
-    var mouseInputEnabled: Bool = true
     /// 모션 부드러움 0(예리)~1(부드러움), 0.5=기본. MetalFlow 전용 취향 슬라이더 (실시간 반영).
     var motionSmoothness: Double = 0.5
     /// 경계 전환 0(crisp/저더)~1(soft/고스팅), 0.5=기본. 콘텐츠 취향(게임 crisp / 영화 soft).
@@ -618,7 +616,6 @@ public final class AppState {
         d.set(isInterpolationEnabled, forKey: "s.interp")
         d.set(occlusionDirectional, forKey: "s.occdir")
         d.set(coverKeepVisible, forKey: "s.coverkeep")
-        d.set(mouseInputEnabled, forKey: "s.mouseinput")
         d.set(motionSmoothness, forKey: "s.msmooth")
         d.set(boundarySoftness, forKey: "s.bsoft")
     }
@@ -635,7 +632,6 @@ public final class AppState {
         if d.object(forKey: "s.preset") != nil { sourcePreset = d.integer(forKey: "s.preset") }
         if d.object(forKey: "s.interp") != nil { isInterpolationEnabled = d.bool(forKey: "s.interp") }
         if d.object(forKey: "s.coverkeep") != nil { coverKeepVisible = d.bool(forKey: "s.coverkeep") }
-        if d.object(forKey: "s.mouseinput") != nil { mouseInputEnabled = d.bool(forKey: "s.mouseinput") }
         if d.object(forKey: "s.occdir") != nil { occlusionDirectional = d.bool(forKey: "s.occdir") }
         MetalFlowEngine.occlusionDirectional = occlusionDirectional
         if d.object(forKey: "s.msmooth") != nil { motionSmoothness = d.double(forKey: "s.msmooth") }
@@ -656,11 +652,6 @@ public final class AppState {
     }
 
     /// 오클루전 방향별 워프 토글 (실험) — 정적 var를 워프가 매 쌍 읽으므로 캡처 중에도 즉시 반영.
-    func updateMouseInput() {
-        persistSettings()
-        overlayManager?.setMouseInputEnabled(mouseInputEnabled)
-        DiagnosticLog.shared.log("[SETTING] 마우스 입력 전달 = \(mouseInputEnabled)")
-    }
 
     func updateOcclusionDirectional() {
         MetalFlowEngine.occlusionDirectional = occlusionDirectional
@@ -1039,9 +1030,10 @@ public final class AppState {
 
             // 창 추적은 30Hz면 충분 — 틱(120Hz)마다 CGWindowList를 부르면 호출당 0.5-2ms로
             // vsync 틱을 놓쳐 출력 fps 천장이 ~110으로 내려앉는다 (실측).
-            // 뷰어 배치도 15Hz — 상대커서 매핑이 sourceFrameNS를 쓰므로, 드래그로 소스 창이
-            // 움직였을 때 다음 조작 좌표가 어긋나지 않게 신선도가 필요 (2Hz는 0.5s 지연으로
-            // 매핑이 헛돌았음). 렌더는 전용 스레드라 메인 CGWindowList 15Hz는 틱에 무해.
+            // 뷰어 배치 15Hz의 원래 근거는 상대커서 매핑의 좌표 신선도였는데, 그 기능은
+            // 2026-08-20에 제거됐다. 지금 남은 용도는 소스 창 이동/리사이즈 감지(캡처 재구성)뿐이라
+            // 더 낮춰도 될 가능성이 크다 — 다만 낮췄을 때 재구성이 늦어지는지 안 재봤으므로
+            // 값은 그대로 둔다. 렌더는 전용 스레드라 메인 CGWindowList 15Hz는 틱에 무해하다.
             let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
             trackingTimer = makeTrackingTimer(hz: trackHz)
 
@@ -1049,7 +1041,6 @@ public final class AppState {
             sourceOwnerPID = ownerPID(of: windowID)
         originalCaptureWindowID = windowID
         currentTargetWindowID = windowID
-            overlayManager?.sourcePID = sourceOwnerPID   // 뷰어 마우스 역매핑 대상
             overlayUserHidden = false
             overlayHiddenState = false
             isCapturing = true
@@ -2870,11 +2861,10 @@ public final class AppState {
         diagLastLogWallSpan = wallSpan
         diagLastLogWall = nowWall
         let tickCPUAvg = diagTickCPUSum / 240.0
-        let pointerEvents = PointerTapStats.drain()
         let ingAvg = diagIngestSamples > 0 ? diagIngestSum / Double(diagIngestSamples) : 0
-        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) mouse=%llu foreign=%llu ing=%.2f/%.1fms ingOver=%d",
+        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) foreign=%llu ing=%.2f/%.1fms ingOver=%d",
                                tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax,
-                               pointerEvents, renderDriver.foreignTickDrops, ingAvg, diagIngestMax, diagIngestOver)
+                               renderDriver.foreignTickDrops, ingAvg, diagIngestMax, diagIngestOver)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
         // 콘텐츠 간격 통계 (wobble 지표)

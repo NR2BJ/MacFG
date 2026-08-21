@@ -124,9 +124,6 @@ public final class OverlayManager {
     }
 
     /// 소스 앱 PID — 뷰어 마우스 역매핑에서 CGEventPostToPid 대상. 창 재생성에도 유지.
-    public var sourcePID: pid_t = 0 {
-        didSet { overlayWindow?.sourcePID = sourcePID }
-    }
 
     /// 업스케일 방식 — 현재 창에 즉시 적용 + 이후 창 재생성에도 유지
     public func setUpscaleMode(_ mode: UpscaleMode) {
@@ -219,7 +216,6 @@ public final class OverlayManager {
         }
         overlay.upscaleMode = upscaleMode
         overlay.sharpness = sharpness
-        overlay.sourcePID = sourcePID
         overlay.sourceWindowID = trackedWindowID ?? 0
         self.overlayWindow = overlay
         // 창을 새로 만들었으면 정보 오버레이를 복원한다 (라벨은 창에 붙어 있어 같이 사라진다)
@@ -236,10 +232,6 @@ public final class OverlayManager {
     }
 
     /// 캡처 색공간 기록 — 실제 적용은 화면 일치 여부와 함께 결정
-    /// 설정창 "마우스 입력" 토글 → 출력 창에 즉시 반영.
-    public func setMouseInputEnabled(_ enabled: Bool) {
-        overlayWindow?.setMouseInputEnabled(enabled)
-    }
 
     public func setCaptureColorSpace(_ colorSpace: CGColorSpace?) {
         captureColorSpace = colorSpace
@@ -310,7 +302,6 @@ public final class OverlayManager {
             return
         }
         trackingFailureCount = 0
-        overlayWindow?.sourceFrameNS = geom.frame   // 마우스 역매핑용 — 소스 위치 최신 유지
 
         if placement == .coverSource {
             // 위치/크기가 실제로 바뀌었을 때만 setFrame 호출 (윈도우 서버 부하 최소화)

@@ -221,10 +221,7 @@ public final class OverlayWindow: NSObject {
     /// 설정되면 뷰어의 호버/클릭/스크롤을 업스케일 배율로 역산해 소스로 전달(CGEventPostToPid).
     /// windowID는 이벤트의 windowUnderMousePointer 필드에 박는다 — 수신 AppKit이 좌표 밑 창을
     /// 윈도우서버에 물으면 우리 뷰어(다른 앱)가 나와 자기 창을 못 찾고 클릭을 버리는 것 우회.
-    public var sourceFrameNS: CGRect = .zero { didSet { pushPointerGeometry() } }
-    public var sourcePID: pid_t = 0
     public var sourceWindowID: CGWindowID = 0
-    private weak var interactionView: ViewerInteractionView?
 
     /// 정보 오버레이 (단축키 토글) — 좌상단에 소스/보간/업스케일 정보. metal 콘텐츠 위 서브뷰로 합성.
     private var infoLabel: NSTextField?
@@ -276,7 +273,6 @@ public final class OverlayWindow: NSObject {
     }
 
     /// 상대커서 모드 — 진짜 커서 위치를 소스로 재타깃 (호버/스크롤/클릭/드래그 전부 진짜 이벤트)
-    private let relativePointer = RelativePointer()
 
     public init(device: any MTLDevice, style: OverlayStyle, title: String = "MacFG Output") throws {
         self.device = device
@@ -312,27 +308,11 @@ public final class OverlayWindow: NSObject {
             window.level = .floating
             window.isOpaque = OverlayStyleConstants.opaqueCover
             window.backgroundColor = OverlayStyleConstants.opaqueCover ? .black : .clear
-            // 기본은 통과(true) — 커버는 "보기만" 하는 오버레이라 소스 조작을 방해하면 안 된다.
-            //
-            // MACFG_COVEREATMOUSE=1이면 **삼킨다.** 실측 근거(2026-08-07, 한 실행 내 교차):
-            //   실제 브라우저 소스: 마우스를 움직이면 소스 공급이 59.8 → 13.2장/s로 무너지고
-            //     (중복 프레임 비율 58% → 17%), 표시가 89.9 → 11.3/s가 되며 resync 8회, srcInt 최대 210ms.
-            //   결정적 소스(TestPattern): 같은 마우스 부하에서 48.0 → 48.0, 표시 83.0 → 83.4, resync 0.
-            // 즉 이 부하에서 우리 파이프라인은 무죄이고(틱은 143Hz로 정상), 소스 앱이 마우스를
-            // 처리하느라 영상을 진행시키지 못했다. 삼키면 그 현상이 사라진다(59.2장/s 유지, resync 0).
-            //
-            // **다만 이 실측의 마우스는 진짜 마우스가 아니다.** 합성 CGEvent로 만들었고
-            // kCGMouseEventDeltaX/Y·Subtype·Number가 비어 있다 — 실제 HID 마우스가 채우는 필드다.
-            // 사용자는 "보간을 안 켜고 파이어폭스에서 마우스를 까딱여도 네이티브 영상은 안 떨어진다"고
-            // 보고했고, 그게 맞다면 위 붕괴는 **합성 이벤트의 산물**일 수 있다.
-            // 진짜 마우스로 재현되기 전까지 이 노브를 기본값으로 켜지 마라.
-            // 그리고 소스 조작 통과는 커버 배치의 의도된 동작이다 — 성능을 이유로 바꾸지 않는다.
-            // 설정에서 마우스 입력을 끄면 커버도 통과시키지 않는다 — 그래야 "마우스 입력"이라는
-            // 이름값을 한다. ignoresMouseEvents=false면 이 창이 이벤트를 받아 **삼키므로**
-            // 소스에 도달하지 않고, 소스는 호버 리페인트를 하지 않는다.
-            // (통과가 커버의 의도된 동작인 것은 맞다 — 그래서 기본은 켬이고, 끄는 것은 사용자 선택이다.)
-            window.ignoresMouseEvents = !mouseInputSuppressed && Knob.string("MACFG_COVEREATMOUSE") != "1"
-            DiagnosticLog.shared.log("[MOUSE] 커버 생성: 통과=\(window.ignoresMouseEvents) 억제=\(mouseInputSuppressed)")
+            // **마우스 이벤트를 삼킨다.** 뷰어 마우스 재매핑은 2026-08-20에 제거됐다 —
+            // 크래시 3계통의 근원이었고, 소스가 이벤트를 받아 호버 리페인트를 하면 입력
+            // 케이던스가 오염돼 보간 예산이 좁아진다(worklog 참조). 통과시킬 이유가 없어졌다.
+            // 소스를 조작하려면 단축키로 오버레이를 숨긴다.
+            window.ignoresMouseEvents = false
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             window.hasShadow = false
             window.alphaValue = 1.0
@@ -372,13 +352,12 @@ public final class OverlayWindow: NSObject {
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
             // 마우스 이벤트를 소스로 포워딩하는 인터랙션 뷰 (호버/클릭/스크롤 역매핑)
-            let iview = ViewerInteractionView(frame: window.contentView?.bounds ?? .zero)
+            let iview = NSView(frame: window.contentView?.bounds ?? .zero)
             iview.wantsLayer = true
             iview.layer?.backgroundColor = NSColor.black.cgColor
             iview.layer?.addSublayer(metalLayer)
             iview.autoresizingMask = [.width, .height]
             window.contentView = iview
-            self.interactionView = iview
         }
 
         // .readOnly: 스크린샷/녹화에 출력이 보이도록 (검증 및 사용자 녹화용).
@@ -410,204 +389,13 @@ public final class OverlayWindow: NSObject {
 
         if style == .viewer {
             window.delegate = self
-            window.acceptsMouseMovedEvents = true
-            interactionView?.owner = mouseInputSuppressed ? nil : self
         }
 
         logger.info("OverlayWindow created (style=\(String(describing: style)))")
     }
 
-    // MARK: - 상대커서 모드 (진짜 커서 위치를 소스로 재타깃 — 링·숨김 없음)
-
-    private var primaryScreenHeight: CGFloat {
-        NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
-            ?? NSScreen.main?.frame.height ?? 0
-    }
-
-    /// 탭 스레드용 지오메트리 스냅샷을 메인에서 계산해 push (전부 값 타입 → 스레드 안전).
-    /// sourceFrameNS 갱신(15Hz)·진입 시 호출 — 탭은 AppKit을 만지지 않고 이 스냅샷만 읽는다.
-    private func pushPointerGeometry() {
-        guard style == .viewer, relativePointer.active else { return }
-        let displayID = (window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
-            ?? CGMainDisplayID()
-        relativePointer.setGeometry(RelativePointer.Geometry(
-            displayID: displayID,
-            windowFrame: window.frame,
-            letterbox: metalLayer.frame,
-            sourceFrameNS: sourceFrameNS,
-            primaryHeight: primaryScreenHeight,
-            sourcePID: sourcePID
-        ))
-    }
-
-    /// 뷰어 표시 시작 시 상대커서 진입 — 뷰어를 클릭투과로 만들고 커서를 소스에 상주.
-    /// 상대커서 킬 스위치. `defaults write com.macfg.MacFG s.norelptr -bool true` 로 끈다.
-    ///
-    /// 환경변수가 아니라 UserDefaults인 이유: Finder 더블클릭으로 켠 .app에는 환경변수가
-    /// 전달되지 않아, env 게이트는 실사용에서 **도달 불가능한 스위치**가 된다(이미 겪은 함정).
-    ///
-    /// 왜 필요한가: 마우스를 뷰어에 반복 진입/이탈시키면 앱이 SIGTRAP으로 죽는다(참조 카운트
-    /// 손상, 크래시 3건). 탭이 켜진 뒤 수십 초 안에 터지는 상관이 있으나 원인은 미확정이다.
-    /// 이 스위치는 **회피책이자 결정적 실험**이다 — 끄고도 죽으면 상대커서는 무죄다.
-    private static let relativePointerDisabled = UserDefaults.standard.bool(forKey: "s.norelptr")
-
-    /// 마우스 입력 전달 억제 (설정창 토글 "마우스 입력", 기본 켬=전달).
-    ///
-    /// 끄면 뷰어가 소스로 아무 이벤트도 보내지 않는다 — 상대커서 탭도, 레거시 포워딩도.
-    /// 왜 토글인가: 이 프로젝트에서 잡은 크래시가 전부 마우스 유발이었고(렌더 스레드 레이스,
-    /// 탭 refcon 힙 손상, 경계 재활성화), 마우스가 소스 리페인트를 부르면 입력 케이던스도
-    /// 오염된다. 영상 감상엔 마우스 전달이 필요 없는 경우가 많고, 모델 최적화 측정은
-    /// 마우스 변수를 빼야 깨끗하다. 삭제 대신 토글로 두면 쓸 때만 켤 수 있다.
-    /// (커버 배치의 클릭 통과는 OS 레벨이라 이 토글과 무관 — 뷰어 전용.)
-    private var mouseInputSuppressed =
-        UserDefaults.standard.object(forKey: "s.mouseinput") != nil
-        && !UserDefaults.standard.bool(forKey: "s.mouseinput")
-
-    /// 설정창 토글의 라이브 반영. 뷰어가 떠 있는 동안 꺼도/켜도 즉시 적용된다.
-    public func setMouseInputEnabled(_ enabled: Bool) {
-        mouseInputSuppressed = !enabled
-        if style == .overlay {
-            // 커버: OS 레벨 클릭 통과를 그대로 켜고 끈다. 끄면 이 창이 이벤트를 삼켜
-            // 소스가 마우스를 보지 못한다(호버 리페인트 차단).
-            window.ignoresMouseEvents = enabled && Knob.string("MACFG_COVEREATMOUSE") != "1"
-            DiagnosticLog.shared.log("[MOUSE] 커버 통과 = \(window.ignoresMouseEvents)")
-            return
-        }
-        guard style == .viewer else { return }
-        if enabled {
-            interactionView?.owner = self
-            if window.isVisible { enterRelativePointer() }
-        } else {
-            exitRelativePointer()               // 탭 해제 + 클릭투과 복구
-            interactionView?.owner = nil        // 레거시 포워딩도 차단
-            DiagnosticLog.shared.log("[RELPTR] 마우스 입력 전달 꺼짐 (설정)")
-        }
-    }
-
-    private func enterRelativePointer() {
-        guard !mouseInputSuppressed else { return }   // 설정 토글 — 전달 자체가 꺼짐
-        guard !Self.relativePointerDisabled else {
-            DiagnosticLog.shared.log("[RELPTR] 비활성 (s.norelptr) — 상대커서 진입 생략")
-            return
-        }
-        guard style == .viewer, !relativePointer.active else { return }
-        window.ignoresMouseEvents = true            // 재게시 이벤트가 뷰어 통과 → 소스 도달
-        // 소스를 키 창으로 — 비활성 창은 mouseMoved 로컬좌표가 붕괴해 호버가 죽음(실측 재확인).
-        if sourcePID != 0 { NSRunningApplication(processIdentifier: sourcePID)?.activate() }
-        // 옛 postToPid 포워딩 경로 차단 — 진짜 커서가 뷰어 위(fullscreen)에 있어 ViewerInteractionView
-        // 트래킹영역이 발화하면 이벤트가 한 번 더 매핑·전달(이중 배달, 실측). 탭이 전담하므로 무력화.
-        interactionView?.owner = nil
-        relativePointer.enable()
-        // 탭 생성 실패(접근성 미허가 등)면 클릭투과만 켜진 채 포워딩이 없어, 뷰어 위 클릭이
-        // 아래 임의 창으로 새어 나간다 (리뷰 확정). 레거시 postToPid 경로로 되돌린다.
-        guard relativePointer.active else {
-            window.ignoresMouseEvents = false
-            interactionView?.owner = self
-            DiagnosticLog.shared.log("[RELPTR] tap 생성 실패 → 클릭투과 해제 + 레거시 포워딩 복원 (접근성 권한 확인 필요)")
-            return
-        }
-        pushPointerGeometry()   // 초기 스냅샷 (이후 sourceFrameNS 갱신마다 push)
-    }
-
-    /// 뷰어 숨김/정지 시 상대커서 이탈 — 클릭투과 해제.
-    private func exitRelativePointer() {
-        guard style == .viewer else { return }
-        relativePointer.disable()
-        window.ignoresMouseEvents = false
-        // 옛 경로 복원 (폴백용) — 단, 설정으로 전달이 꺼져 있으면 복원하지 않는다
-        interactionView?.owner = mouseInputSuppressed ? nil : self
-    }
-
-    // MARK: - 마우스 역매핑 (뷰어 → 소스) — 레거시 postToPid 경로(상대커서 모드에선 미사용)
-
-    /// 뷰어 창 좌표(NS)의 마우스 위치를 소스 좌표로 역산.
-    /// 반환: (global: 스크린 CG top-left, local: 소스 창 내부 top-left).
-    /// windowNumber(필드51)를 박은 이벤트는 location을 창-로컬로 해석하므로 local이 필요.
-    private func mapToSource(_ locInWindow: CGPoint) -> (global: CGPoint, local: CGPoint)? {
-        guard style == .viewer, sourceFrameNS.width > 1, sourceFrameNS.height > 1 else { return nil }
-        let lb = metalLayer.frame   // 레터박스 (contentView=window content 좌표, NS bottom-left)
-        guard lb.width > 1, lb.height > 1 else { return nil }
-        let nx = (locInWindow.x - lb.minX) / lb.width
-        let ny = (locInWindow.y - lb.minY) / lb.height        // NS: 0=하단
-        guard nx >= 0, nx <= 1, ny >= 0, ny <= 1 else { return nil }   // 레터박스 밖은 무시
-        // 소스 창 NS 스크린 좌표 (소스 로컬 → 스크린)
-        let sxNS = sourceFrameNS.minX + nx * sourceFrameNS.width
-        let syNS = sourceFrameNS.minY + ny * sourceFrameNS.height
-        // NS(bottom-left) → CG(top-left): 주 스크린 높이 기준 y 반전
-        let primaryH = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
-            ?? NSScreen.main?.frame.height ?? 0
-        let global = CGPoint(x: sxNS, y: primaryH - syNS)
-        let local = CGPoint(x: nx * sourceFrameNS.width, y: (1 - ny) * sourceFrameNS.height)
-        return (global, local)
-    }
-
-    private let mouseEventSource = CGEventSource(stateID: .hidSystemState)
-    private var mouseLogCount = 0
-    /// 호버 전달 — 전역 좌표 + 창 필드 없이 postToPid. 키 창(소스는 캡처 시작 때 활성화됨)
-    /// 라우팅으로 정확한 좌표로 도달(실측). ⚠️ f51(창번호)을 붙이면 오히려 locationInWindow가
-    /// (0,height)로 붕괴해 호버가 구석 좌표로 감 — 창 필드는 moved에 쓰지 말 것.
-    fileprivate func forwardMouse(_ e: NSEvent, type: CGEventType, button: CGMouseButton = .left) {
-        guard sourcePID != 0, let m = mapToSource(e.locationInWindow),
-              let ev = CGEvent(mouseEventSource: mouseEventSource, mouseType: type,
-                               mouseCursorPosition: m.global,
-                               mouseButton: button) else { return }
-        ev.postToPid(sourcePID)
-        if type != .mouseMoved || mouseLogCount < 3 {
-            mouseLogCount += 1
-            DiagnosticLog.shared.log("[MOUSE] \(type.rawValue) viewer=(\(Int(e.locationInWindow.x)),\(Int(e.locationInWindow.y))) → PID\(sourcePID) global(\(Int(m.global.x)),\(Int(m.global.y)))")
-        }
-    }
-
-    /// 클릭 패스스루 리플레이 — postToPid 클릭은 창-로컬 위치(윈도우서버가 라우팅 중 채우는
-    /// 내부 구조체)가 비어 수신 AppKit이 (0,height)로 해석·폐기함(실측). 대신:
-    /// 뷰어를 이벤트 투과로 전환 → 커서를 소스 위치로 워프 → 진짜 클릭(세션 탭, 정상 라우팅)
-    /// → 커서/투과 복구. 커서가 ~150ms 소스 위치로 깜빡이는 비용으로 100% 정상 배달.
-    private var passthroughActive = false
+    /// 뷰어 기하 로그 중복 억제 키 — 마우스 재매핑 제거 후 이 블록에서 유일한 잔존 사용처.
     private var lastLoggedViewerFrame = ""
-    fileprivate func passthroughClick(_ e: NSEvent, button: CGMouseButton) {
-        // 재진입 가드 — ignoresMouseEvents 반영 전(윈도우서버 비동기)에 자기 클릭이 뷰어에
-        // 되튕겨 재귀 발화하던 것 차단 (실측: 30ms 내 재진입)
-        guard !passthroughActive, let m = mapToSource(e.locationInWindow) else { return }
-        passthroughActive = true
-        let returnPos = CGEvent(source: nil)?.location ?? m.global   // 현재 실제 커서(CG)
-        let target = m.global
-        window.ignoresMouseEvents = true
-        NSRunningApplication(processIdentifier: sourcePID)?.activate()
-        CGWarpMouseCursorPosition(target)
-        let downType: CGEventType = button == .right ? .rightMouseDown : .leftMouseDown
-        let upType: CGEventType = button == .right ? .rightMouseUp : .leftMouseUp
-        // ignore 전파 여유(80ms) 후 진짜 클릭 — 윈도우서버가 뷰어를 건너뛰고 소스로 정상 라우팅
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            if let d = CGEvent(mouseEventSource: self?.mouseEventSource, mouseType: downType, mouseCursorPosition: target, mouseButton: button) {
-                d.setIntegerValueField(.mouseEventClickState, value: 1)
-                d.post(tap: .cgSessionEventTap)
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
-            if let u = CGEvent(mouseEventSource: self?.mouseEventSource, mouseType: upType, mouseCursorPosition: target, mouseButton: button) {
-                u.setIntegerValueField(.mouseEventClickState, value: 1)
-                u.post(tap: .cgSessionEventTap)
-            }
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
-            guard let self else { return }
-            CGWarpMouseCursorPosition(returnPos)
-            // 이 0.22s 사이에 상대커서가 진입했다면 클릭투과는 그쪽이 소유한 상태 — 여기서
-            // 되돌리면 재게시 이벤트가 뷰어에 막혀 뷰어 입력이 통째로 죽는다 (리뷰 확정).
-            if !self.relativePointer.active { self.window.ignoresMouseEvents = false }
-            self.passthroughActive = false
-        }
-        DiagnosticLog.shared.log("[MOUSE] passthrough click at CG(\(Int(target.x)),\(Int(target.y))) → return(\(Int(returnPos.x)),\(Int(returnPos.y)))")
-    }
-
-    fileprivate func forwardScroll(_ e: NSEvent) {
-        guard sourcePID != 0, let m = mapToSource(e.locationInWindow),
-              let ev = CGEvent(scrollWheelEvent2Source: mouseEventSource, units: .pixel, wheelCount: 2,
-                               wheel1: Int32(e.scrollingDeltaY), wheel2: Int32(e.scrollingDeltaX), wheel3: 0) else { return }
-        // moved와 동일: 전역 좌표 + 창 필드 없이 (f51은 좌표 붕괴 유발 — 위 참조)
-        ev.location = m.global
-        ev.postToPid(sourcePID)
-    }
 
     /// 색 처리 정책.
     /// - passthrough(colorspace=nil): 컬러 매칭 없이 캡처 바이트를 그대로 패널에 전달.
@@ -773,7 +561,6 @@ public final class OverlayWindow: NSObject {
     public func close() {
         // 프로그램적 정지 — 델리게이트를 먼저 떼어 windowWillClose→onUserClose→stopCapture
         // 재진입을 차단 (이건 사용자가 X로 닫은 게 아님).
-        exitRelativePointer()   // 커서 디커플/숨김 반드시 복구
         onUserClose = nil
         window.delegate = nil
         if window.styleMask.contains(.fullScreen) {
@@ -846,15 +633,7 @@ public final class OverlayWindow: NSObject {
                         + "전체화면 Space에 못 올라간다). 확인: defaults read com.macfg.MacFG s.menubaronly")
                 }
             }
-            if style == .viewer {
-                // 첫 프레임 레이아웃(레터박스 확정) 후 진입 — 매핑 준비 완료 보장
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                    guard let self, self.window.isVisible else { return }
-                    self.enterRelativePointer()
-                }
-            }
         } else {
-            exitRelativePointer()
             window.orderOut(nil)
         }
     }
@@ -875,40 +654,13 @@ extension OverlayWindow: NSWindowDelegate {
     /// 콘텐츠가 좌하단에 몰린다 — 전체화면 자동 전환(창이 커짐)에서 오른쪽·위쪽 패딩으로 발현.
     public func windowDidResize(_ notification: Notification) {
         refreshSurfaceParams()
-        pushPointerGeometry()   // 상대커서 매핑 기준(레터박스)도 함께 갱신
     }
 
     /// 전체화면 진입/이탈은 리사이즈 통지가 애니메이션 도중 값으로 올 수 있어 완료 시점에 재갱신
-    public func windowDidEnterFullScreen(_ notification: Notification) { refreshSurfaceParams(); pushPointerGeometry() }
-    public func windowDidExitFullScreen(_ notification: Notification)  { refreshSurfaceParams(); pushPointerGeometry() }
+    public func windowDidEnterFullScreen(_ notification: Notification) { refreshSurfaceParams() }
+    public func windowDidExitFullScreen(_ notification: Notification)  { refreshSurfaceParams() }
 
     /// 다른 배율의 화면으로 옮겨가면 contentsScale이 달라진다
     public func windowDidChangeScreen(_ notification: Notification) { refreshSurfaceParams() }
 }
 
-/// 뷰어 contentView — 호버/클릭/스크롤을 OverlayWindow가 소스로 역매핑·전달하게 넘긴다.
-/// 뷰어가 이벤트를 받아 먹기만 하던 것(조작 불가)을 소스로 포워딩. metalLayer는 서브레이어.
-final class ViewerInteractionView: NSView {
-    weak var owner: OverlayWindow?
-    private var tracking: NSTrackingArea?
-
-    override var isFlipped: Bool { false }   // NS bottom-left 유지 (매핑이 이 기준)
-    override var acceptsFirstResponder: Bool { true }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let tracking { removeTrackingArea(tracking) }
-        let t = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .inVisibleRect],
-                               owner: self, userInfo: nil)
-        addTrackingArea(t); tracking = t
-    }
-
-    // 호버 = postToPid moved(키 창 라우팅으로 정상 도달) · 클릭 = 패스스루 리플레이(진짜 이벤트)
-    override func mouseMoved(with e: NSEvent)   { owner?.forwardMouse(e, type: .mouseMoved) }
-    override func mouseDown(with e: NSEvent)    { owner?.passthroughClick(e, button: .left) }
-    override func mouseUp(with e: NSEvent)      { }   // 클릭은 down에서 down+up 시퀀스로 처리
-    override func mouseDragged(with e: NSEvent) { }
-    override func rightMouseDown(with e: NSEvent) { owner?.passthroughClick(e, button: .right) }
-    override func rightMouseUp(with e: NSEvent)   { }
-    override func scrollWheel(with e: NSEvent)  { owner?.forwardScroll(e) }
-}

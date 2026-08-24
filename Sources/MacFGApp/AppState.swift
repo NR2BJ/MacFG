@@ -278,9 +278,12 @@ public final class AppState {
         // 오염시킨다), MACFG_AUTOFLOW=0은 스케일러를 현재값에 고정할 뿐 값을 못 정한다.
         // flow 해상도는 base²에 비례하는 최대 단일 다이얼이라(800→480이면 flow 비용 0.36배),
         // 측정에서 이걸 못 돌리면 남은 항목들의 기여도를 가릴 수 없다.
-        let desired = Knob.double("MACFG_FLOWBASE")
+        // MACFG_FLOWBASE는 **절대 핀**이다 — 거버너 상한(flowBaseCap)도 무시한다.
+        // min()에 같이 넣으면 부하 강등이 측정 중의 핀을 조용히 풀어 A/B가 오염된다(리뷰 확정).
+        let pinned = Knob.double("MACFG_FLOWBASE")
+        let desired = pinned
             ?? (autoFlowScaler.manualOverride ? userFlowBase : autoFlowScaler.current)
-        let base = min(desired, loadGovernor.flowBaseCap ?? desired)
+        let base = pinned ?? min(desired, loadGovernor.flowBaseCap ?? desired)
         if MetalFlowEngine.flowBaseLongSide != base {
             MetalFlowEngine.flowBaseLongSide = base
             DiagnosticLog.shared.log("[GOV] flowBase → \(Int(base))")
@@ -961,6 +964,10 @@ public final class AppState {
                     guard let self else { return }
                     self.ingestScheduled.withLock { $0 = false }
                     guard self.isCapturingMirror else { return }
+                    // 오버레이 숨김 중에는 틱 경로만 GPU를 양보하고 이 도착 경로는 풀가동이었다
+                    // (리뷰 확정) — 숨긴 목적이 GPU 확보이므로 여기도 같이 양보한다. 쌓인 프레임은
+                    // 틱의 숨김 분기가 드레인해 텍스처를 풀로 회수한다.
+                    guard !self.overlayHiddenState else { return }
                     self.drainAndIngest(maxCount: 4)
                 }
             }
@@ -1126,7 +1133,13 @@ public final class AppState {
                     if !headingFullscreen,
                        !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
                        let src = self.overlayManager?.sourcePixelSize {
-                        let mismatch = abs(src.width - self.stablePoolWidth) > 8 || abs(src.height - self.stablePoolHeight) > 8
+                        // 캡처 배율(MACFG_CAPSCALE)이 걸려 있으면 배달 프레임(=풀)은 소스 픽셀의
+                        // 배율 크기다 — 소스 원본과 직접 비교하면 구조적으로 영원히 불일치라서
+                        // ~1초마다 재구성→전체 리셋 루프에 빠진다(리뷰 확정). 기대 크기로 비교한다.
+                        let capScale = min(max(Knob.double("MACFG_CAPSCALE") ?? 1.0, 0.25), 1.0)
+                        let expectedW = Int(Double(src.width) * capScale)
+                        let expectedH = Int(Double(src.height) * capScale)
+                        let mismatch = abs(expectedW - self.stablePoolWidth) > 8 || abs(expectedH - self.stablePoolHeight) > 8
                         if mismatch {
                             self.resizeMismatchCount += 1
                             if self.resizeMismatchCount >= 2 {
@@ -1350,6 +1363,7 @@ public final class AppState {
         lastPresentedTimestamp = 0
         lastPresentedTexture = nil
         lastAcceptedTimestamp = 0
+        acceptedTsBeforeLast = 0
         lastAcceptedFingerprint = 0
         resetSnapState()
         lastVsyncTarget = 0
@@ -1376,23 +1390,6 @@ public final class AppState {
         _ = mailbox.drain()
     }
 
-    /// 리사이즈 전용 경량 리셋 — 크기 의존 상태(타임라인/풀/이전 프레임)만 비우고
-    /// 케이던스(스냅 링/EMA/타임스탬프)는 유지한다. 전체 리셋의 ~16프레임 재락을 회피.
-    nonisolated private func softResetForResize() {
-        timeline = []
-        inFlightTextures = [:]
-        presentingTextures.withLock { $0.removeAll() }
-        stablePool = []
-        stablePoolWidth = 0
-        stablePoolHeight = 0
-        prevStable = nil                 // 크기 바뀐 이전 프레임과 새 프레임은 페어 불가 → 1프레임 워밍업
-        lastPresentedTexture = nil
-        lastAcceptedFingerprint = 0
-        resizeMismatchCount = 0
-        _ = mailbox.drain()
-        // 유지: snapTsRing / sourceIntervalEMA / snappedLastTimestamp / lastPresentedTimestamp /
-        //       lastAcceptedTimestamp / hasReceivedFirstFrame → 콘텐츠 타이밍 연속성 보존
-    }
 
     // MARK: - Scheduler State
 
@@ -1610,6 +1607,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var overSupplyCredit: Double = 0
     /// 소스 케이던스 고정으로 걸러낸 프레임 수 (영상 프레임 사이에 낀 UI 갱신).
     @ObservationIgnored nonisolated(unsafe) private var diagSrcLockSkip = 0
+    /// 마지막 수용분 **직전** 수용분의 타임스탬프 — 케이던스 게이트의 복원 판정(2슬롯 규칙)용.
+    @ObservationIgnored nonisolated(unsafe) private var acceptedTsBeforeLast: CFTimeInterval = 0
     /// UI 전용 갱신(영상 미진행)으로 판정해 걸러낸 프레임 수.
     @ObservationIgnored nonisolated(unsafe) private var diagUiGateSkip = 0
     /// 연속으로 건너뛴 수 — 4장에서 강제 수용해 정지를 구조적으로 막는다.
@@ -2006,10 +2005,20 @@ public final class AppState {
         // 정지 화면을 만들 수 없는 구조다: 느린 장면은 애초에 간격이 넓어 전부 수용된다.
         // 120fps를 진짜로 받아야 하는 특수 소스는 노브로 올린다(0 = 끔).
         let srcFpsCap = Knob.double("MACFG_SRCFPS") ?? 60
-        if case let srcFps = srcFpsCap, srcFps >= 1 {
-            let lockedInterval = 1.0 / srcFps
-            if lastAcceptedTimestamp > 0,
-               slot.timestamp - lastAcceptedTimestamp < lockedInterval * 0.75 {
+        if srcFpsCap >= 1, lastAcceptedTimestamp > 0 {
+            let lockedInterval = 1.0 / srcFpsCap
+            let sinceLast = slot.timestamp - lastAcceptedTimestamp
+            // **복원 규칙 (2026-08-25).** 간격 하나만 보는 게이트는 SCK 배달 지터에 진짜
+            // 프레임을 먹는다 — 직전 프레임이 늦게 배달되면 다음 프레임과의 간격이 12.5ms
+            // 아래로 압축되는데, 그 프레임은 리페인트가 아니라 케이던스 **복원**이다.
+            // 실측(PiP FHD 60fps 실사용): srcLock 50/s 중 지문 중복은 3/s뿐, 진짜 프레임이
+            // 초당 ~7장 거부돼 인식이 53fps로 떨어지고 2× 출력이 106에 멈췄다.
+            // 판정: 마지막 수용분 직전 것부터의 간격이 1.6슬롯 이상이면 두 프레임이 합쳐
+            // 2슬롯 근처를 덮는다 = 지연 배달의 복원 → 허용. 리페인트 폭풍(지속 배가)은
+            // 어느 쌍을 잡아도 2슬롯을 못 채우므로 여전히 걸러진다.
+            let sinceBeforeLast = acceptedTsBeforeLast > 0
+                ? slot.timestamp - acceptedTsBeforeLast : .infinity
+            if sinceLast < lockedInterval * 0.75, sinceBeforeLast < lockedInterval * 1.6 {
                 diagSrcLockSkip += 1
                 return
             }
@@ -2041,6 +2050,7 @@ public final class AppState {
         let previousAcceptedTs = lastAcceptedTimestamp
         let previousAcceptedFingerprint = lastAcceptedFingerprint
         lastFrameArrivalAt = CFAbsoluteTimeGetCurrent()   // 좀비 오버레이 판정용 (프레임 공급 생존 신호)
+        acceptedTsBeforeLast = lastAcceptedTimestamp      // 케이던스 게이트의 복원 판정 기준
         lastAcceptedTimestamp = slot.timestamp
         lastAcceptedFingerprint = slot.contentFingerprint
         performanceMonitor.recordFrameArrival()
@@ -2312,6 +2322,7 @@ public final class AppState {
                 //
                 // 이 상한은 **세 경로 공통**으로 마지막에 건다. 경로별로 걸면 설정에 따라 다른
                 // 분기를 타면서 새어나간다(거버너 t 상한에서 이미 겪은 실수).
+                var quotaEmptied = false
                 if !tValues.isEmpty, displayInterval > 0 {
                     let iv = sourceIntervalEMA > 0 ? sourceIntervalEMA : gap
                     let srcHz = iv > 0 ? 1.0 / iv : 0
@@ -2332,12 +2343,18 @@ public final class AppState {
                     // 크레딧이 쌓여 재생 재개 시 몰아치는 것을 막는다.
                     if perPair < 0.05 {
                         tValues = []                       // 소스만으로 주사율을 채운다
+                        quotaEmptied = true
                         diagTOverSupply += 1
                     } else {
-                        overSupplyCredit = min(overSupplyCredit + perPair, 8.0)
+                        // 적립은 쌍당 고정이 아니라 **경과 콘텐츠 시간 비례**(deficitHz × gap) —
+                        // 정상 쌍(gap=1/srcHz)에선 정확히 perPair와 같고, 드랍 갭(steps>1)에선
+                        // 잃은 슬롯만큼 더 쌓여 구멍을 메울 수 있다(쌍당 고정이면 갭 쌍이
+                        // 프레임을 더 내야 하는데 크레딧이 모자라 구멍이 남는다 — 리뷰 확정).
+                        overSupplyCredit = min(overSupplyCredit + deficitHz * gap, 8.0)
                         let allow = Int(overSupplyCredit)
                         if allow <= 0 {
                             tValues = []
+                            quotaEmptied = true
                             diagTOverSupply += 1
                         } else if tValues.count > allow {
                             let stride = Double(tValues.count) / Double(allow)
@@ -2355,7 +2372,9 @@ public final class AppState {
                 }
                 // 폴백은 큰 갭 + 불운한 그리드 위상일 때만. 작은 갭(≤1.5슬롯)은 소스 두 장이
                 // 이미 인접 슬롯을 채우므로 [0.5] 폴백이 잉여 프레임 → 큐 적체(e2e +40ms 실측)
-                if tValues.isEmpty && gap > displayInterval * 1.5 { tValues = [0.5] }
+                // 쿼터가 **의도적으로** 비운 것이면 폴백으로 되살리지 않는다 — 안 그러면
+                // perPair<1 대역(소스가 주사율 절반 초과)에서 쿼터가 무력화돼 과생산이 돌아온다.
+                if tValues.isEmpty && !quotaEmptied && gap > displayInterval * 1.5 { tValues = [0.5] }
                 // 거버너 t 상한 — **세 생성 경로 공통**. 경로별로 걸면 Auto 배율(=0)처럼
                 // 다른 분기를 타는 설정에서 그냥 새어나간다(실측: 캡을 첫 분기에만 걸었더니
                 // 강등 후에도 t×5·t×6이 계속 나옴). 균등 간격으로 솎아 케이던스는 보존.
@@ -2442,7 +2461,12 @@ public final class AppState {
             // 완료 핸들러에서 double 2개 읽기라 상시 켜도 비용 없음.
             if let self {
                 let g = (cb2Buf.gpuEndTime - cb2Buf.gpuStartTime) * 1000.0
-                if g > 0, g < 200 { self.engineGpuMsEMA = self.engineGpuMsEMA <= 0 ? g : self.engineGpuMsEMA * 0.9 + g * 0.1 }
+                if g > 0, g < 200 {
+                    // 완료 핸들러(임의 스레드)의 RMW — stageLock으로 보호 (규약)
+                    self.stageLock.lock()
+                    self.engineGpuMsEMA = self.engineGpuMsEMA <= 0 ? g : self.engineGpuMsEMA * 0.9 + g * 0.1
+                    self.stageLock.unlock()
+                }
             }
             if let self, self.stageDbg {
                 let cb2Gpu = (cb2Buf.gpuEndTime - cb2Buf.gpuStartTime) * 1000.0
@@ -2455,8 +2479,10 @@ public final class AppState {
                 // 구간에서 work 평균 21ms인데 창의 89%가 최대 40ms를 넘고 p90이 67ms — 그 꼬리 때문에
                 // lat이 +3~4까지 올라가 e2e에 25~33ms가 상시로 실린다. 어느 단계가 튀는지 알아야
                 // 꼬리만 잘라낼 수 있으므로, 기준선의 2.5배를 넘는 프레임 하나를 통째로 찍는다.
+                self.stageLock.lock()
                 let base = self.stgWorkEMA
                 self.stgWorkEMA = base <= 0 ? workNow : base * 0.95 + workNow * 0.05
+                self.stageLock.unlock()
                 let now = CACurrentMediaTime()
                 if base > 0, workNow > max(25.0, base * 2.5), now - self.stgLastSpikeLog > 1.0 {
                     self.stgLastSpikeLog = now
@@ -2598,7 +2624,11 @@ public final class AppState {
                 // 실제 표시가 목표 슬롯에서 몇 칸 밀렸나. 밀림이 미표시 비율과 맞아떨어지면
                 // "뒤 present에 추월당해 버려진다"가 확정된다.
                 let slip = Int(((d.presentedTime - targetRef) / slotSec).rounded())
+                // presentedHandler는 임의 스레드 — diagGpuLateHist와 같은 규약으로 stageLock 보호.
+                // (무락이면 렌더 스레드의 [SCHED] 리셋 재할당과 겹쳐 해제된 버퍼에 쓸 수 있다.)
+                self.stageLock.lock()
                 self.diagSlipHist[min(max(slip, 0), 3)] += 1
+                self.stageLock.unlock()
             }
             mailboxRef.postPresented(at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
         }
@@ -2925,7 +2955,12 @@ public final class AppState {
         if diagPresentBusy > 0 { skipParts.append("drawBusy:\(diagPresentBusy)") }
         let skips = skipParts.isEmpty ? "-" : skipParts.joined(separator: ",")
 
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(diagSlipHist.map(String.init).joined(separator: "/")) gpuLate=\(diagGpuLateHist.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        // 임의 스레드(핸들러)가 쓰는 히스토그램은 락 안에서 스냅샷을 떠서 조립한다
+        stageLock.lock()
+        let slipSnapshot = diagSlipHist
+        let gpuLateSnapshot = diagGpuLateHist
+        stageLock.unlock()
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -2965,7 +3000,7 @@ public final class AppState {
         _ = wallSpan
         diagPresentCount = 0
         diagPresentDropped = 0
-        diagSlipHist = [0, 0, 0, 0]
+        stageLock.lock(); diagSlipHist = [0, 0, 0, 0]; stageLock.unlock()
         diagTMultFell = 0; diagTGridEmpty = 0; diagTRatioMin = 999.0; diagTRatioMax = 0.0; diagTOverSupply = 0
         diagDupTargetSlot = 0
         if presentEveryAlternates { presentEveryN = presentEveryN == 1 ? 2 : 1 }

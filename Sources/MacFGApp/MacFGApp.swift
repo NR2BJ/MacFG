@@ -60,7 +60,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         appState.updateMenuBarOnly()
         setUpStatusItem()
 
-        // 접근성 권한 (마우스 역매핑용) — 없으면 프롬프트
+        // 접근성 권한 — **창 추적용** (WindowTracker가 AXUIElement로 소스 창 기하를 조회).
+        // 원래 근거였던 마우스 역매핑은 2026-08-20에 삭제됐지만 이 권한은 여전히 필요하다.
         if !AXIsProcessTrusted() {
             AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         }

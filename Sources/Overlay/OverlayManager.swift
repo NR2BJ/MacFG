@@ -216,7 +216,6 @@ public final class OverlayManager {
         }
         overlay.upscaleMode = upscaleMode
         overlay.sharpness = sharpness
-        overlay.sourceWindowID = trackedWindowID ?? 0
         self.overlayWindow = overlay
         // 창을 새로 만들었으면 정보 오버레이를 복원한다 (라벨은 창에 붙어 있어 같이 사라진다)
         if let t = lastInfoText { overlay.setInfoOverlay(t) }

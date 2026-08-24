@@ -221,7 +221,6 @@ public final class OverlayWindow: NSObject {
     /// 설정되면 뷰어의 호버/클릭/스크롤을 업스케일 배율로 역산해 소스로 전달(CGEventPostToPid).
     /// windowID는 이벤트의 windowUnderMousePointer 필드에 박는다 — 수신 AppKit이 좌표 밑 창을
     /// 윈도우서버에 물으면 우리 뷰어(다른 앱)가 나와 자기 창을 못 찾고 클릭을 버리는 것 우회.
-    public var sourceWindowID: CGWindowID = 0
 
     /// 정보 오버레이 (단축키 토글) — 좌상단에 소스/보간/업스케일 정보. metal 콘텐츠 위 서브뷰로 합성.
     private var infoLabel: NSTextField?
@@ -429,8 +428,11 @@ public final class OverlayWindow: NSObject {
         // 계속 그리고 매 프레임 블렌딩한다. 불투명이면 그 아래를 통째로 건너뛸 수 있다.
         // 부작용(의도됨): 소스 창이 occluded 판정돼 렌더링을 멈춘다 — 그래서 이 측정은
         // MACFG_ALWAYSPRESENT=1과 함께 써서 마지막 프레임을 계속 내보내며 효율만 본다.
-        if Knob.string("MACFG_NOOCCBYPASS") == "1" || OverlayStyleConstants.opaqueCover {
-            // opaqueCover는 alpha 대신 **기하**로 오클루전을 피한다(updateFrame의 1pt 인셋).
+        // opaqueCover의 불투명화는 **커버 전용**이다. 1pt 인셋(오클루전 회피)이 커버의
+        // updateFrame에만 있으므로, 뷰어에 적용하면 우회 수단 없이 alpha만 1.0이 되어
+        // 소스가 "완전 가려짐" 판정 → 렌더 정지 → 캡처가 정지 화면만 받는다(리뷰 확정).
+        if Knob.string("MACFG_NOOCCBYPASS") == "1"
+            || (OverlayStyleConstants.opaqueCover && style == .overlay) {
             window.alphaValue = 1.0
             return
         }

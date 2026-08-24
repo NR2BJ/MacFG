@@ -33,7 +33,9 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
     /// threadReady 세마포어가 happens-before를 만들어, 기동 이후 읽기는 안전하다.
     private var renderThread: Thread?
     /// 다른 스레드에서 배달돼 버린 콜백 수 (진단)
-    private(set) nonisolated(unsafe) var foreignTickDrops: UInt64 = 0
+    /// 외부 스레드 콜백 폐기 수 — **쓰는 쪽이 외부(메인) 스레드**이므로 lock으로 보호.
+    private nonisolated(unsafe) var _foreignTickDrops: UInt64 = 0
+    var foreignTickDrops: UInt64 { lock.lock(); defer { lock.unlock() }; return _foreignTickDrops }
 
     /// 렌더 스레드 기동 (1회) — 런루프를 더미 소스로 유지
     private func ensureThread() {
@@ -159,12 +161,12 @@ final class RenderDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Senda
         // 렌더 스레드가 자기 콜백을 정상적으로 받고 있으므로 페이싱에 영향이 없다.
         lock.lock(); let rt = renderThread; lock.unlock()
         if let rt, Thread.current !== rt {
-            foreignTickDrops &+= 1
+            lock.lock(); _foreignTickDrops &+= 1; let drops = _foreignTickDrops; lock.unlock()
             // **버린 사실 자체를 남긴다.** 버린 콜백은 [SCHED]의 foreign=N으로만 보이는데,
             // 그 로그는 틱이 돌아야 나온다 — 즉 "전부 버려서 틱이 아예 없는" 상태에서는
             // 진단이 원리적으로 도달 불가다(실측 2026-08-06 전체화면에서 그 함정에 빠졌다).
-            if foreignTickDrops <= 3 || foreignTickDrops % 600 == 0 {
-                DiagnosticLog.shared.log("[DRIVER] 외부 스레드 콜백 폐기 #\(foreignTickDrops) (thread=\(Thread.current.name ?? "(무명)") main=\(Thread.isMainThread))")
+            if drops <= 3 || drops % 600 == 0 {
+                DiagnosticLog.shared.log("[DRIVER] 외부 스레드 콜백 폐기 #\(drops) (thread=\(Thread.current.name ?? "(무명)") main=\(Thread.isMainThread))")
             }
             return
         }

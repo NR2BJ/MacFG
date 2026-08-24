@@ -32,6 +32,16 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
 
     /// 영역 캡처: 소스 창 좌상단 기준 크롭 사각형(pt). nil이면 창 전체.
     private var captureRect: CGRect?
+
+    /// SCK 샘플 배달 전용 **직렬** 큐.
+    ///
+    /// 이전에는 .global(qos: .userInteractive)(동시성 큐)를 넘겼는데, StreamOutputHandler의
+    /// 상태(prevSamples/curSamples/cachedColorSpace 등)는 "단일 직렬 큐 배달" 전제로 무락이다.
+    /// 동시성 큐에서는 앞 콜백이 지문 스캔(4K 8k점 + CVPixelBufferLock) 중 선점된 사이 SCK가
+    /// 다음 샘플을 다른 워커에 디스패치할 수 있고, 그러면 withUnsafeBufferPointer 진행 중에
+    /// swap/재할당이 겹쳐 해제된 버퍼를 만진다 — 이 저장소가 이미 겪은 "엉뚱한 곳 SIGTRAP"
+    /// 부류의 힙 손상이다. 직렬 큐면 전제가 실제로 성립해 핸들러는 계속 무락으로 안전하다.
+    private let sampleQueue = DispatchQueue(label: "com.macfg.sck.samples", qos: .userInteractive)
     private var captureScale: CGFloat = 2.0
 
     public var isAvailable: Bool { true }
@@ -106,7 +116,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         self.stopObserver = observer
 
         let stream = SCStream(filter: filter, configuration: config, delegate: observer)
-        try stream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        try stream.addStreamOutput(handler, type: .screen, sampleHandlerQueue: sampleQueue)
         try await stream.startCapture()
 
         self.stream = stream

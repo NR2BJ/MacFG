@@ -85,7 +85,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         let w = regionPt.width > 0 ? Int(regionPt.width * scaleFactor) : 1920
         let h = regionPt.height > 0 ? Int(regionPt.height * scaleFactor) : 1080
         let config = Self.makeConfig(width: w, height: h, sourceRect: captureRect)
-        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) region=\(captureRect.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" } ?? "full") → config \(w)x\(h) fps상한=\(Knob.int("MACFG_SCKFPS") ?? 120) 캡처배율=\(Knob.double("MACFG_CAPSCALE") ?? 1.0)")
+        DiagnosticLog.shared.log("[SCK-CFG] start: window.frame=\(Int(window.frame.width))x\(Int(window.frame.height)) scale=\(scaleFactor) region=\(captureRect.map { "\(Int($0.width))x\(Int($0.height))@\(Int($0.minX)),\(Int($0.minY))" } ?? "full") → config \(w)x\(h)→실제 \(config.width)x\(config.height) fps상한=\(Knob.int("MACFG_SCKFPS") ?? 120) 캡처배율=\(Knob.double("MACFG_CAPSCALE") ?? 1.0)")
 
         let handler = StreamOutputHandler(device: device) { [weak self] slot in
             guard let self else { return }

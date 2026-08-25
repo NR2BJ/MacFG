@@ -94,9 +94,10 @@ public final class RenderSurface: @unchecked Sendable {
         var source = texture
         if p.upscaleMode != .off || p.sharpness > 0.01 {
             var chain: [String] = []
-            if p.isViewer, p.upscaleMode != .off {
-                let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
-                let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
+            if p.upscaleMode != .off {
+                // 활성 경로와 동일 원칙 — 목표는 드로어블 backing 크기(아래에서 그 크기로 얻는다).
+                let targetW = Int(metalLayer.drawableSize.width.rounded())
+                let targetH = Int(metalLayer.drawableSize.height.rounded())
                 // 소스≈타깃(≤8% 차)이면 SR 무효인데 비용만 큼 — 블릿 샘플러에 맡기고 건너뜀 (활성 경로와 동일)
                 if targetW > Int(Double(texture.width) * 1.08) || targetH > Int(Double(texture.height) * 1.08) {
                     var cur = source
@@ -153,9 +154,18 @@ public final class RenderSurface: @unchecked Sendable {
         if p.upscaleMode != .off || p.sharpness > 0.01 {
             // 업스케일 결과를 숫자로만 기록 (문자열 할당 없음) — status 문자열은 시그니처 변화 시에만.
             var aneW = 0, aneH = 0, mfxW = 0, mfxH = 0
-            if p.isViewer, p.upscaleMode != .off {
-                let targetW = Int((metalLayer.frame.width * p.contentsScale).rounded())
-                let targetH = Int((metalLayer.frame.height * p.contentsScale).rounded())
+            if p.upscaleMode != .off {
+                // **목표는 드로어블 실제 크기다** — 우리가 그려 넣는 바로 그 표면.
+                // 이전에는 metalLayer.frame × contentsScale이라 두 가지가 어긋났다:
+                //  · MACFG_DRAWSCALE<1이면 목표가 드로어블보다 커서 SR이 과확대한 뒤 최종
+                //    블릿이 도로 축소 — 순수 낭비(리뷰 [13]).
+                //  · 커버 배치는 `p.isViewer` 가드로 아예 제외였다. 그 전제("커버는 소스=창
+                //    크기라 확대할 게 없다")를 MACFG_CAPSCALE이 깼다 — 캡처를 줄이면 커버에서도
+                //    소스가 드로어블보다 작아진다. 그 복원을 컴포지터 이중선형에 맡기는 것보다
+                //    우리 GPU로 하는 게 화질상 유리하고, 병목은 GPU가 아니라 컴포지터임이
+                //    이미 측정됐다(GPU는 슬롯 예산의 35%).
+                let targetW = drawable.texture.width
+                let targetH = drawable.texture.height
                 // 소스≈타깃(수% 차)이면 SR 체인(ANE+MetalFX)은 사실상 무효인데 매 틱 큰 비용을 낸다
                 // (실측: 3755→3808 = 1.4% 확대인데 4K SR을 매 틱 → present-바운드로 120Hz 틱을
                 // ~104Hz로 조임). 그 미세 스케일은 최종 블릿 샘플러가 처리하면 충분하므로, 목표가

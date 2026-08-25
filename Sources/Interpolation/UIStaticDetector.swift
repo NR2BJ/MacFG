@@ -42,13 +42,19 @@ public final class UIStaticDetector {
 
     /// Vision 등 외부 검출기가 텍스트 박스를 제출 (아무 스레드) — 다음 update에서 업로드.
     /// rects: 정규화 좌표(0..1), 좌상 원점.
-    public func submitTextBoxes(_ rects: [CGRect]) {
+    /// generation: 인코딩 시점의 `generation` 값. reset() 이후 도착한 이전 캡처의 박스를
+    /// 버린다 — 안 그러면 새 세션 첫 ~2초에 이전 장면의 텍스트 위치가 프리즈된다(리뷰 확정).
+    public func submitTextBoxes(_ rects: [CGRect], generation: Int) {
         boxLock.lock()
+        guard generation == resetGen else { boxLock.unlock(); return }
         pendingBoxes = rects
         boxesStamp += 1
         lastSubmitAt = CFAbsoluteTimeGetCurrent()
         boxLock.unlock()
     }
+
+    private var resetGen = 0
+    public var generation: Int { boxLock.lock(); defer { boxLock.unlock() }; return resetGen }
 
     /// 튜닝(오프라인 clo0.8 chi2.0 시작점). alpha=EMA율(~1/창길이). enabled=off면 no-op.
     public nonisolated(unsafe) static var enabled = true
@@ -100,14 +106,14 @@ public final class UIStaticDetector {
     /// 불연속(캡처 시작/장면 전환) — 다음 업데이트에서 누적 리셋 (+이전 캡처의 텍스트 박스 폐기).
     public func reset() {
         needsReset = true; frames = 0
-        boxLock.lock(); pendingBoxes = nil; boxesStamp += 1; lastSubmitAt = 0; boxLock.unlock()
+        boxLock.lock(); pendingBoxes = nil; boxesStamp += 1; lastSubmitAt = 0; resetGen += 1; boxLock.unlock()
     }
 
     /// 현재 소스 프레임으로 누적 갱신 + 마스크 산출. cb에 인코딩 (blit 직후 = 소스 준비됨).
     public func update(source: any MTLTexture, into cb: any MTLCommandBuffer) {
         guard Self.enabled, let pso else { return }
         ensure(srcW: source.width, srcH: source.height)
-        guard meanTex.count == 2, sqTex.count == 2, maskTex.count == 2,
+        guard meanTex.count == 2, sqTex.count == 2, maskTex.count == 2, boostTex.count == 2,
               let enc = cb.makeComputeCommandEncoder() else { return }
         // 이번엔 반대 마스크 버퍼에 쓴다 — 직전 프레임 워프가 아직 옛 버퍼를 읽는 중일 수 있음.
         let maskWrite = 1 - maskCur

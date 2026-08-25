@@ -584,7 +584,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // model을 **강참조**로 캡처 — 사다리 교체로 self.model이 바뀌어도 이 쌍은 자기 모델로 완주한다.
         // 약참조였을 땐 교체 직후 워커가 guard에 걸려 그 쌍이 50/50 강등으로 떨어졌다(전환 티).
         // 순환 없음(모델은 클로저를 참조하지 않음), 전환 순간 두 모델이 잠깐 공존하는 비용만 든다.
-        packCB.addCompletedHandler { [model] _ in
+        packCB.addCompletedHandler { [model] packBuf in
             workerRef.async {
                 defer { slot.event.signaledValue = signalValue }
                 // predict를 못 채우는 앵커는 flow=0/mask=0으로 명시 클리어 — unpack이 50/50
@@ -594,6 +594,13 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                         memset(slot.flowBufs[i].contents(), 0, slot.flowBufs[i].length)
                         memset(slot.maskBufs[i].contents(), 0, slot.maskBufs[i].length)
                     }
+                }
+                // pack GPU가 실패하면 packBuf 내용이 이전 쌍/미초기화 — 그대로 predict하면
+                // 스테일 flow로 워프된다(리뷰 확정). 50/50 강등으로 떨어뜨리고 로그를 남긴다.
+                if let packErr = packBuf.error {
+                    DiagnosticLog.shared.log("[GPUERR] RIFE pack 실패 — 50/50 강등: \(packErr.localizedDescription)")
+                    degradeAnchors(0..<anchorsRef.count)
+                    return
                 }
                 // 모델은 이제 강참조라 항상 유효 — 취소(shutdown)만 확인한다
                 guard !cancelledRef.withLock({ $0 }) else {

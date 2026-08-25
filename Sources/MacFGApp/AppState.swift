@@ -62,8 +62,12 @@ private final class RenderMailbox: @unchecked Sendable {
     private var releasedTextures: [ObjectIdentifier] = []
     private var presentedRecords: [(presentedAt: CFTimeInterval, captureTs: CFTimeInterval, isInterp: Bool)] = []
 
-    func postCompleted(entries newEntries: [TimelineEntry], released: ObjectIdentifier?, workLatencyMs: Double, sceneCut: Bool) {
+    /// gen: 렌더 세대. resetScheduler가 올린다 — 이전 세대의 늦은 GPU 완료가 리셋 후
+    /// 새 타임라인에 스테일 프레임을 등재하는 것을 drain에서 걸러낸다(리뷰 확정: stamp 0인
+    /// stable 엔트리는 lease 프루닝을 구조적으로 통과하므로 세대 검사가 유일한 방어다).
+    func postCompleted(gen: UInt64, entries newEntries: [TimelineEntry], released: ObjectIdentifier?, workLatencyMs: Double, sceneCut: Bool) {
         lock.lock()
+        entryGens.append(contentsOf: Array(repeating: gen, count: newEntries.count))
         entries.append(contentsOf: newEntries)
         if let released { releasedTextures.append(released) }
         workLatencies.append(workLatencyMs)
@@ -86,23 +90,33 @@ private final class RenderMailbox: @unchecked Sendable {
 
     private var workLatencies: [Double] = []
     private var sceneCutCount = 0
+    private var entryGens: [UInt64] = []
+    private var presentedGens: [UInt64] = []
 
-    func postPresented(at time: CFTimeInterval, captureTs: CFTimeInterval, isInterp: Bool) {
+    func postPresented(gen: UInt64, at time: CFTimeInterval, captureTs: CFTimeInterval, isInterp: Bool) {
         lock.lock()
+        presentedGens.append(gen)
         presentedRecords.append((time, captureTs, isInterp))
-        if presentedRecords.count > 480 { presentedRecords.removeFirst(240) }
+        if presentedRecords.count > 480 {
+            presentedRecords.removeFirst(240)
+            presentedGens.removeFirst(min(240, presentedGens.count))
+        }
         lock.unlock()
     }
 
-    func drain() -> ([TimelineEntry], [ObjectIdentifier], [(presentedAt: CFTimeInterval, captureTs: CFTimeInterval, isInterp: Bool)]) {
+    /// current 세대와 다른 항목은 버린다. released는 세대 무관 — 이전 세대 텍스처의
+    /// 보호 해제는 정리이므로 항상 통과시킨다.
+    func drain(current: UInt64) -> ([TimelineEntry], [ObjectIdentifier], [(presentedAt: CFTimeInterval, captureTs: CFTimeInterval, isInterp: Bool)]) {
         lock.lock()
         defer {
-            entries = []
+            entries = []; entryGens = []
             releasedTextures = []
-            presentedRecords = []
+            presentedRecords = []; presentedGens = []
             lock.unlock()
         }
-        return (entries, releasedTextures, presentedRecords)
+        let liveEntries = zip(entries, entryGens).filter { $0.1 == current }.map(\.0)
+        let livePresented = zip(presentedRecords, presentedGens).filter { $0.1 == current }.map(\.0)
+        return (liveEntries, releasedTextures, livePresented)
     }
 }
 
@@ -551,7 +565,12 @@ public final class AppState {
         // 대상 창 닫힘 → SCK 스트림 중단 즉시 캡처 정지 (폴링 대기 없이 거의 동시)
         captureManager.onStreamStopped = { [weak self] in
             Task { @MainActor in
-                guard let self, self.isCapturing, !self.isRestartingCapture else { return }
+                guard let self, !self.isRestartingCapture else { return }
+                // 시작 절차 중(엔진 준비 등)이면 isCapturing이 아직 false — 무시하지 말고
+                // 표시해 두고, 시작 완료 직후 정리한다(중간에 stopCapture를 끼우면 그 자체가
+                // 새 레이스를 만든다).
+                if self.isStartingCapture { self.streamDiedWhileStarting = true; return }
+                guard self.isCapturing else { return }
                 DiagnosticLog.shared.log("[CAPTURE] source window gone (SCK stopped) → stop")
                 await self.stopCapture()
             }
@@ -911,6 +930,16 @@ public final class AppState {
 
     /// startCapture 진행 중 플래그 — isCapturing만으로는 재진입을 못 막는다(아래 주석 참조).
     @ObservationIgnored private var isStartingCapture = false
+    /// stopCapture 진행 중 플래그. 정지는 isCapturing을 **await 전에** 내리므로, 정지가
+    /// 스트림 해제를 기다리는 수백 ms 동안 새 시작이 위 guard들을 전부 통과할 수 있다 —
+    /// 그러면 옛 정지의 복귀 코드가 새 시작의 스트림 참조·오버레이·엔진을 닫는다(리뷰 확정).
+    /// 정지 중 시작 요청은 무시한다(사용자가 다시 누르면 된다).
+    @ObservationIgnored private var isStoppingCapture = false
+    /// 시작 절차(엔진 준비 수백 ms) 중 SCK 스트림이 죽었다는 표시. 그 시점엔 isCapturing이
+    /// 아직 false라 onStreamStopped 핸들러가 무시하는데, 그대로 두면 isCapturing=true의
+    /// 좀비 캡처(죽은 스트림, 프레임 0장)가 되고 hasReceivedFirstFrame 기반 자동 정지도
+    /// 영영 안 걸린다(리뷰 확정). 시작 완료 직후 이 플래그를 보고 정리한다.
+    @ObservationIgnored private var streamDiedWhileStarting = false
 
     func startCapture() async {
         guard !isCapturing else { return }
@@ -927,7 +956,12 @@ public final class AppState {
             DiagnosticLog.shared.log("[CAPTURE] 시작이 이미 진행 중 — 중복 요청 무시")
             return
         }
+        guard !isStoppingCapture else {
+            DiagnosticLog.shared.log("[CAPTURE] 정지가 진행 중 — 시작 요청 무시 (완료 후 다시)")
+            return
+        }
         isStartingCapture = true
+        streamDiedWhileStarting = false
         defer { isStartingCapture = false }
 
         guard let windowID = selectedWindowID else {
@@ -960,7 +994,7 @@ public final class AppState {
                 guard self.ingestScheduled.withLock({ was in
                     let already = was; was = true; return !already
                 }) else { return }
-                self.renderDriver.performAsync { [weak self] in
+                let queued = self.renderDriver.performAsync { [weak self] in
                     guard let self else { return }
                     self.ingestScheduled.withLock { $0 = false }
                     guard self.isCapturingMirror else { return }
@@ -970,6 +1004,9 @@ public final class AppState {
                     guard !self.overlayHiddenState else { return }
                     self.drainAndIngest(maxCount: 4)
                 }
+                // 런루프 미기동으로 못 태웠으면 플래그를 여기서 되돌린다 — 안 하면 CAS가
+                // 영구히 true로 남아 콜백 저지연 경로가 이후 계속 죽는다(틱 폴백만 남음).
+                if !queued { self.ingestScheduled.withLock { $0 = false } }
             }
         } else {
             captureManager.onFrameAvailable = nil
@@ -1070,6 +1107,16 @@ public final class AppState {
                     if isCapturing { resizeSourceToPreset(sourcePreset) }
                 }
             }
+            // 시작 절차 중 스트림이 죽었으면(엔진 준비 수백 ms 사이 소스 창 닫힘 등) 여기서
+            // 정리한다. 이 검사와 return 사이에 suspension이 없으므로 MainActor 직렬성이
+            // 나머지 창을 닫는다 — 이후 도착하는 알림은 isCapturing=true라 정상 정지 경로를 탄다.
+            if streamDiedWhileStarting {
+                streamDiedWhileStarting = false
+                DiagnosticLog.shared.log("[CAPTURE] 시작 중 스트림 사망 감지 → 정리 정지")
+                isStartingCapture = false
+                await stopCapture()
+                return
+            }
         } catch {
             // 롤백 — 실패 지점이 어디든 이미 열린 자원을 되감는다. 안 하면 isCapturing=false인데
             // SCK 스트림·오버레이·타이머는 계속 도는 유령 상태가 되고, 재시도 시 옛 스트림과
@@ -1158,6 +1205,9 @@ public final class AppState {
     }
 
     func stopCapture() async {
+        guard !isStoppingCapture else { return }
+        isStoppingCapture = true
+        defer { isStoppingCapture = false }
         // 플래그를 await 이전에 먼저 내림 — 아래 stopCapture await 중 화면 파라미터 변경이
         // handleScreenParametersChange(399행, isCapturing 가드)로 detach된 링크를 재부착해
         // 좀비 렌더 루프를 만들던 것 차단 (리뷰 확정). 진행 중 configurePairEngine도 무효화.
@@ -1285,6 +1335,7 @@ public final class AppState {
         visionInFlight = true
         let queue = visionQueue
         nonisolated(unsafe) let selfRef = self   // visionInFlight 플래그 리셋용 (unsafe 필드)
+        let visionGen = uiDetector?.generation ?? 0   // 인코딩 시점 세대 — 리셋 후 제출 차단용
         cb.addCompletedHandler { [weak det] _ in
             queue.async {
                 defer { selfRef.visionInFlight = false }
@@ -1307,7 +1358,7 @@ public final class AppState {
                     let b = o.boundingBox
                     return CGRect(x: b.origin.x, y: 1 - b.origin.y - b.height, width: b.width, height: b.height)
                 }
-                det.submitTextBoxes(rects)
+                det.submitTextBoxes(rects, generation: visionGen)
                 DiagnosticLog.shared.log("[UISTATIC] vision \(rects.count)개 텍스트 박스")
             }
         }
@@ -1387,7 +1438,8 @@ public final class AppState {
         paceWorkP90 = 0   // 이전(무거운) 세션의 work p90 하한이 새 캡처의 extra를 재부풀리지 않게 (감사 확정)
         pendingIngest = []
         inFlightPresents.withLock { $0 = 0 }
-        _ = mailbox.drain()
+        renderGen &+= 1   // 이전 세대의 늦은 완료를 이후 drain이 걸러낸다
+        _ = mailbox.drain(current: renderGen)
     }
 
 
@@ -1462,6 +1514,11 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var hasReceivedFirstFrame: Bool = false
     /// 캡처 창 리사이즈 감지 (연속 감지 횟수 — 드래그 중 재시작 연발 방지, 메인 타이머 전용)
     @ObservationIgnored nonisolated(unsafe) private var resizeMismatchCount = 0
+    /// 렌더 세대 — resetScheduler마다 증가(렌더 스레드 전용 쓰기). 인코딩 시점에 캡처돼
+    /// 완료 핸들러의 postCompleted/postPresented에 실리고, drain이 불일치를 버린다.
+    @ObservationIgnored nonisolated(unsafe) private var renderGen: UInt64 = 0
+    /// 장면 전환 감지(임의 스레드의 cb2 완료) → 렌더 틱이 소비해 엔진 prior/UI 누적을 리셋.
+    private let pendingSceneCutReset = OSAllocatedUnfairLock(initialState: false)
     private var lastResizeCheck: CFTimeInterval = 0
     /// 인제스트 이월 큐 — 버스트 틱(숨김 해제/재개 직후 최대 8장)의 인코딩 CPU가
     /// vsync 콜백을 삼키지 않게 틱당 4장 캡, 나머지는 다음 틱에서 처리
@@ -1479,7 +1536,7 @@ public final class AppState {
     /// (인플라이트 텍스처가 조기 해제되던 버그를 고치자 이 결함이 드러났다: 예전엔 죽은
     ///  ObjectIdentifier가 주소를 재사용한 새 텍스처와 충돌해 우연히 busy로 잡히면서
     ///  이 경로를 가려주고 있었다.)
-    private let presentingTextures = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: any MTLTexture]())
+    private let presentingTextures = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: (tex: any MTLTexture, count: Int)]())
     @ObservationIgnored nonisolated(unsafe) private var diagPresentBusy = 0
     @ObservationIgnored nonisolated(unsafe) private var isRestartingCapture = false
     @ObservationIgnored nonisolated(unsafe) private var presentedTimes: [CFTimeInterval] = []
@@ -1715,7 +1772,7 @@ public final class AppState {
         // 오버레이 숨김(자동/수동) 중 — GPU 양보: 캡처/메일박스 파이프만 비우고
         // 보간·present는 생략한다 (사용자가 다른 앱으로 전환한 목적이 GPU 확보이므로).
         if overlayHiddenState {
-            let (_, released, _) = mailbox.drain()
+            let (_, released, _) = mailbox.drain(current: renderGen)
             for id in released { inFlightTextures.removeValue(forKey: id) }
             _ = captureManager.drainFrames()   // 파이프 적체 방지 (텍스처는 풀로 회수)
             pendingIngest = []
@@ -1723,7 +1780,14 @@ public final class AppState {
         }
 
         // 1) 완료된 GPU 작업 수거 → 타임라인 등재
-        let (newEntries, released, presented) = mailbox.drain()
+        // [10] 장면 전환이 감지됐으면(cb2 완료 스레드가 표시) 시간적 prior와 UI 누적을 리셋 —
+        // 컷 쌍의 쓰레기 flow가 다음 장면 첫 쌍의 시드/블렌드로 들어가는 것을 막는다(리뷰 확정).
+        // 여기는 렌더 스레드라 MetalFlow.reset()의 무락 상태도 안전하다.
+        if pendingSceneCutReset.withLock({ was in let v = was; was = false; return v }) {
+            pairEngine?.reset()
+            uiDetector?.reset()
+        }
+        let (newEntries, released, presented) = mailbox.drain(current: renderGen)
         for id in released { inFlightTextures.removeValue(forKey: id) }
         if !newEntries.isEmpty {
             timeline.append(contentsOf: newEntries)
@@ -2048,6 +2112,7 @@ public final class AppState {
             if delta > diagSrcIntMax { diagSrcIntMax = delta }
         }
         let previousAcceptedTs = lastAcceptedTimestamp
+        let previousBeforeLast = acceptedTsBeforeLast
         let previousAcceptedFingerprint = lastAcceptedFingerprint
         lastFrameArrivalAt = CFAbsoluteTimeGetCurrent()   // 좀비 오버레이 판정용 (프레임 공급 생존 신호)
         acceptedTsBeforeLast = lastAcceptedTimestamp      // 케이던스 게이트의 복원 판정 기준
@@ -2078,6 +2143,8 @@ public final class AppState {
             // 거절돼 실제 콘텐츠 변화가 다음 변화까지 표시 지연 (감사 확정)
             lastAcceptedTimestamp = previousAcceptedTs
             lastAcceptedFingerprint = previousAcceptedFingerprint
+            acceptedTsBeforeLast = previousBeforeLast   // 케이던스 복원 판정 기준도 함께 롤백
+            diagSourceCount -= 1                        // 실패 프레임이 전달률 분자에 남지 않게
             resetSnapState()
             return
         }
@@ -2101,6 +2168,8 @@ public final class AppState {
             DiagnosticLog.shared.log("[INGEST] ⚠︎ blit 인코더 생성 실패 — 이 프레임 폐기")
             lastAcceptedTimestamp = previousAcceptedTs
             lastAcceptedFingerprint = previousAcceptedFingerprint
+            acceptedTsBeforeLast = previousBeforeLast
+            diagSourceCount -= 1
             return
         }
 
@@ -2151,13 +2220,19 @@ public final class AppState {
         if let srcBuffer = slot.pixelBuffer {
             cb.addCompletedHandler { _ in withExtendedLifetime(srcBuffer) {} }
         }
-        cb.commit()
+        // cb2를 **cb1 커밋 전에** 만든다. 커밋 후에 만들다 실패하면 이미 GPU가 stable에
+        // 쓰는 중인데 이 함수는 그냥 반환해 다음 프레임이 같은 stable을 재획득할 수 있다
+        // (프레임 중첩의 구조적 원인과 동일 부류 — 리뷰 확정). 커밋 전 실패면 cb1은
+        // 버려지고 GPU 작업이 시작되지 않으므로 stable 재사용이 안전하다.
         guard let cb2 = workQueue.makeCommandBuffer() else {
             lastAcceptedTimestamp = previousAcceptedTs
             lastAcceptedFingerprint = previousAcceptedFingerprint   // 위와 동일 — 지문 롤백
+            acceptedTsBeforeLast = previousBeforeLast
+            diagSourceCount -= 1
             resetSnapState()
             return
         }
+        cb.commit()
         if let ev = stableReadyEvent {
             (pairEngine as? RIFEEngine)?.noteInputReady(event: ev, value: readyValue)
             // **항상 기다린다.** 예전엔 splitQ일 때만 걸었다 — "미분리면 같은 큐 in-order라 불필요"
@@ -2449,6 +2524,7 @@ public final class AppState {
 
         let entryTs = snappedTs
         let mailboxRef = mailbox
+        let genRef = renderGen
         let stableRef: any MTLTexture = stable
         let interpFrames = interpResult?.frames ?? []
         let cutEvaluator = interpResult?.sceneCutEvaluator
@@ -2533,6 +2609,17 @@ public final class AppState {
                     self.stageLock.unlock()
                 }
             }
+            // GPU 실패면 보간분을 버리고 stable만 등재한다 — 실패한 커맨드버퍼의 출력 텍스처는
+            // 이전 쌍 내용이거나 미초기화라서, 조용히 올리면 스테일 프레임이 표시된다(리뷰 확정).
+            // stable은 cb1(별도 커맨드버퍼)이 썼으므로 유효하고, releasePrevID는 반드시 전달해
+            // 풀 누수를 막는다. 지금까지 GPU 오류는 로그 한 줄 없이 시각 결함으로만 나타났다.
+            if let gpuErr = cb2Buf.error {
+                DiagnosticLog.shared.log("[GPUERR] cb2 실패 — 보간 폐기, 원본만 등재: \(gpuErr.localizedDescription)")
+                let fallback = [TimelineEntry(timestamp: entryTs, texture: stableRef, isInterpolated: false, captureTimestamp: rawCaptureTsRef)]
+                mailboxRef.postCompleted(gen: genRef, entries: fallback, released: releasePrevID,
+                                         workLatencyMs: (CACurrentMediaTime() - entryTs) * 1000.0, sceneCut: false)
+                return
+            }
             // 장면 전환이면 보간 프레임 폐기 — 무관한 두 샷 사이의 모핑 프레임 방지
             let isSceneCut = cutEvaluator?() ?? false
             var entries: [TimelineEntry] = []
@@ -2550,7 +2637,8 @@ public final class AppState {
             entries.append(TimelineEntry(timestamp: entryTs, texture: stableRef, isInterpolated: false, captureTimestamp: rawCaptureTsRef))
             // 캡처 시각 → 타임라인 등재까지의 파이프라인 지연 (스케줄러 offset 튜닝 지표)
             let workLatency = (CACurrentMediaTime() - entryTs) * 1000.0
-            mailboxRef.postCompleted(entries: entries, released: releasePrevID, workLatencyMs: workLatency, sceneCut: isSceneCut)
+            if isSceneCut { self?.pendingSceneCutReset.withLock { $0 = true } }
+            mailboxRef.postCompleted(gen: genRef, entries: entries, released: releasePrevID, workLatencyMs: workLatency, sceneCut: isSceneCut)
         }
         cb2.commit()
     }
@@ -2608,6 +2696,7 @@ public final class AppState {
         if diagFrameTypes.count > 60 { diagFrameTypes.removeFirst(30) }
 
         let mailboxRef = mailbox
+        let genRef = renderGen
         let captureTs = entry.captureTimestamp
         let isInterp = entry.isInterpolated
         let inFlightRef = inFlightPresents
@@ -2630,16 +2719,27 @@ public final class AppState {
                 self.diagSlipHist[min(max(slip, 0), 3)] += 1
                 self.stageLock.unlock()
             }
-            mailboxRef.postPresented(at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
+            mailboxRef.postPresented(gen: genRef, at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
         }
         // 이 커맨드 버퍼가 끝날 때까지 소스 텍스처를 붙잡는다 — 그 전에 풀이 재사용하면
         // 읽는 중에 덮어쓰게 된다(프레임 중첩).
         let presentTex = entry.texture
         let presentingRef = presentingTextures
-        presentingRef.withLock { $0[ObjectIdentifier(presentTex)] = presentTex }
+        // 참조 **카운트** — 재표시 경로(forceRepresentTicks/alwaysRepresent)가 같은 텍스처를
+        // 연속 present하면 CB 2개가 동시에 떠 있는데, 단순 딕셔너리면 먼저 끝난 CB가 보호를
+        // 제거해 나중 CB가 읽는 중에 엔진이 그 텍스처를 덮어쓸 수 있다(리뷰 확정).
+        presentingRef.withLock {
+            let key = ObjectIdentifier(presentTex)
+            $0[key] = (presentTex, ($0[key]?.count ?? 0) + 1)
+        }
         let stageDbgRef = stageDbg
         cb.addCompletedHandler { [weak self] buf in
-            presentingRef.withLock { $0.removeValue(forKey: ObjectIdentifier(presentTex)) }
+            presentingRef.withLock {
+                let key = ObjectIdentifier(presentTex)
+                if let cur = $0[key] {
+                    if cur.count <= 1 { $0.removeValue(forKey: key) } else { $0[key] = (cur.tex, cur.count - 1) }
+                }
+            }
             guard let self else { return }
             // **미표시의 직접 원인 판별.** 드로어블은 이 콜백의 표시 슬롯에 이미 바인딩돼 있어
             // (그래서 present(atTime:)이 불법이다), GPU가 그 슬롯을 넘겨서 끝나면 표시를 놓치고

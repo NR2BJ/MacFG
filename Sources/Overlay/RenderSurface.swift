@@ -212,7 +212,13 @@ public final class RenderSurface: @unchecked Sendable {
         renderPassDesc.colorAttachments[0].texture = target
         renderPassDesc.colorAttachments[0].loadAction = .dontCare
         renderPassDesc.colorAttachments[0].storeAction = .store
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else { return }
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else {
+            // 조용히 삼키면 드로어블에 아무것도 안 그려진 채 present된다(미초기화/이전 프레임).
+            // 빈도는 극히 낮지만(디바이스 수준 오류) 지금까지 로그 한 줄 없이 시각 결함으로만
+            // 나타났다 — 최소한 원인 추적은 가능하게 남긴다.
+            DiagnosticLog.shared.log("[GPUERR] 출력 blit 인코더 생성 실패 — 이 프레임 무표시")
+            return
+        }
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentTexture(source, index: 0)
         encoder.setFragmentSamplerState(sampler, index: 0)

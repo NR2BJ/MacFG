@@ -222,6 +222,15 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
             DiagnosticLog.shared.log("[SCK-DISPLAY] 제외 재조회 \(attempt)회 → \(excluded.count)/\(excludingWindowIDs.count)개"
                 + (hasRequired(excluded) ? " (출력 창 확보)" : " **출력 창 여전히 미포함**"))
         }
+        // **출력 창을 못 뺐으면 여기서 실패한다 — 적용하면 안 된다.** 재시도 소진 후에도
+        // 그대로 적용하면 자기 출력을 되먹는 거울이 되고(아래 주석의 실사용 증상), 한번
+        // isDisplayCapture=true로 굳으면 호출측 재진입 가드("이미 원하는 모드")가 재시도를
+        // 영영 막아 실패가 끈적해진다(리뷰 확정). throw하면 호출측 catch가 로그를 남기고
+        // 기존 창 캡처가 유지되며, 전체화면 상태가 지속되는 한 다음 재평가가 다시 시도한다.
+        if requiredWindowID != 0 && !hasRequired(excluded) {
+            DiagnosticLog.shared.log("[SCK-DISPLAY] ✗ 출력 창(\(requiredWindowID)) 제외 실패 — 디스플레이 전환 중단, 창 캡처 유지")
+            throw CaptureError.windowNotFound
+        }
         self.captureRect = nil
         self.captureScale = Self.findScaleFactor(for: display.frame)
         let w = display.width, h = display.height          // 디스플레이는 이미 픽셀 단위

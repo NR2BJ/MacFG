@@ -344,12 +344,33 @@ public final class AppState {
         let srcSpreadMs = (diagSrcIntMax > 0 && diagSrcIntMin.isFinite && diagSrcIntMin >= 0)
             ? (diagSrcIntMax - diagSrcIntMin) * 1000 : 0
         gapExpansionAllowed = loadGovernor.allowsGapExpansion && srcSpreadMs < 20
-        tCountCap = bypassButRife ? 1 : loadGovernor.tCountCap
+        // ⑥ **엔진 실측 비용 기반 t 상한.** 거버너는 시스템 부하만 보므로, 엔진이 여유롭다고
+        // 보고해도(RIFE: predict 8ms / budget 14.5ms, exhaust 15%) 쌍당 생성 총비용이 소스
+        // 간격을 넘을 수 있다. 실측(4K 60fps RIFE, 2026-08-26): 거버너 L0라 상한이 nil이고
+        // 그리드 폴백이 t×3을 내는데, 장당 8ms × 3 = 24ms > 소스 간격 16.3ms —
+        // 만드는 시간이 프레임 간격을 넘으니 구조적으로 밀린다. 결과가 cb2gpu 11.7ms,
+        // 대기 16ms, work 46ms(MetalFlow는 7ms), e2e 95ms, 콘텐츠 σ 2.93(MetalFlow 0.86).
+        // 같은 t×3을 MetalFlow는 워프 1.8ms라 감당하지만 RIFE는 못 한다 — **엔진마다 다르므로
+        // 정책이 아니라 실측으로 정해야 한다.** cb2 GPU EMA는 쌍 전체(t 전부)의 비용이므로
+        // 장당 비용으로 나눠 "간격 안에 몇 장이 들어가는가"를 직접 구한다.
+        // 안전계수 0.7: cb2 GPU 외에 인코딩/대기가 붙고, 예산을 꽉 채우면 지터에 바로 밀린다.
+        var costCap: Int? = nil
+        let perT = engineGpuMsEMA > 0 && lastTValueCount > 0
+            ? engineGpuMsEMA / Double(lastTValueCount) : 0
+        let srcIntervalMs = sourceIntervalEMA > 0 ? sourceIntervalEMA * 1000.0 : 0
+        if perT > 0.1, srcIntervalMs > 0 {
+            let affordable = Int((srcIntervalMs * 0.7 / perT).rounded(.down))
+            costCap = max(1, affordable)
+        }
+        let govCap = bypassButRife ? 1 : loadGovernor.tCountCap
+        tCountCap = [govCap, costCap].compactMap { $0 }.min()
     }
 
     /// 거버너 미러 (렌더 스레드에서 읽음) — 갭 확장 허용 / t 개수 상한
     @ObservationIgnored nonisolated(unsafe) private var gapExpansionAllowed = true
     @ObservationIgnored nonisolated(unsafe) private var tCountCap: Int?
+    /// 최근 창에서 실제로 낸 쌍당 t 개수(최대) — engineGpuMsEMA를 장당 비용으로 환산하는 분모.
+    @ObservationIgnored nonisolated(unsafe) private var lastTValueCount = 0
     /// 쌍당 보간 프레임 수 강제 상한 (측정용, MACFG_TCAP). 거버너 상한과 함께 더 작은 쪽이 이긴다.
     @ObservationIgnored nonisolated(unsafe) private let tCapOverride: Int? = Knob.int("MACFG_TCAP")
     /// 매 틱 강제 재present (측정용, MACFG_ALWAYSPRESENT) — present 레이트와 틱 굶주림의 인과 분리.
@@ -2459,6 +2480,7 @@ public final class AppState {
                     guard let k = tCapOverride else { return tCountCap }
                     return min(k, tCountCap ?? k)
                 }()
+                lastTValueCount = max(lastTValueCount, tValues.count)   // 상한 산출용 (창마다 리셋)
                 if let cap = effTCap, tValues.count > cap {
                     if cap <= 0 {
                         tValues = []
@@ -3031,6 +3053,30 @@ public final class AppState {
         let variance = intervals.isEmpty ? 0 : intervals.map { ($0 - avgInterval) * ($0 - avgInterval) }.reduce(0, +) / Double(intervals.count)
         let maxInterval = intervals.max() ?? 0
 
+        // **홀드 패턴 — σ가 못 보는 것을 본다.**
+        //
+        // σ는 "간격이 평균에서 얼마나 흩어졌나"만 잰다. 그런데 규칙적으로 흩어진 것과
+        // 무작위로 흩어진 것을 구분하지 못한다. 144Hz에서 네이티브 60fps는 2.4슬롯이라
+        // 홀드가 2,2,3이 **규칙적으로 반복**되는데 σ는 5.49로 크게 나온다 — 그런데 사람은
+        // 규칙적인 리듬을 배경으로 처리해 부자연스럽게 느끼지 않는다(사용자 지적, 타당).
+        // 같은 σ라도 1,2가 무작위로 섞이면 체감이 전혀 다를 수 있다.
+        // 그래서 각 표시 간격을 슬롯 수로 양자화한 **순서**를 그대로 남긴다. 숫자열을 보면
+        // 반복 주기가 눈에 보이고, 아래 repeat 지표가 그것을 정량화한다.
+        let slotMs = 1000.0 / max(mirrorRefreshRate, 60)
+        let holds = intervals.map { max(1, min(9, Int(($0 / slotMs).rounded()))) }
+        // 규칙성 지표: 주기 p(1~6)로 접었을 때 일치율이 가장 높은 p와 그 일치율.
+        // 완전 규칙(2,2,3 반복)이면 p=3에서 100%, 무작위면 어느 p에서도 낮다.
+        var bestPeriod = 0, bestScore = 0.0
+        if holds.count >= 12 {
+            for p in 1...6 where holds.count > p {
+                var hit = 0
+                for i in p..<holds.count where holds[i] == holds[i - p] { hit += 1 }
+                let sc = Double(hit) / Double(holds.count - p)
+                if sc > bestScore { bestScore = sc; bestPeriod = p }
+            }
+        }
+        let holdStr = holds.suffix(32).map(String.init).joined()
+
         let avgLatency = latencySamplesMs.isEmpty ? 0 : latencySamplesMs.reduce(0, +) / Double(latencySamplesMs.count)
         let pattern = diagFrameTypes.suffix(24).joined()
         let srcFps = sourceIntervalEMA > 0 ? 1.0 / sourceIntervalEMA : 0
@@ -3060,7 +3106,7 @@ public final class AppState {
         let slipSnapshot = diagSlipHist
         let gpuLateSnapshot = diagGpuLateHist
         stageLock.unlock()
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -3108,6 +3154,7 @@ public final class AppState {
         diagPoolExhaustCount = 0
         diagInterpEncodedCount = 0
         diagSrcIntMin = .infinity
+        lastTValueCount = 0
         diagSrcIntMax = 0
         diagDrainDepthSum = 0
         diagDrainDepthMax = 0

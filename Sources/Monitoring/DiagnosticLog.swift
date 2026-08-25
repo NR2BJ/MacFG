@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import os
 
 /// 파일 기반 진단 로그. 캡처 세션의 진단 데이터를 `/tmp/MacFG_diag.log`에 기록.
@@ -14,6 +15,7 @@ public final class DiagnosticLog: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.macfg.diaglog", qos: .utility)
     private var handle: FileHandle?          // queue에서만 접근
+    private var lastPathCheck: CFAbsoluteTime = 0   // 경로 존재 확인 스로틀 (queue에서만 접근)
     private let enabledFlag = OSAllocatedUnfairLock(initialState: false)
     private let dateFormatter: DateFormatter
     private let fileURL = URL(fileURLWithPath: "/tmp/MacFG_diag.log")
@@ -93,7 +95,24 @@ public final class DiagnosticLog: @unchecked Sendable {
         let line = "[\(timestamp)] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         queue.async { [weak self] in
-            try? self?.handle?.write(contentsOf: data)
+            guard let self else { return }
+            // **경로가 사라졌으면 다시 연다.** FileHandle은 inode를 붙들기 때문에, 파일이
+            // 지워지거나 옮겨져도 쓰기는 계속 성공한다 — 다만 아무도 볼 수 없는 유령 파일에.
+            // 실제로 그렇게 됐다: 무인 A/B 스크립트가 실행마다 로그를 rm 하는데 앱은 이미
+            // 열린 핸들에 계속 써서, 275KB가 쌓였는데 /tmp의 파일은 23KB에서 멈춰 있었고
+            // 그 옛 파일을 최신으로 오독했다(2026-08-26). 진단 도구가 조용히 거짓말하면
+            // 그 위에 쌓은 모든 판단이 무효가 된다.
+            // stat은 로그 줄마다가 아니라 1초에 한 번만 — 핫패스 비용을 만들지 않는다.
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - self.lastPathCheck > 1.0 {
+                self.lastPathCheck = now
+                if !FileManager.default.fileExists(atPath: self.fileURL.path) {
+                    try? self.handle?.close()
+                    self.handle = nil
+                    self.openHandle()
+                }
+            }
+            try? self.handle?.write(contentsOf: data)
         }
     }
 }

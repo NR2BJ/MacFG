@@ -344,33 +344,20 @@ public final class AppState {
         let srcSpreadMs = (diagSrcIntMax > 0 && diagSrcIntMin.isFinite && diagSrcIntMin >= 0)
             ? (diagSrcIntMax - diagSrcIntMin) * 1000 : 0
         gapExpansionAllowed = loadGovernor.allowsGapExpansion && srcSpreadMs < 20
-        // ⑥ **엔진 실측 비용 기반 t 상한.** 거버너는 시스템 부하만 보므로, 엔진이 여유롭다고
-        // 보고해도(RIFE: predict 8ms / budget 14.5ms, exhaust 15%) 쌍당 생성 총비용이 소스
-        // 간격을 넘을 수 있다. 실측(4K 60fps RIFE, 2026-08-26): 거버너 L0라 상한이 nil이고
-        // 그리드 폴백이 t×3을 내는데, 장당 8ms × 3 = 24ms > 소스 간격 16.3ms —
-        // 만드는 시간이 프레임 간격을 넘으니 구조적으로 밀린다. 결과가 cb2gpu 11.7ms,
-        // 대기 16ms, work 46ms(MetalFlow는 7ms), e2e 95ms, 콘텐츠 σ 2.93(MetalFlow 0.86).
-        // 같은 t×3을 MetalFlow는 워프 1.8ms라 감당하지만 RIFE는 못 한다 — **엔진마다 다르므로
-        // 정책이 아니라 실측으로 정해야 한다.** cb2 GPU EMA는 쌍 전체(t 전부)의 비용이므로
-        // 장당 비용으로 나눠 "간격 안에 몇 장이 들어가는가"를 직접 구한다.
-        // 안전계수 0.7: cb2 GPU 외에 인코딩/대기가 붙고, 예산을 꽉 채우면 지터에 바로 밀린다.
-        var costCap: Int? = nil
-        let perT = engineGpuMsEMA > 0 && lastTValueCount > 0
-            ? engineGpuMsEMA / Double(lastTValueCount) : 0
-        let srcIntervalMs = sourceIntervalEMA > 0 ? sourceIntervalEMA * 1000.0 : 0
-        if perT > 0.1, srcIntervalMs > 0 {
-            let affordable = Int((srcIntervalMs * 0.7 / perT).rounded(.down))
-            costCap = max(1, affordable)
-        }
-        let govCap = bypassButRife ? 1 : loadGovernor.tCountCap
-        tCountCap = [govCap, costCap].compactMap { $0 }.min()
+        // 엔진 비용 기반 t 상한을 여기 넣었다가 **되돌렸다**(2026-08-26).
+        // RIFE 4K의 work 22ms 중 16ms가 `대기`인데, t를 3→2→1로 줄여도 대기는 15~16ms로
+        // 그대로였다(실측). 원인이 t 개수가 아니라 **cb2가 ANE 추론 완료를 GPU에서 기다리는
+        // 구조**이기 때문이다(RIFEEngine: packCB.commit → 워커가 predict → slot.event 시그널
+        // → 호출자 cb의 encodeWaitForEvent). 그 대기는 소스 간격(16.7ms)과 거의 같다.
+        // 단계별 GPU 합은 두 엔진이 사실상 동일하다: cb1+cb2+present ≈ 4.5ms.
+        //   MetalFlow  cb1 0.61  cb2 3.32  present 0.54  대기 **0.32**  work  5.92
+        //   RIFE       cb1 0.85  cb2 3.28  present 0.64  대기 **16.28** work 22.18
+        tCountCap = bypassButRife ? 1 : loadGovernor.tCountCap
     }
 
     /// 거버너 미러 (렌더 스레드에서 읽음) — 갭 확장 허용 / t 개수 상한
     @ObservationIgnored nonisolated(unsafe) private var gapExpansionAllowed = true
     @ObservationIgnored nonisolated(unsafe) private var tCountCap: Int?
-    /// 최근 창에서 실제로 낸 쌍당 t 개수(최대) — engineGpuMsEMA를 장당 비용으로 환산하는 분모.
-    @ObservationIgnored nonisolated(unsafe) private var lastTValueCount = 0
     /// 쌍당 보간 프레임 수 강제 상한 (측정용, MACFG_TCAP). 거버너 상한과 함께 더 작은 쪽이 이긴다.
     @ObservationIgnored nonisolated(unsafe) private let tCapOverride: Int? = Knob.int("MACFG_TCAP")
     /// 매 틱 강제 재present (측정용, MACFG_ALWAYSPRESENT) — present 레이트와 틱 굶주림의 인과 분리.
@@ -2480,7 +2467,6 @@ public final class AppState {
                     guard let k = tCapOverride else { return tCountCap }
                     return min(k, tCountCap ?? k)
                 }()
-                lastTValueCount = max(lastTValueCount, tValues.count)   // 상한 산출용 (창마다 리셋)
                 if let cap = effTCap, tValues.count > cap {
                     if cap <= 0 {
                         tValues = []
@@ -3154,7 +3140,6 @@ public final class AppState {
         diagPoolExhaustCount = 0
         diagInterpEncodedCount = 0
         diagSrcIntMin = .infinity
-        lastTValueCount = 0
         diagSrcIntMax = 0
         diagDrainDepthSum = 0
         diagDrainDepthMax = 0

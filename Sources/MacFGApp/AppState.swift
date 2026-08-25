@@ -244,6 +244,8 @@ public final class AppState {
     /// 그리고 **"그러므로 present 경로는 무죄"로 읽지 마라** — present 측 손실은 별개로 살아 있는
     /// 사안이다(2246~2261행의 slip 실측 7,696프레임, 1638행 부근).
     @ObservationIgnored nonisolated(unsafe) private var stgPresentGpu = 0.0
+    /// GPU 정지 시간 EMA (work − 단계합). 엔진 간 성능 차이의 핵심 항 — stageLock 보호.
+    @ObservationIgnored nonisolated(unsafe) private var stgWaitEMA = 0.0
     @ObservationIgnored nonisolated(unsafe) private var stgPresentCount = 0
     /// 직전 진단 창의 벽시계 길이 [s] — 슬롯당 정규화에 필요(present 발생률 산출)
     @ObservationIgnored nonisolated(unsafe) private var diagLastLogWallSpan: Double = 0
@@ -1446,6 +1448,7 @@ public final class AppState {
         paceWorkP90 = 0   // 이전(무거운) 세션의 work p90 하한이 새 캡처의 extra를 재부풀리지 않게 (감사 확정)
         pendingIngest = []
         inFlightPresents.withLock { $0 = 0 }
+        stageLock.lock(); stgWaitEMA = 0; stageLock.unlock()   // 세션 경계에서 대기 통계 초기화
         renderGen &+= 1   // 이전 세대의 늦은 완료를 이후 drain이 걸러낸다
         _ = mailbox.drain(current: renderGen)
     }
@@ -2580,6 +2583,12 @@ public final class AppState {
                 self.stageLock.lock()
                 self.stgCapIngest += capIngest
                 self.stgCb2Gpu += cb2Gpu
+                // 대기 = work - (capIngest + cb1 + cb2). GPU가 아무것도 못 하고 멈춘 시간이며,
+                // RIFE는 여기가 16ms(소스 간격만큼)인데 MetalFlow는 0.3ms다 — 엔진 간 성능
+                // 차이의 전부가 이 항이다(2026-08-26 확정). [STAGE]는 120프레임 평균이라
+                // 창별 추이를 못 보므로 EMA로 따로 남겨 [SCHED]에서 창마다 읽는다.
+                let waitNow = max(0, workNow - capIngest - self.stgLastCb1Gpu - cb2Gpu)
+                self.stgWaitEMA = self.stgWaitEMA <= 0 ? waitNow : self.stgWaitEMA * 0.9 + waitNow * 0.1
                 self.stgWork += workNow
                 self.stgCount += 1
                 let n = self.stgCount
@@ -3092,7 +3101,8 @@ public final class AppState {
         let slipSnapshot = diagSlipHist
         let gpuLateSnapshot = diagGpuLateHist
         stageLock.unlock()
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
+        stageLock.lock(); let waitSnapshot = stgWaitEMA; stageLock.unlock()
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.

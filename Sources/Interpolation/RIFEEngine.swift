@@ -146,6 +146,24 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 최근 predict 시간 링(≤15) — 앵커 예산은 **중앙값**으로 판단. EMA(α=0.05)는 콜드스타트
     /// 60ms급 첫 predict에 오염돼 실제값(12ms) 복귀까지 수십 쌍 → 앵커가 영영 미발동했음(실측).
     private let predictMsRing = OSAllocatedUnfairLock(initialState: [Double]())
+    /// 최근 쌍 간격 링 — 앵커 예산의 기준(케이던스). 드롭으로 벌어진 갭에 예산이 끌려가면
+    /// 자기강화 고리가 되므로 중앙값을 쓴다. predictMsRing과 같은 락 규약.
+    private let gapMsRing = OSAllocatedUnfairLock(initialState: [Double]())
+    private func noteGap(_ ms: Double) {
+        guard ms > 1, ms < 200 else { return }
+        gapMsRing.withLock { r in
+            r.append(ms)
+            if r.count > 60 { r.removeFirst(r.count - 60) }
+        }
+    }
+    private func gapMedian() -> Double {
+        gapMsRing.withLock { r in
+            guard r.count >= 8 else { return 0 }
+            let s = r.sorted()
+            return s[s.count / 2]
+        }
+    }
+
     private func predictMsMedian() -> Double {
         predictMsRing.withLock { ring in
             guard !ring.isEmpty else { return 0 }
@@ -530,9 +548,23 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let ts = capped.map { min(max($0, 0.01), 0.99) }
         guard outputPool.count >= ts.count else { releaseSlot(slot); return nil }
 
-        // ── 앵커 선택: predict 예산(쌍 간격×0.8 ÷ 중앙값) 내에서 최대한 exact
+        // ── 앵커 선택: predict 예산 내에서 최대한 exact
+        //
+        // **예산의 기준은 실제 갭이 아니라 케이던스다.** 실제 갭을 쓰면 프레임을 놓친 쌍에서
+        // 갭이 2배가 되고 예산도 2배가 돼 앵커 3개(=predict 24.6ms)를 넣는데, ANE가 그만큼
+        // 파이프를 막아 다음 프레임을 또 놓친다 — 드롭이 드롭을 부르는 자기강화 고리다.
+        // 이 저장소는 t 값 쪽에서 같은 함정을 이미 겪고 gapExpansionAllowed로 막았는데
+        // (AppState: "드롭 → 갭 2배 → 3장 생성 → 4K 워프 3회 + ANE 3회 → work 50-65ms → 더 드롭"),
+        // 엔진 내부 앵커 예산에는 그 가드가 없었다.
+        // 실측(2026-08-26, 4K 60fps): anchors=3 × predictMed 8.2ms = 24.6ms인데 DELIV가
+        // 보고한 예산은 14.5ms였다. 소스 간격 16.7ms를 ANE 혼자 넘으니 wait가 16~20ms로
+        // 상시화되고 e2e가 87~161ms까지 밀렸다.
+        // 케이던스는 최근 갭의 중앙값으로 잡는다 — 드롭 쌍의 큰 갭에 끌려가지 않는다.
         let med = predictMsMedian()
-        let budgetMs = (tsB - tsA) * 1000.0 * 0.8
+        let rawGapMs = (tsB - tsA) * 1000.0
+        noteGap(rawGapMs)
+        let cadenceMs = gapMedian() > 0 ? min(rawGapMs, gapMedian() * 1.25) : rawGapMs
+        let budgetMs = cadenceMs * 0.8
         let affordable = med > 0 ? max(1, Int(budgetMs / med)) : 1
         let anchorCount = min(ts.count, affordable, Self.maxAnchors)
         var anchors: [Float]
@@ -799,7 +831,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         pairCount += 1
         if pairCount <= 3 || pairCount % 600 == 0 || anchors.count > 1 {
             let medNow = predictMsMedian()
-            DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) anchors=\(anchors.count) predictMed=\(String(format: "%.1f", medNow))ms")
+            DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) anchors=\(anchors.count)/\(affordable) cad=\(String(format: "%.1f", cadenceMs))ms predictMed=\(String(format: "%.1f", medNow))ms")
             if Knob.string("MACFG_RIFE_VERBOSE") != nil {
                 print("  [RIFE] pair#\(pairCount) anchors=\(anchors.map { String(format: "%.2f", $0) }.joined(separator: ",")) med=\(String(format: "%.1f", medNow))")
             }
@@ -882,6 +914,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     // MARK: - Reset / Shutdown
 
     public func reset() {
+        gapMsRing.withLock { $0.removeAll() }
         // 시간적 flow prior만 무효화 (불연속에서 이전 flow 블렌드 방지). 진행 중 슬롯은 자연 완료.
         slotLock.withLock { tempPrevValid = false }
     }

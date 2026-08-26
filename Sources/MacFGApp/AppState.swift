@@ -1692,6 +1692,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagFrameTypes: [String] = []
     @ObservationIgnored nonisolated(unsafe) private var diagSrcIntMin: Double = .infinity  // 콘텐츠 간격 min/max (VFR 판별)
     @ObservationIgnored nonisolated(unsafe) private var diagSrcIntMax: Double = 0
+    /// 원본 도착 간격 분포 [<8, 8~13, 13~20, 20~27, 27+]ms — 소스가 정말 균일한지 판별
+    @ObservationIgnored nonisolated(unsafe) private var diagSrcIntHist = [0, 0, 0, 0, 0]
     @ObservationIgnored nonisolated(unsafe) private var diagDrainDepthSum: Int = 0         // 매 틱 drain한 프레임 수 (버스트 판별)
     @ObservationIgnored nonisolated(unsafe) private var diagDrainDepthMax: Int = 0
     @ObservationIgnored nonisolated(unsafe) private var diagDrainSamples: Int = 0
@@ -1700,6 +1702,10 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagSkipEngineNil = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipNoPrev = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipContentFast = 0
+    /// 쿼터/상한이 의도적으로 비운 쌍 (정상 동작 — 손실 아님)
+    @ObservationIgnored nonisolated(unsafe) private var diagSkipQuota = 0
+    /// 어느 생성 경로도 t를 못 낸 쌍 (진짜 손실 — 여기가 0이어야 한다)
+    @ObservationIgnored nonisolated(unsafe) private var diagSkipNoT = 0
     /// t 결정 진단 — "보간 0장"이 **어느 가지에서** 나왔는지 가른다.
     /// mult: 정수배가 0장을 내 비정수 경로로 넘긴 횟수 (절벽 조건에 들어왔다는 뜻)
     /// grid: 비정수 경로까지 갔는데도 0장인 횟수 (여기가 진짜 막힌 곳)
@@ -2121,6 +2127,12 @@ public final class AppState {
             // 덮어쓰면 히스테리시스의 락 기준 자체가 매 프레임 오염된다 (리뷰 지적).
             if delta < diagSrcIntMin { diagSrcIntMin = delta }
             if delta > diagSrcIntMax { diagSrcIntMax = delta }
+            // **원본 도착 간격 히스토그램.** min/max만으로는 "가끔 한 번 튄 것"과 "상시 흔들림"이
+            // 구분되지 않는다. 사용자는 소스가 균일한 60fps라고 보고했는데 우리 계측은
+            // 7~30ms 범위를 보고한다 — 둘 중 하나가 틀렸고, 분포를 보면 갈린다.
+            // 60fps(16.7ms) 기준 칸: <8 / 8~13 / 13~20 / 20~27 / 27+ ms
+            let dms = delta * 1000
+            diagSrcIntHist[dms < 8 ? 0 : dms < 13 ? 1 : dms < 20 ? 2 : dms < 27 ? 3 : 4] += 1
         }
         let previousAcceptedTs = lastAcceptedTimestamp
         let previousBeforeLast = acceptedTsBeforeLast
@@ -2489,7 +2501,12 @@ public final class AppState {
                     }
                 }
                 if tValues.isEmpty {
-                    diagSkipContentFast += 1
+                    // **의미를 갈라 센다.** 이 자리는 두 가지가 섞인다: 쿼터/상한이 "이 쌍은
+                    // 낼 필요 없다"고 판단해 비운 정상 동작(quotaEmptied)과, 어느 경로도
+                    // 수확하지 못한 진짜 손실. 한 숫자로 합치면 9.6/s가 손실인지 정상인지
+                    // 구분이 안 돼 다음 판단을 못 한다(실측 2026-08-26: 생성/수용이 1.01로
+                    // 정상인데 fast가 9.6/s로 찍혀 손실처럼 보였다).
+                    if quotaEmptied { diagSkipQuota += 1 } else { diagSkipNoT += 1 }
                 }
                 // 배압: 워크 스파이크로 큐가 깊어졌으면 생성 단계에서 줄인다 —
                 // 이미 예약된 프레임을 드레인으로 버리는 것(눈에 보이는 딸꾹질)보다
@@ -2525,7 +2542,7 @@ public final class AppState {
                     diagSkipEngineFail += 1
                 }
             } else if contentAlreadyFast {
-                diagSkipContentFast += 1
+                diagSkipContentFast += 1   // 원본 간격이 표시 슬롯보다 좁음 (진짜 버스트)
             } else if gap >= 0.25 {
                 diagSkipBigGap += 1
                 pairEngine?.reset()
@@ -3095,6 +3112,8 @@ public final class AppState {
         if diagSkipEngineNil > 0 { skipParts.append("noEng:\(diagSkipEngineNil)") }
         if diagSkipNoPrev > 0 { skipParts.append("noPrev:\(diagSkipNoPrev)") }
         if diagSkipContentFast > 0 { skipParts.append("fast:\(diagSkipContentFast)") }
+        if diagSkipQuota > 0 { skipParts.append("quota:\(diagSkipQuota)") }
+        if diagSkipNoT > 0 { skipParts.append("noT:\(diagSkipNoT)") }
         if diagSkipBigGap > 0 { skipParts.append("gap:\(diagSkipBigGap)") }
         if diagSkipDiscontinuity > 0 { skipParts.append("discont:\(diagSkipDiscontinuity)") }
         if diagSkipEngineFail > 0 { skipParts.append("engFail:\(diagSkipEngineFail)") }
@@ -3112,7 +3131,7 @@ public final class AppState {
         let gpuLateSnapshot = diagGpuLateHist
         stageLock.unlock()
         stageLock.lock(); let waitSnapshot = stgWaitEMA; stageLock.unlock()
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
+        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -3138,7 +3157,7 @@ public final class AppState {
         diagSnapMissCount = 0; diagSnapPullableCount = 0; diagSnapPullLagMax = 0
         diagIngestSum = 0; diagIngestSamples = 0; diagIngestMax = 0; diagIngestOver = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
-        diagSkipContentFast = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
+        diagSkipContentFast = 0; diagSkipQuota = 0; diagSkipNoT = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
         diagStaleDropCount = 0; diagCapDropCount = 0; diagLeaseDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
 
@@ -3160,6 +3179,7 @@ public final class AppState {
         diagPoolExhaustCount = 0
         diagInterpEncodedCount = 0
         diagSrcIntMin = .infinity
+        diagSrcIntHist = [0, 0, 0, 0, 0]
         diagSrcIntMax = 0
         diagDrainDepthSum = 0
         diagDrainDepthMax = 0

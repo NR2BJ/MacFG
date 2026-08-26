@@ -2284,7 +2284,17 @@ public final class AppState {
             // 게다가 브라우저 버스트 배달(30fps인데 2프레임이 7ms로 붙어 옴)에서 이 퇴화 쌍을
             // 억지로 보간하면 ANE 과부하로 engFail·아티팩트가 난다(실측). 슬롯 없는 갭은 스킵해도
             // 구멍이 안 생기므로(보여줄 자리가 없음) 문턱을 한 프레임으로 올려 버스트를 걸러낸다.
-            let contentAlreadyFast = gap < displayInterval
+            // **판정은 스냅된 갭이 아니라 원본 간격으로 한다.**
+            // 이 가드의 의도는 "콘텐츠가 정말로 표시 슬롯보다 빠르면 보간이 무의미하다"인데,
+            // gap은 PLL이 스냅한 값이라 **스냅이 빗나가면 콘텐츠와 무관하게 좁아진다.**
+            // 실측(2026-08-26, 깨끗한 시스템 4K 60fps): snapMiss 4.15/s와 fast 4.20/s가
+            // 정확히 일치했고, 같은 창에서 원본 delta의 최소는 7.0ms로 슬롯(6.94ms)보다 항상
+            // 컸다 — 즉 6.94ms 미만 갭은 소스가 만든 것이 아니라 스냅 실패의 산물이다.
+            // 그 오판으로 초당 4쌍의 보간이 통째로 건너뛰어졌다(생성 55.6 vs 수용 59.7).
+            // 원본 간격으로 재면 버스트 배달(30fps인데 2프레임이 7ms로 붙는 것)은 여전히
+            // 걸러지고, 스냅 실패한 정상 쌍은 살아난다.
+            let rawGap = slot.timestamp - prev.rawTimestamp
+            let contentAlreadyFast = (rawGap > 0 ? rawGap : gap) < displayInterval
             if gap > 0 && gap < 0.25 && !contentAlreadyFast
                 && prev.texture.width == stable.width && prev.texture.height == stable.height
                 && previousAcceptedTs == prev.rawTimestamp {

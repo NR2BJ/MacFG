@@ -566,7 +566,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let cadenceMs = gapMedian() > 0 ? min(rawGapMs, gapMedian() * 1.25) : rawGapMs
         let budgetMs = cadenceMs * 0.8
         let affordable = med > 0 ? max(1, Int(budgetMs / med)) : 1
-        let anchorCount = min(ts.count, affordable, Self.maxAnchors)
+        // MACFG_RIFE_ANCHORS=N: 앵커 수 강제 상한. **지연↔화질 다이얼이다.**
+        // 앵커는 단일 워커 큐에서 **순차** 추론이라(for (i, anchorT) in anchors.enumerated())
+        // N개면 ANE 시간이 N배다. 그 시간은 호출자 cb가 GPU에서 통째로 기다리므로
+        // (encodeWaitForEvent) work p90 → 적응 지연(lat) → 타임라인 깊이 → 미표시로 번진다.
+        // 실측(4K 60fps 실사용, 2026-08-26): 앵커 2개 = predict 15.4ms = wait 17.3ms,
+        // work p90 71ms, lat +4, e2e 85ms, 미표시 7.2%. 생성 자체는 소스를 따라간다(비 1.01)
+        // — 잃는 것은 생성이 아니라 지연이 깊어져 생기는 표시 손실이다.
+        // 1로 줄이면 ANE가 반토막 나 지연이 내려가지만, 앵커 아닌 t는 최근접 앵커에서 워프로
+        // 근사되므로 화질 손해가 있다. 어느 쪽이 나은지는 콘텐츠에 달렸다.
+        let anchorHardCap = Knob.int("MACFG_RIFE_ANCHORS").map { max(1, $0) } ?? Self.maxAnchors
+        let anchorCount = min(ts.count, affordable, Self.maxAnchors, anchorHardCap)
         var anchors: [Float]
         if anchorCount >= ts.count {
             anchors = Array(ts)                             // 전부 exact (arbitrary-t 풀활용)

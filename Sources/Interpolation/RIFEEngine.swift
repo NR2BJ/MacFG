@@ -146,6 +146,16 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 최근 predict 시간 링(≤15) — 앵커 예산은 **중앙값**으로 판단. EMA(α=0.05)는 콜드스타트
     /// 60ms급 첫 predict에 오염돼 실제값(12ms) 복귀까지 수십 쌍 → 앵커가 영영 미발동했음(실측).
     private let predictMsRing = OSAllocatedUnfairLock(initialState: [Double]())
+    /// **predictMed 분해 계측 (2026-08-27).**
+    /// predictMed는 ANE 연산 시간이 아니라 **Core ML 호출 전체의 wall time**이다 —
+    /// MLMultiArray 래퍼 4개 생성 + options/provider + prediction + 출력 폴백 복사가 전부 들어 있다.
+    /// 그래서 "predictMed × 60 = ANE 점유"라는 계산은 상한을 과대평가한다.
+    /// 특히 outputBackings가 무시되면 flow(2.46MB)+mask를 매 추론마다 memcpy하는데
+    /// 그 발생 횟수가 아무 데도 기록되지 않았다. 세 구간을 갈라 어디에 시간이 있는지 본다.
+    ///   prep = 래퍼/옵션/provider 생성,  pred = model.prediction,  copy = 폴백 복사
+    private let predictPhaseRing = OSAllocatedUnfairLock(initialState: [(Double, Double, Double)]())
+    /// 출력 backing이 무시되어 폴백 복사가 발생한 횟수 / 전체 추론 횟수
+    private let backingMissCount = OSAllocatedUnfairLock(initialState: (miss: 0, total: 0))
     /// 최근 쌍 간격 링 — 앵커 예산의 기준(케이던스). 드롭으로 벌어진 갭에 예산이 끌려가면
     /// 자기강화 고리가 되므로 중앙값을 쓴다. predictMsRing과 같은 락 규약.
     private let gapMsRing = OSAllocatedUnfairLock(initialState: [Double]())
@@ -255,6 +265,20 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             throw InterpolationError.notPrepared
         }
         return (model, shape[3].intValue, shape[2].intValue)
+    }
+
+    /// predictMed 분해 — prep(래퍼 생성) / pred(추론) / copy(폴백 복사) 중앙값과 backing 미스율.
+    /// copy가 유의미하면 outputBackings가 무시되고 있다는 뜻이고, 그건 순수 낭비다.
+    private func phaseBreakdown() -> String {
+        let rows = predictPhaseRing.withLock { $0 }
+        guard !rows.isEmpty else { return "" }
+        func med(_ f: ((Double, Double, Double)) -> Double) -> Double {
+            rows.map(f).sorted()[rows.count / 2]
+        }
+        let st = backingMissCount.withLock { $0 }
+        let missPct = st.total > 0 ? Double(st.miss) * 100.0 / Double(st.total) : 0
+        return String(format: "[prep %.1f / pred %.1f / copy %.1f ms, backingMiss %.0f%%]",
+                      med { $0.0 }, med { $0.1 }, med { $0.2 }, missPct)
     }
 
     public func prepare(device: any MTLDevice) async throws {
@@ -621,6 +645,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         let workerRef = worker
         let cancelledRef = cancelled
         let ringRef = predictMsRing
+        let phaseRef = predictPhaseRing
+        let missRef = backingMissCount
         let loggerRef = logger
         let anchorsRef = anchors
         // model을 **강참조**로 캡처 — 사다리 교체로 self.model이 바뀌어도 이 쌍은 자기 모델로 완주한다.
@@ -673,26 +699,43 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
                         let opts = MLPredictionOptions()
                         opts.outputBackings = ["flow": flowBack, "mask": maskBack]
                         let input = try MLDictionaryFeatureProvider(dictionary: ["x": xArr, "t": tArr])
+                        let tPrep = CFAbsoluteTimeGetCurrent()
                         let result = try model.prediction(from: input, options: opts)
+                        let tPred = CFAbsoluteTimeGetCurrent()
+                        var backingMissed = false
                         // backing 미사용 폴백 — 반환 배열이 우리 버퍼가 아니면 복사
                         if let f = result.featureValue(for: "flow")?.multiArrayValue,
                            f.dataPointer != slot.flowBufs[i].contents() {
+                            backingMissed = true
+                            let dstF = slot.flowBufs[i]
                             f.withUnsafeBytes { raw in
-                                slot.flowBufs[i].contents().copyMemory(
-                                    from: raw.baseAddress!, byteCount: min(raw.count, slot.flowBufs[i].length))
+                                dstF.contents().copyMemory(
+                                    from: raw.baseAddress!, byteCount: min(raw.count, dstF.length))
                             }
                         }
                         if let m = result.featureValue(for: "mask")?.multiArrayValue,
                            m.dataPointer != slot.maskBufs[i].contents() {
+                            backingMissed = true
+                            let dstM = slot.maskBufs[i]
                             m.withUnsafeBytes { raw in
-                                slot.maskBufs[i].contents().copyMemory(
-                                    from: raw.baseAddress!, byteCount: min(raw.count, slot.maskBufs[i].length))
+                                dstM.contents().copyMemory(
+                                    from: raw.baseAddress!, byteCount: min(raw.count, dstM.length))
                             }
                         }
-                        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                        let tEnd = CFAbsoluteTimeGetCurrent()
+                        let ms = (tEnd - t0) * 1000
                         ringRef.withLock { ring in
                             ring.append(ms)
                             if ring.count > 15 { ring.removeFirst() }
+                        }
+                        phaseRef.withLock { ring in
+                            ring.append(((tPrep - t0) * 1000, (tPred - tPrep) * 1000, (tEnd - tPred) * 1000))
+                            if ring.count > 15 { ring.removeFirst() }
+                        }
+                        let missedNow = backingMissed   // @Sendable 클로저는 var를 캡처 못 한다
+                        missRef.withLock { st in
+                            st.total += 1
+                            if missedNow { st.miss += 1 }
                         }
                     } catch {
                         degradeAnchors(i..<(i + 1))   // 이 앵커만 50/50 강등
@@ -841,7 +884,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         pairCount += 1
         if pairCount <= 3 || pairCount % 600 == 0 || anchors.count > 1 {
             let medNow = predictMsMedian()
-            DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) anchors=\(anchors.count)/\(affordable) cad=\(String(format: "%.1f", cadenceMs))ms predictMed=\(String(format: "%.1f", medNow))ms")
+            DiagnosticLog.shared.log("[RIFE] pair #\(pairCount) t×\(frames.count) anchors=\(anchors.count)/\(affordable) cad=\(String(format: "%.1f", cadenceMs))ms predictMed=\(String(format: "%.1f", medNow))ms \(phaseBreakdown())")
             if Knob.string("MACFG_RIFE_VERBOSE") != nil {
                 print("  [RIFE] pair#\(pairCount) anchors=\(anchors.map { String(format: "%.2f", $0) }.joined(separator: ",")) med=\(String(format: "%.1f", medNow))")
             }

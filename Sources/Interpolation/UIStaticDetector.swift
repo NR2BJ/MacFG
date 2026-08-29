@@ -15,12 +15,17 @@ import Monitoring
 public final class UIStaticDetector {
     private let device: any MTLDevice
     private var pso: (any MTLComputePipelineState)?
+    private var blurPso: (any MTLComputePipelineState)?
     private var meanTex: [any MTLTexture] = []   // ping-pong EMA(hp)
     private var sqTex: [any MTLTexture] = []      // ping-pong EMA(hp²)
     // 마스크도 ping-pong — cb1(blit+detector)을 copy 큐로 분리하면(O1-3), 다음 프레임 update가
     // 마스크를 쓰는 동안 이번 프레임 cb2(warp, work 큐)가 같은 마스크를 읽어 cross-queue 하자드가
     // 난다. 2버퍼로 번갈아 써서 읽는 버퍼와 쓰는 버퍼를 분리.
     private var maskTex: [any MTLTexture] = []
+    /// 블러 전 raw 마스크 + 분리형 블러 중간 버퍼. 같은 cb 안에서 인코더 순서가 보장되므로
+    /// ping-pong 불필요(위 maskTex의 2버퍼는 cross-queue 하자드용이라 사정이 다르다).
+    private var rawTex: (any MTLTexture)?
+    private var tmpTex: (any MTLTexture)?
     private var maskCur = 0
     private var cur = 0
     private var w = 0, h = 0
@@ -73,8 +78,10 @@ public final class UIStaticDetector {
 
     public func prepare() async throws {
         let lib = try await device.makeLibrary(source: Self.shaderSource, options: nil)
-        guard let fn = lib.makeFunction(name: "uiStaticUpdate") else { throw InterpolationError.shaderCompilationFailed }
+        guard let fn = lib.makeFunction(name: "uiStaticUpdate"),
+              let fb = lib.makeFunction(name: "uiMaskBlur") else { throw InterpolationError.shaderCompilationFailed }
         pso = try await device.makeComputePipelineState(function: fn)
+        blurPso = try await device.makeComputePipelineState(function: fb)
     }
 
     /// 해상도 세팅/재세팅 — 소스 크기의 1/2(텍스트 보존 + 저비용).
@@ -90,6 +97,8 @@ public final class UIStaticDetector {
         meanTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
         sqTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
         maskTex = [tex(.r16Float, [.shaderRead, .shaderWrite]), tex(.r16Float, [.shaderRead, .shaderWrite])].compactMap { $0 }
+        rawTex = tex(.r16Float, [.shaderRead, .shaderWrite])
+        tmpTex = tex(.r16Float, [.shaderRead, .shaderWrite])
         maskCur = 0
         // boost: CPU 업로드용 shared r8 ping-pong (GPU가 이전 장을 읽는 중에도 안전)
         func sharedTex() -> (any MTLTexture)? {
@@ -114,6 +123,7 @@ public final class UIStaticDetector {
         guard Self.enabled, let pso else { return }
         ensure(srcW: source.width, srcH: source.height)
         guard meanTex.count == 2, sqTex.count == 2, maskTex.count == 2, boostTex.count == 2,
+              let rawOut = rawTex,
               let enc = cb.makeComputeCommandEncoder() else { return }
         // 이번엔 반대 마스크 버퍼에 쓴다 — 직전 프레임 워프가 아직 옛 버퍼를 읽는 중일 수 있음.
         let maskWrite = 1 - maskCur
@@ -154,7 +164,7 @@ public final class UIStaticDetector {
         enc.setTexture(sqTex[prev], index: 2)
         enc.setTexture(meanTex[next], index: 3)
         enc.setTexture(sqTex[next], index: 4)
-        enc.setTexture(maskTex[maskWrite], index: 5)
+        enc.setTexture(rawOut, index: 5)   // 블러 전 raw — 아래 두 패스를 거쳐 maskTex로 간다
         enc.setTexture(boostTex[boostCur], index: 6)
         var p = SIMD4<Float>(Self.alpha, Self.clo, Self.chi, needsReset ? 1 : 0)
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
@@ -163,6 +173,23 @@ public final class UIStaticDetector {
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1), threadsPerThreadgroup: tg)
         enc.endEncoding()
+
+        // 분리형 가우시안 두 패스: raw → tmp(가로) → maskTex[maskWrite](세로).
+        // 같은 커맨드 버퍼 안이라 인코더 순서가 의존성을 보장한다.
+        if let blurPso, let tmp = tmpTex {
+            for (srcT, dstT, ax) in [(rawOut, tmp, SIMD2<Int32>(1, 0)),
+                                     (tmp, maskTex[maskWrite], SIMD2<Int32>(0, 1))] {
+                guard let benc = cb.makeComputeCommandEncoder() else { break }
+                benc.setComputePipelineState(blurPso)
+                benc.setTexture(srcT, index: 0)
+                benc.setTexture(dstT, index: 1)
+                var a = ax
+                benc.setBytes(&a, length: MemoryLayout<SIMD2<Int32>>.size, index: 0)
+                benc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1),
+                                          threadsPerThreadgroup: tg)
+                benc.endEncoding()
+            }
+        }
         cur = next
         maskCur = maskWrite   // 방금 쓴 버퍼가 이제 유효 마스크
         needsReset = false
@@ -215,6 +242,42 @@ public final class UIStaticDetector {
         // Vision 텍스트 박스 부스트 — 일관성이 놓친 흐린 텍스트 라인을 커버 (오프라인 GT +0.002)
         m = max(m, boost.read(gid).r);
         maskOut.write(float4(m * strength), gid);
+    }
+
+    // **마스크 공간 가우시안 블러 (분리형 5탭, σ=2).**
+    //
+    // 왜 필요한가 (2026-08-28, 다중 에이전트 조사에서 실측으로 확정):
+    // clo/chi/alpha는 research/rife/finetune/ui_tune_sweep.py로 스윕해 정한 값인데,
+    // 그 하네스의 ema_mask() 마지막 줄은 `gblur(m, 5, 2)` — **마스크에 블러를 걸고 업샘플한다.**
+    // 배포 셰이더에는 그 블러가 없었다. 그래서 같은 파라미터가 튜닝이 검증한 이득의
+    // 절반만 냈다 (bench_frames 12시퀀스, short=360, 스윕과 동일 GT 프로토콜):
+    //     스윕 하네스(블러 있음)  커버 15.18%  전체 +0.0092  ROI +0.0207
+    //     배포 셰이더(블러 없음)  커버 11.50%  전체 +0.0047  ROI +0.0139
+    //     블러만 추가             커버 11.47%  전체 +0.0084  ROI +0.0201   ← 회수
+    // 결정적으로 **커버리지는 그대로인데 이득이 온다** — 마스크의 '면적'이 아니라
+    // '공간 분포'가 전부였다. 블러가 없으면 마스크가 획 위에만 점점이 서고,
+    // mfWarp의 mix(outc, nearestPix, uim)이 한 글자 안에서 프리즈와 워프를 격자로 섞는다.
+    //
+    // 하이패스 커널(3x3 박스 vs 스윕의 가우시안 σ1.5)도 불일치하지만 **그건 고치지 않는다** —
+    // 같은 실측에서 hp만 맞추면 커버리지는 15%로 복원되는데 이득은 +0.0045/+0.0132로
+    // 오히려 배포본보다 낮았다. 커버리지가 아니라 분포가 레버라는 증거이기도 하다.
+    kernel void uiMaskBlur(texture2d<float, access::read> src [[texture(0)]],
+                           texture2d<float, access::write> dst [[texture(1)]],
+                           constant int2 &axis [[buffer(0)]],
+                           uint2 gid [[thread_position_in_grid]])
+    {
+        uint w = src.get_width(), h = src.get_height();
+        if (gid.x >= w || gid.y >= h) return;
+        // exp(-x²/2σ²), σ=2, 5탭 정규화
+        const float wt[5] = { 0.1525, 0.2219, 0.2514, 0.2219, 0.1525 };
+        float acc = 0.0;
+        for (int k = -2; k <= 2; k++) {
+            int2 q = int2(gid) + axis * k;
+            q.x = clamp(q.x, 0, int(w) - 1);
+            q.y = clamp(q.y, 0, int(h) - 1);
+            acc += src.read(uint2(q)).r * wt[k + 2];
+        }
+        dst.write(float4(acc), gid);
     }
     """
 }

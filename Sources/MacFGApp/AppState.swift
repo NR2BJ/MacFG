@@ -1705,6 +1705,10 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagSkipContentFast = 0
     /// 버스트 판정을 받았지만 여유가 있어 **스킵 대신 한 장으로 구제**된 쌍 수 (fastCap:N)
     @ObservationIgnored nonisolated(unsafe) private var diagFastCapped = 0
+    /// 갭 확장(steps>1)이 원본 도착 간격으로도 뒷받침되는 경우 = 프레임이 실제로 빠졌다
+    @ObservationIgnored nonisolated(unsafe) private var diagGapExpandReal = 0
+    /// 갭 확장이 스냅에서만 나온 경우 = 제때 온 프레임을 PLL이 밀어냈을 가능성
+    @ObservationIgnored nonisolated(unsafe) private var diagGapExpandSnap = 0
     /// 쿼터/상한이 의도적으로 비운 쌍 (정상 동작 — 손실 아님)
     @ObservationIgnored nonisolated(unsafe) private var diagSkipQuota = 0
     /// 어느 생성 경로도 t를 못 낸 쌍 (진짜 손실 — 여기가 0이어야 한다)
@@ -2437,6 +2441,26 @@ public final class AppState {
                     // 실측(4K 디스플레이 캡처): t×3 anchors=3, present 124/240, staleDrop 103.
                     // 그래서 거버너가 개입 중이면 확장을 접고 기본 배율만 만든다.
                     if !gapExpansionAllowed { steps = 1 }
+                    // **갭 확장이 진짜인지 스냅 오판인지 가른다 (2026-08-30 계측).**
+                    //
+                    // 실사용 4K 60fps RIFE에서 생성이 소스(60/s)를 넘어 74~87/s까지 오르고
+                    // 표시가 130/s를 찍는다(사용자 제보 "안 부드러움"). 원인은 여기다:
+                    // 갭이 소스 간격의 2배로 잡히면 steps=2 → count=2*2−1=3장을 만든다.
+                    // 도착 간격 히스토그램의 27ms+ 칸이 11~18%라 산술도 맞는다
+                    // (59쌍 × 15% × +2장 ≈ +18장 → 60+18 = 78, 관측 범위 안).
+                    //
+                    // **문제는 그 갭이 진짜냐다.** 소스 프레임이 실제로 빠졌으면 3장으로 메우는 게
+                    // 옳다(콘텐츠 케이던스 유지). 그냥 늦게 배달된 것을 PLL이 '빠졌다'로 스냅했다면
+                    // 16.7ms 구간에 3장을 넣는 셈이라 콘텐츠 간격이 8.3 → 5.5ms로 좁아진다 —
+                    // 그게 곧 불균일이고 체감 불편의 후보다.
+                    //
+                    // 판별: 원본 **도착** 간격이 확장을 뒷받침하는가. rawGap이 스냅된 갭의
+                    // 70% 이상이면 진짜 늦게 온 것(=프레임이 실제로 없었다), 그보다 훨씬 짧으면
+                    // 제때 왔는데 스냅이 밀어낸 것이다. 후자가 많으면 스냅 쪽을 고쳐야 한다.
+                    if steps > 1 {
+                        let supported = rawGap > 0 && rawGap >= gap * 0.7
+                        if supported { diagGapExpandReal += 1 } else { diagGapExpandSnap += 1 }
+                    }
                     let maxUseful = max(1, Int((interval / displayInterval).rounded()))
                     let m = min(mirrorFrameMultiplier, maxUseful)
                     let count = min(m * Int(steps) - 1, 8)
@@ -3300,6 +3324,9 @@ public final class AppState {
         if diagSkipNoPrev > 0 { skipParts.append("noPrev:\(diagSkipNoPrev)") }
         if diagSkipContentFast > 0 { skipParts.append("fast:\(diagSkipContentFast)") }
         if diagFastCapped > 0 { skipParts.append("fastCap:\(diagFastCapped)") }
+        if diagGapExpandReal + diagGapExpandSnap > 0 {
+            skipParts.append("gapExp:\(diagGapExpandReal)r/\(diagGapExpandSnap)s")
+        }
         if diagSkipQuota > 0 { skipParts.append("quota:\(diagSkipQuota)") }
         if diagSkipNoT > 0 { skipParts.append("noT:\(diagSkipNoT)") }
         if diagSkipBigGap > 0 { skipParts.append("gap:\(diagSkipBigGap)") }
@@ -3345,7 +3372,8 @@ public final class AppState {
         diagSnapMissCount = 0; diagSnapPullableCount = 0; diagSnapPullLagMax = 0
         diagIngestSum = 0; diagIngestSamples = 0; diagIngestMax = 0; diagIngestOver = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
-        diagSkipContentFast = 0; diagFastCapped = 0; diagSkipQuota = 0; diagSkipNoT = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
+        diagSkipContentFast = 0; diagFastCapped = 0
+        diagGapExpandReal = 0; diagGapExpandSnap = 0; diagSkipQuota = 0; diagSkipNoT = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
         diagStaleDropCount = 0; diagCapDropCount = 0; diagLeaseDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
 

@@ -1424,6 +1424,7 @@ public final class AppState {
         lastPresentedTimestamp = 0
         lastPresentedTexture = nil
         lastAcceptedTimestamp = 0
+        stageLock.lock(); shownContentTs = 0; shownWallTs = 0; stageLock.unlock()
         acceptedTsBeforeLast = 0
         lastAcceptedFingerprint = 0
         resetSnapState()
@@ -1702,6 +1703,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagSkipEngineNil = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipNoPrev = 0
     @ObservationIgnored nonisolated(unsafe) private var diagSkipContentFast = 0
+    /// 버스트 판정을 받았지만 여유가 있어 **스킵 대신 한 장으로 구제**된 쌍 수 (fastCap:N)
+    @ObservationIgnored nonisolated(unsafe) private var diagFastCapped = 0
     /// 쿼터/상한이 의도적으로 비운 쌍 (정상 동작 — 손실 아님)
     @ObservationIgnored nonisolated(unsafe) private var diagSkipQuota = 0
     /// 어느 생성 경로도 t를 못 낸 쌍 (진짜 손실 — 여기가 0이어야 한다)
@@ -1742,6 +1745,34 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagGapPrevCPUMax: Double = 0
     // 콘텐츠-시간 간격 (표시 프레임 간 콘텐츠 진행량 ms) — 균일성이 wobble의 직접 지표
     @ObservationIgnored nonisolated(unsafe) private var diagContentIntervals: [Double] = []
+    // **표시 확정 기준 콘텐츠 전진.** presentedHandler(임의 스레드)에서만 갱신 — stageLock 보호.
+    // 인코딩 시점(surface.encode 직후)에 재던 예전 방식은 두 가지를 못 봤다:
+    //   ① 스캔아웃되지 못한 present도 균일한 8.3ms로 집계된다 (미표시는 diagPresentDropped로
+    //      따로 세질 뿐, 콘텐츠 간격 표본에는 8.3이 두 개 들어가 σ가 낙관적으로 나온다)
+    //   ② 그 프레임이 화면에 **얼마나 오래 걸려 있었는지**를 아예 무시한다
+    // ②가 본질이다. 눈이 읽는 양은 "표시 프레임당 콘텐츠 전진"이 아니라 **벽시계 시간당
+    // 콘텐츠 전진**이다 — 홀드가 길어지면 그동안 영상이 그냥 멈춰 있는 것이기 때문이다:
+    //   콘텐츠 8.3ms / 벽시계 6.9ms = 1.20 (정상)
+    //   콘텐츠 8.3ms / 벽시계 27.8ms = 0.30 (모션이 4배 느려짐 = 눈에 보이는 히치)
+    // 실측(2026-08-26): 홀드 ≥3틱이 초당 4.2회인데 content σ에는 한 톨도 안 잡혔다.
+    @ObservationIgnored nonisolated(unsafe) private var shownContentTs: CFTimeInterval = 0
+    @ObservationIgnored nonisolated(unsafe) private var shownWallTs: CFTimeInterval = 0
+    /// 콘텐츠 전진 / 벽시계 전진. 1.0이 정속, <1이면 그 구간 모션이 느려진 것.
+    @ObservationIgnored nonisolated(unsafe) private var diagMotionRates: [Double] = []
+    /// 모션 레이트 분포. 임계값 하나로는 안 된다 — 0.6 임계는 하필 **정상 홀드-2**(8.3/13.9
+    /// = 0.597)와 겹쳐 구조적 동작을 히치로 오인했다(실측 stall 18/창 = 10.8/s, 대부분 정상).
+    /// 칸: <0.5 / 0.5~0.8 / 0.8~1.1 / 1.1~1.4 / ≥1.4.
+    /// 120@144의 구조적 바닥은 0.60(20%)과 1.20(80%) 두 칸에만 몰리는 모양이고,
+    /// 144@144가 되면 1.00 한 칸(가운데)으로 수렴한다. 칸이 퍼지면 그게 진짜 불균일이다.
+    @ObservationIgnored nonisolated(unsafe) private var diagMotionHist = [0, 0, 0, 0, 0]
+    /// **원시 시계열 덤프 (MACFG_TSDUMP=1 → /tmp/MacFG_ts.csv).**
+    /// [SCHED]의 1.7초 평균으로는 1Hz 안팎의 맥놀이를 볼 수 없고(에일리어싱), hold 문자열은
+    /// 마지막 32장(0.27초)뿐이라 주기 추정에 못 쓴다. 사용자 제보 "프레임이 몰렸다 벌어졌다
+    /// 하는 사인파 같은" 것과 최적 주기(p3~p6)가 창마다 옮겨다니는 로그가 모두 맥놀이를
+    /// 가리키므로, 자기상관을 돌릴 수 있는 연속 표본이 필요하다.
+    /// 핸들러(임의 스레드)에서 쌓고 [SCHED] 틱(렌더 스레드)에서 비운다 — stageLock 공유.
+    @ObservationIgnored nonisolated(unsafe) private let tsDumpEnabled = Knob.string("MACFG_TSDUMP") == "1"
+    @ObservationIgnored nonisolated(unsafe) private var diagTsDump: [(Double, Double)] = []
     // 적응형 지연 A/B용 (MACFG_NO_ADAPT=1이면 extraLatencySlots 0 고정 — 회귀 판별)
     private let adaptDisabled = Knob.string("MACFG_NO_ADAPT") != nil
 
@@ -2306,8 +2337,86 @@ public final class AppState {
             // 원본 간격으로 재면 버스트 배달(30fps인데 2프레임이 7ms로 붙는 것)은 여전히
             // 걸러지고, 스냅 실패한 정상 쌍은 살아난다.
             let rawGap = slot.timestamp - prev.rawTimestamp
-            let contentAlreadyFast = (rawGap > 0 ? rawGap : gap) < displayInterval
-            if gap > 0 && gap < 0.25 && !contentAlreadyFast
+            //
+            // **이 게이트의 대가 (2026-08-26 확정, 다중 검증).**
+            // 로그 37창에서 `fast` 카운터는 `dist[0]`(도착 간격 <8ms 칸)과 **정확히 같은 수**였고,
+            // 표시 패턴 문자열의 `SS` 인접쌍 수와도 1:1이었다 (fast=0 구간에선 SS도 정확히 0).
+            // 즉 fast 1회 = 보간이 통째로 빠진 S-S 1회다. 그런데 스냅의 steps 클램프
+            // (`max(1.0, …)`)가 콘텐츠를 반드시 한 간격 전진시키므로, 그 쌍의 콘텐츠 스텝은
+            // 좁은 7ms가 **아니라 16.6ms — 정상 8.3ms의 2배 히치**다. 초당 약 10회.
+            // 회귀로 잰 몫은 content σ 2.40 중 0.2~2.0ms(중앙 1.0~1.5).
+            //
+            // **그런데 이게 전부가 아니다:** fast≈0인 구간에서도 σ가 2.12로 측정됐다. 절반 이상은
+            // 아직 설명되지 않았으므로 이 게이트를 손대는 것만으로 균일성이 해결되지 않는다.
+            //
+            // 판정 기준 자체가 두 오판 사이에 끼어 있다:
+            //   gap(스냅)   — 스냅이 빗나가면 콘텐츠와 무관하게 좁아진다 (711b429가 고친 방향)
+            //   rawGap(도착) — 배달이 뭉치면 진짜 60fps 쌍도 좁아 보인다 (지금 이 대가)
+            // 그래서 A/B 다이얼로 연다. 기본 1 = 현행(rawGap).
+            //   0 = 게이트 해제 (버스트 쌍도 보간 — ANE 부하 +16%, 성능 축 재개 위험)
+            //   1 = 현행: 도착 간격이 좁으면 보간 0장
+            //   2 = 논리곱: 도착과 스냅갭이 **둘 다** 좁을 때만 스킵 (진짜 버스트만 거른다)
+            //   3 = 상한 1장: 스킵 대신 t=[0.5] 한 장만 — 16.6ms 히치를 8.3×2로 가르되
+            //       ANE 과부하 방지 의도(69e7808)는 "쌍당 최대 1장"으로 보존
+            // 검증지표는 fast 카운트가 아니라 **표시 패턴의 SS 수와 motion σ/stall**이다 —
+            // fast는 도착 간격의 동어반복이라 게이트가 고쳐져도 그대로 남는다.
+            //
+            // **기본값은 고정이 아니라 엔진 여유로 정한다 (2026-08-27 실측).**
+            // 같은 게이트가 엔진에 따라 정반대 역할을 한다:
+            //   RIFE 4K      work 26~50ms / wait 13~22ms → ANE 포화. 게이트를 열자
+            //                engFail 1~3/창 → 14~28/창, 미표시 0~5 → 16~46/창,
+            //                생성은 오히려 47 → 45/s로 **감소**. 게이트가 부하 보호였다.
+            //   MetalFlow 4K work  4~6ms / wait  1~2ms  → 유휴. 게이트를 열자
+            //                생성 52 → 60/s, 표시 111 → 119/s, work 4 → 5ms, engFail 0.
+            //                게이트가 순수 손실이었다.
+            // 그래서 "켜냐 끄냐"가 아니라 **여유가 있느냐**가 옳은 질문이다.
+            // **판정은 거버너 신호로 한다 — work으로 하면 안 된다 (2026-08-30 실측으로 정정).**
+            //
+            // 처음엔 `paceWorkP90 < 소스간격`으로 판정했는데 **틀렸다.**
+            // work은 파이프라인 **지연**이지 점유율이 아니고, RIFE는 그 대부분이 ANE 대기다.
+            // 위 348행 주석이 이미 그 분해를 기록해 뒀는데(대기 0.32 vs 16.28, GPU 합은 둘 다
+            // ≈4.5ms) 그걸 안 보고 work을 부하로 읽었다. 결과: 여유가 있는데 없다고 판정해
+            // 초당 7장(RIFE)·3장(AppleFI)의 보간을 버렸다.
+            //
+            // 같은 소스(4K 60fps AV1) 3엔진 A/B, 전환 구간 제외 26~34창:
+            //             게이트(work 판정)        구제(강제)              engFail
+            //   AppleFI   116.6/s sd 4.18  →  **119.7/s sd 0.93**  생성 56.6→59.9   0
+            //   RIFE      113.5/s sd 2.15  →  **121.2/s sd 1.95**  생성 53.7→61.1   0
+            //   MetalFlow 119.9/s sd 0.82 (이미 구제 모드라 변화 없음)
+            // 표시율이 오르면서 **안정성도 같이 좋아졌고**(AppleFI sd 4.18→0.93),
+            // work은 1ms만 올랐다(10.0→10.9, 14.7→15.9). 셋 다 ×2 상한 119.8에 도달.
+            // 실제 점유는 셋 다 절반 미만이었다 — RIFE ANE 42%, MetalFlow 12~22%.
+            //
+            // **판정은 거버너의 t 개수 정책으로 한다.**
+            //
+            // 두 번 틀렸다. ① `paceWorkP90 < 소스간격` — work은 지연이지 점유가 아니다(위 참조).
+            // ② `gapExpansionAllowed` — 이건 두 이유로 부적합했다:
+            //    · `level == .full`만 통과하는데 거버너는 그 자리에 머물지 않는다(GOV 로그가
+            //      800↔640을 계속 오간다)
+            //    · 그리고 `&& srcSpreadMs < 20`이 붙어 있는데, 그건 **배달 지터** 신호다.
+            //      브라우저 버스트 배달은 srcInt [7~28] = 스프레드 21ms라 상시 문턱을 넘는다.
+            //      연산 여유와 아무 상관이 없다.
+            //    실측 결과: 가장 가벼운 MetalFlow(work 4.0ms)에서 게이트가 닫혀
+            //    생성 60.0 → 50.6, 표시 119.9 → 110.2으로 **회귀했다.**
+            //
+            // 옳은 기준: **구제는 정확히 1장을 만든다.** 거버너는 쌍당 몇 장이 괜찮은지를
+            // tCountCap으로 이미 말한다 — .full=제한없음 / .light=2 / .heavy=1 / .bypass=0.
+            // 즉 .heavy에서조차 1장은 정책상 허용이고, 막아야 할 것은 .bypass(0장)뿐이다.
+            // 판정 단위(1장)와 신호 단위(장수)가 정확히 일치하는 유일한 기준이다.
+            // 2026-08-27에 강제 구제가 engFail을 10배로 터뜨렸던 조건(RIFE 사다리 288↔432
+            // 진동, work 26~50ms)에서는 거버너가 내려앉으므로 보호가 유지된다.
+            let fastGuardMode = Knob.int("MACFG_FASTGUARD") ?? ((tCountCap ?? 1) >= 1 ? 3 : 1)
+            let rawFast = (rawGap > 0 ? rawGap : gap) < displayInterval
+            let snapFast = gap < displayInterval
+            let contentAlreadyFast: Bool
+            switch fastGuardMode {
+            case 0: contentAlreadyFast = false
+            case 2: contentAlreadyFast = rawFast && snapFast
+            default: contentAlreadyFast = rawFast   // 1(기본), 3(아래에서 상한으로 처리)
+            }
+            let fastCapOne = fastGuardMode == 3 && rawFast
+            if fastCapOne { diagFastCapped += 1 }
+            if gap > 0 && gap < 0.25 && !(contentAlreadyFast && !fastCapOne)
                 && prev.texture.width == stable.width && prev.texture.height == stable.height
                 && previousAcceptedTs == prev.rawTimestamp {
                 // 보간 위상을 vsync 그리드 시각에 정렬 — 균등분할(t=k/(n+1))은
@@ -2483,6 +2592,11 @@ public final class AppState {
                 // 쿼터가 **의도적으로** 비운 것이면 폴백으로 되살리지 않는다 — 안 그러면
                 // perPair<1 대역(소스가 주사율 절반 초과)에서 쿼터가 무력화돼 과생산이 돌아온다.
                 if tValues.isEmpty && !quotaEmptied && gap > displayInterval * 1.5 { tValues = [0.5] }
+                // 모드 3: 버스트로 판정된 쌍은 **스킵 대신 한 장만**. 16.6ms 히치를 8.3×2로
+                // 가르면서도 ANE 부하 증가는 쌍당 1장(=정상 쌍과 동일)으로 묶인다.
+                if fastCapOne {
+                    tValues = tValues.isEmpty ? [0.5] : [tValues[tValues.count / 2]]
+                }
                 // 거버너 t 상한 — **세 생성 경로 공통**. 경로별로 걸면 Auto 배율(=0)처럼
                 // 다른 분기를 타는 설정에서 그냥 새어나간다(실측: 캡을 첫 분기에만 걸었더니
                 // 강등 후에도 t×5·t×6이 계속 나옴). 균등 간격으로 솎아 케이던스는 보존.
@@ -2724,13 +2838,9 @@ public final class AppState {
         // CAMetalDisplayLink가 배달한 드로어블에 직접 인코딩 — nextDrawable 없음
         surface.encode(texture: entry.texture, into: cb, drawable: drawable)
 
-        // "왔다갔다"의 진짜 지표: 연속 표시 프레임의 콘텐츠-시간 간격 불균일.
-        // 균일 모션이면 매 표시가 콘텐츠를 ~동일량 전진(60→120이면 ~8.3ms). 이게 출렁이면 wobble.
-        // (glass σ는 표시 시각만 봐서 이 문제를 못 잡음 — 표시는 균등한데 콘텐츠가 출렁일 수 있음)
-        if lastPresentedTimestamp > 0 {
-            let cd = (entry.timestamp - lastPresentedTimestamp) * 1000.0
-            if cd > 0 && cd < 100 { diagContentIntervals.append(cd) }
-        }
+        // 콘텐츠 간격/모션 레이트는 여기서 재지 않는다 — 아래 addPresentedHandler(표시 확정)로
+        // 옮겼다. 이유는 shownContentTs 선언부 주석 참조. lastPresentedTimestamp는 **페이싱
+        // 입력**(타임라인 프루닝·후보 필터·재표시)이라 인코딩 시점 갱신을 그대로 둔다.
         lastPresentedTimestamp = entry.timestamp
         lastPresentedTexture = entry.texture
         lastPresentedStamp = entry.stamp
@@ -2743,6 +2853,7 @@ public final class AppState {
         let genRef = renderGen
         let captureTs = entry.captureTimestamp
         let isInterp = entry.isInterpolated
+        let contentTs = entry.timestamp
         let inFlightRef = inFlightPresents
         inFlightRef.withLock { $0 += 1 }
         let slotSec = 1.0 / max(mirrorRefreshRate, 60)
@@ -2761,6 +2872,27 @@ public final class AppState {
                 // (무락이면 렌더 스레드의 [SCHED] 리셋 재할당과 겹쳐 해제된 버퍼에 쓸 수 있다.)
                 self.stageLock.lock()
                 self.diagSlipHist[min(max(slip, 0), 3)] += 1
+                // 표시 확정 기준 콘텐츠 전진 — 핸들러는 임의 스레드에 **순서 보장이 없다**
+                // (드로어블 3개 인플라이트). 뒤집혀 도착한 표본은 음수 간격을 만들므로
+                // 콘텐츠·벽시계가 **둘 다 전진했을 때만** 표본으로 삼고, 상태는 max로 단조 유지한다.
+                if self.shownContentTs > 0, contentTs > self.shownContentTs,
+                   d.presentedTime > self.shownWallTs {
+                    let dContent = contentTs - self.shownContentTs
+                    let dWall = d.presentedTime - self.shownWallTs
+                    let cd = dContent * 1000.0
+                    if cd > 0 && cd < 100 { self.diagContentIntervals.append(cd) }
+                    if dWall > 0 && dWall < 0.1 {
+                        let rate = dContent / dWall
+                        self.diagMotionRates.append(rate)
+                        let b = rate < 0.5 ? 0 : rate < 0.8 ? 1 : rate < 1.1 ? 2 : rate < 1.4 ? 3 : 4
+                        self.diagMotionHist[b] += 1
+                        if self.tsDumpEnabled, self.diagTsDump.count < 8192 {
+                            self.diagTsDump.append((d.presentedTime, contentTs))
+                        }
+                    }
+                }
+                if contentTs > self.shownContentTs { self.shownContentTs = contentTs }
+                if d.presentedTime > self.shownWallTs { self.shownWallTs = d.presentedTime }
                 self.stageLock.unlock()
             }
             mailboxRef.postPresented(gen: genRef, at: d.presentedTime, captureTs: captureTs, isInterp: isInterp)
@@ -2879,22 +3011,49 @@ public final class AppState {
                 }
             }
         } else {
-        for _ in 0..<2 {   // 배수 접기 정련: 각 델타를 최근접 정수배로 나눠 기본 주기 후보로 환원
-            let folded = deltas.compactMap { d -> Double? in
-                let k = (d / candidate).rounded()
-                return k >= 1 ? d / k : nil
+            // **씨앗은 중앙값이 아니라 평균이다 (2026-08-27, 사용자 3회 제보 "소스가 80으로 튄다").**
+            //
+            // SCK 배달은 디스플레이 격자에 양자화된다. 60fps 소스를 144Hz로 받으면 도착 간격이
+            // **2틱(13.9ms)과 3틱(20.8ms) 두 값으로만** 나온다 (패턴 2,2,3,2,3 → 평균 16.67ms
+            // = 정확히 60fps). 이때 중앙값을 씨앗으로 쓰면 접기가 무너진다:
+            //     candidate = 13.9  →  13.9/13.9 = 1.00 → 1슬롯
+            //                          20.8/13.9 = 1.50 → **반올림 2슬롯**
+            //                          (13.9+20.8)/(1+2) = 11.6ms = 86fps
+            // 실측 라벨이 60↔80~87을 오간 것이 정확히 이 값이다. 1.5가 2로 반올림되며 추정치가
+            // 반토막 난다. 평균을 씨앗으로 쓰면 두 델타 모두 1슬롯으로 접혀 16.67ms가 복원된다.
+            //
+            // 이게 라벨만의 문제가 아닌 이유: sourceIntervalEMA는 부족분 쿼터(deficitHz/srcHz),
+            // 적응지연 baseMs, staleCutoff, maxUseful 계산에 모두 쓰인다. 83fps로 오판하면
+            // "주사율에 가까우니 보간이 덜 필요하다"고 계산해 실제로 덜 만든다.
+            //
+            // 평균은 드랍에 약하지만(한 장 빠지면 델타 하나가 2배) 링이 60개라 1.7% 영향이고,
+            // 아래 접기가 그 델타를 2슬롯으로 정규화해 스스로 교정한다. 반대로 중앙값은
+            // 양자화에 **구조적으로** 틀리므로 접기로도 복구되지 않는다.
+            candidate = arrivalMean
+            // **슬롯 세기를 두 번 반복한다. 중앙값 접기 루프는 제거했다.**
+            // 접기는 양자화된 입력에 해롭다: 13.9와 20.8이 둘 다 k=1로 접히면 median이
+            // 다시 짧은 쪽(13.9)으로 돌아가 86fps 오판이 그대로 재생산된다(시뮬레이션 확인).
+            // 슬롯 세기(시간폭÷슬롯수)는 같은 입력에서 정확히 16.66ms를 복원한다.
+            // 첫 회는 드랍으로 부푼 평균을 정규화하고 두 번째가 수렴값이다.
+            //
+            // 검증(시뮬레이션, 60개 델타):
+            //   60fps@144Hz 격자(2,2,3,2,3틱)  현행 72.0fps → 신규 60.0fps
+            //   60fps + 드랍 10%               현행 72.0fps → 신규 59.6fps
+            //   30fps@144Hz 격자(5,5,4,5,5틱)  현행 28.8fps → 신규 30.0fps
+            //   24fps(정확히 6틱) / 지터 없는 60fps  둘 다 불변
+            for _ in 0..<2 {
+                var slotCount = 0.0
+                var slotSpan = 0.0
+                for d in deltas {
+                    let ratio = d / candidate
+                    // **정수 경계에서 애매한 표본은 버린다.** 격자 양자화가 만든 1.5 같은 비율은
+                    // "1슬롯인지 2슬롯인지" 원리적으로 알 수 없고, 반올림하면 추정치가 반토막 난다.
+                    if abs(ratio - ratio.rounded()) > 0.35 { continue }
+                    let k = ratio.rounded()
+                    if k >= 1 { slotCount += k; slotSpan += d }
+                }
+                if slotCount >= 3 { candidate = slotSpan / slotCount }
             }
-            if folded.count >= 3 { candidate = median(folded) }
-        }
-        // 최종 = 시간폭 ÷ (접기로 센 슬롯 수) — 타이머 지터는 합산에서 상쇄(늦음-편향 중앙값의
-        // 과대추정 회피)되고, 중복/드랍 갭은 k=2+로 정규화. 깨끗한 소스에선 기존 시간폭-평균과 일치.
-        var slotCount = 0.0
-        var slotSpan = 0.0
-        for d in deltas {
-            let k = (d / candidate).rounded()
-            if k >= 1 { slotCount += k; slotSpan += d }
-        }
-        if slotCount >= 3 { candidate = slotSpan / slotCount }
         }
         let interval = candidate
         guard interval > 0.002 else {
@@ -3010,6 +3169,7 @@ public final class AppState {
             lastPresentedTexture = nil
             lastPresentedTimestamp = 0
             pairEngine?.reset()
+            stageLock.lock(); shownContentTs = 0; shownWallTs = 0; stageLock.unlock()
         }
 
         var busy = Set<ObjectIdentifier>()
@@ -3041,12 +3201,39 @@ public final class AppState {
                                renderDriver.foreignTickDrops, ingAvg, diagIngestMax, diagIngestOver)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
-        // 콘텐츠 간격 통계 (wobble 지표)
+        // 콘텐츠 간격 + 모션 레이트 통계 (wobble 지표).
+        // 표본은 presentedHandler(임의 스레드)가 쌓으므로 스냅샷/리셋을 stageLock으로 감싼다 —
+        // 무락이면 여기 재할당과 핸들러 append가 겹쳐 해제된 버퍼에 쓴다(diagGpuLateHist와 같은 규약).
+        stageLock.lock()
         let ci = diagContentIntervals
+        let mr = diagMotionRates
+        let mHist = diagMotionHist
+        let tsRows = diagTsDump
+        diagContentIntervals = []
+        diagMotionRates = []
+        diagMotionHist = [0, 0, 0, 0, 0]
+        diagTsDump = []
+        stageLock.unlock()
         let ciAvg = ci.isEmpty ? 0 : ci.reduce(0, +) / Double(ci.count)
         let ciVar = ci.isEmpty ? 0 : ci.map { ($0 - ciAvg) * ($0 - ciAvg) }.reduce(0, +) / Double(ci.count)
-        let ciStats = String(format: "content=%.1f±%.1fms", ciAvg, sqrt(ciVar))
-        diagContentIntervals = []
+        // motion=1.00이 정속. σ가 체감 매끄러움의 1차 지표이고, stall은 정속의 60% 아래로
+        // 느려진 구간 수 = 눈에 보이는 히치 빈도다. content σ는 이걸 전혀 못 잡는다(홀드 무시).
+        let mrAvg = mr.isEmpty ? 0 : mr.reduce(0, +) / Double(mr.count)
+        let mrVar = mr.isEmpty ? 0 : mr.map { ($0 - mrAvg) * ($0 - mrAvg) }.reduce(0, +) / Double(mr.count)
+        if tsDumpEnabled, !tsRows.isEmpty {
+            // wall,content (초). 파일이 없으면 헤더부터.
+            let path = "/tmp/MacFG_ts.csv"
+            let body = tsRows.map { String(format: "%.6f,%.6f", $0.0, $0.1) }.joined(separator: "\n") + "\n"
+            if let h = FileHandle(forWritingAtPath: path) {
+                h.seekToEndOfFile(); h.write(Data(body.utf8)); try? h.close()
+            } else {
+                try? ("wall,content\n" + body).write(toFile: path, atomically: false, encoding: .utf8)
+            }
+        }
+        let mTot = max(1, mHist.reduce(0, +))
+        let mPct = mHist.map { String(format: "%.0f", Double($0) * 100.0 / Double(mTot)) }.joined(separator: "/")
+        let ciStats = String(format: "content=%.1f±%.1fms motion=%.2f±%.2f m[%@]",
+                             ciAvg, sqrt(ciVar), mrAvg, sqrt(mrVar), mPct)
 
         let workLats = mailbox.drainWorkLatencies()
         let avgWork = workLats.isEmpty ? 0 : workLats.reduce(0, +) / Double(workLats.count)
@@ -3112,6 +3299,7 @@ public final class AppState {
         if diagSkipEngineNil > 0 { skipParts.append("noEng:\(diagSkipEngineNil)") }
         if diagSkipNoPrev > 0 { skipParts.append("noPrev:\(diagSkipNoPrev)") }
         if diagSkipContentFast > 0 { skipParts.append("fast:\(diagSkipContentFast)") }
+        if diagFastCapped > 0 { skipParts.append("fastCap:\(diagFastCapped)") }
         if diagSkipQuota > 0 { skipParts.append("quota:\(diagSkipQuota)") }
         if diagSkipNoT > 0 { skipParts.append("noT:\(diagSkipNoT)") }
         if diagSkipBigGap > 0 { skipParts.append("gap:\(diagSkipBigGap)") }
@@ -3157,7 +3345,7 @@ public final class AppState {
         diagSnapMissCount = 0; diagSnapPullableCount = 0; diagSnapPullLagMax = 0
         diagIngestSum = 0; diagIngestSamples = 0; diagIngestMax = 0; diagIngestOver = 0
         diagSkipToggleOff = 0; diagSkipEngineNil = 0; diagSkipNoPrev = 0
-        diagSkipContentFast = 0; diagSkipQuota = 0; diagSkipNoT = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
+        diagSkipContentFast = 0; diagFastCapped = 0; diagSkipQuota = 0; diagSkipNoT = 0; diagSkipBigGap = 0; diagSkipDiscontinuity = 0
         diagSkipEngineFail = 0; diagSkipOther = 0
         diagStaleDropCount = 0; diagCapDropCount = 0; diagLeaseDropCount = 0; diagSkipBackpressure = 0; diagPresentBusy = 0; diagStaleSampleCount = 0
 

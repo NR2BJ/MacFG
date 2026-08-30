@@ -3632,6 +3632,14 @@ public final class AppState {
 
     func updateOverlayPlacement() {
         overlayManager?.setPlacement(selectedOverlayPlacement)
+        // **출력 창이 새로 만들어졌다 — 디스플레이 캡처 중이면 제외 목록을 다시 박는다.**
+        // 안 하면 새 windowID가 필터에 없어 우리 출력을 되먹는다(창 안에 창 무한 중첩).
+        if captureManager.isDisplayCapture, let om = overlayManager {
+            Task { @MainActor in
+                await captureManager.refreshDisplayExclusions(
+                    excludingWindowIDs: om.ownWindowIDs, requiredWindowID: om.outputWindowID)
+            }
+        }
         if isCapturing { attachRenderDriver() }
         // 배치 전환 시 숨김 상태 초기화 (뷰어는 자동 숨김 대상 아님)
         overlayUserHidden = false
@@ -3646,7 +3654,19 @@ public final class AppState {
     private func detectFullscreenAutoViewer() {
         guard isCapturing, !retargetInFlight, captureRegion == nil,
               let om = overlayManager else { return }
-        let isFS = om.sourceIsFullscreen
+        // **캡처 소스 강제 (MACFG_FORCEDISP, 측정용).**
+        //
+        // 2026-08-31 실측이 배치 가설을 죽였다 — 같은 창 캡처에서 커버 104.9/s vs 뷰어 99.1/s로
+        // 뷰어가 오히려 나쁘고, 유일하게 멀쩡한 조합(미표시 0, 표시 122.8)은 **디스플레이 캡처**
+        // 쪽이었다. 즉 축은 배치가 아니라 캡처 소스다. 그런데 disp 팔은 소스가 전체화면
+        // Space에 있는 상태와 묶여 있어 두 변수가 아직 안 갈린다:
+        //   ① 디스플레이 캡처가 창 캡처보다 싸다   ② 전체화면 Space라 합성이 적다
+        // 창모드 소스에 디스플레이 캡처를 붙이면 ②를 고정한 채 ①만 본다.
+        // (updateToDisplayCapture는 captureRect=nil로 화면 전체를 잡는다. 소스 창이
+        //  3755x2130으로 화면의 98%를 채우므로 픽셀 수는 사실상 같아 처리량 비교가 성립한다.)
+        // 1=항상 디스플레이 캡처, 0=항상 창 캡처, 미설정=기존 자동.
+        let forceDisp = Knob.int("MACFG_FORCEDISP")
+        let isFS = forceDisp.map { $0 == 1 } ?? om.sourceIsFullscreen
         // 시간 기반 디바운스 — 매 틱(15~30Hz) 호출되므로 샘플 수로 세면 트래킹 주기에 따라
         // 지연이 달라진다. 전환 애니메이션 중 떨림만 걸러내면 되므로 0.2s면 충분하고,
         // 옛 "0.5s 게이트 × 2샘플 = 1s 이상"보다 체감 전환이 확연히 빠르다.
@@ -3657,6 +3677,8 @@ public final class AppState {
         guard nowFS - fsStableSince >= 0.2 else { return }
         if isFS {
             syncCaptureSourceForFullscreen(true)
+            // 배치 전환은 **실제** 전체화면일 때만 — FORCEDISP는 캡처 소스만 바꾸는 노브다.
+            guard om.sourceIsFullscreen else { return }
             guard selectedOverlayPlacement == .coverSource else { return }
             autoFsViewer = true
             selectedOverlayPlacement = placementPin ?? .viewerWindow
@@ -3878,12 +3900,12 @@ public final class AppState {
                               modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                switch self.placementPin {
-                case .none:          self.placementPin = .coverSource
-                case .coverSource:   self.placementPin = .viewerWindow
-                case .viewerWindow:  self.placementPin = nil
-                }
-                let label = self.placementPin.map { $0 == .coverSource ? "cover(핀)" : "viewer(핀)" } ?? "자동"
+                // **2단계 토글이다 (커버 ↔ 뷰어). 3단계로 두지 말 것.**
+                // 처음엔 '자동'을 끼워 3단계로 만들었는데, 측정하는 사람이 "몇 번 눌러야 하나"를
+                // 세야 했다. A/B는 두 팔뿐이므로 한 번 누르면 반대 팔로 가는 게 맞다.
+                // 핀은 메모리에만 있어 앱을 다시 켜면 자동 파생으로 돌아간다.
+                self.placementPin = (self.placementPin == .coverSource) ? .viewerWindow : .coverSource
+                let label = self.placementPin == .coverSource ? "cover(핀)" : "viewer(핀)"
                 // 핀을 바꿨으면 즉시 반영 — AUTOFS가 잡고 있던 상태도 푼다.
                 self.autoFsViewer = false
                 self.selectedOverlayPlacement = self.placementPin

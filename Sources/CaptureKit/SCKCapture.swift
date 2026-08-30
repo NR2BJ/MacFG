@@ -68,6 +68,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         self.device = device
         self.captureRect = captureRect
         self.isDisplayCapture = false   // 새 스트림은 창 캡처로 시작 (전체 재시작 경로 포함)
+        self.currentDisplayID = nil
 
         // 캡처 가능한 창 목록에서 대상 찾기
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -187,6 +188,28 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     /// 우리 오버레이/뷰어 창은 반드시 제외해야 한다 (안 그러면 자기 출력을 되먹는 무한 거울).
     /// - Parameter requiredWindowID: **반드시** 제외돼야 하는 창(=우리 출력 창). 0이면 검사 생략.
     ///   이게 빠지면 우리 출력을 우리가 다시 캡처해 되먹임 거울이 된다.
+    /// **디스플레이 캡처 중 출력 창이 재생성됐을 때 제외 목록을 다시 박는다.**
+    ///
+    /// 제외 목록은 `updateToDisplayCapture` 시점에 한 번 굳는다. 그 뒤 오버레이 창이
+    /// 재생성되면(배치 전환·리사이즈·화면 이동) **새 windowID가 필터에 없어 우리 출력이
+    /// 캡처에 들어온다** — 잡힌 출력을 다시 그리고 그게 또 잡히는 되먹임이다.
+    /// 실사용 증상(2026-08-31): 창모드에서 배치를 토글하자 창 안에 창이 무한히 겹쳤다.
+    /// isDisplayCapture는 건드리지 않는다 — 모드 전환이 아니라 필터 갱신이다.
+    public func refreshDisplayExclusions(excludingWindowIDs: [CGWindowID],
+                                        requiredWindowID: CGWindowID = 0) async {
+        guard isDisplayCapture, let stream, let displayID = currentDisplayID else { return }
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
+              let display = content.displays.first(where: { $0.displayID == displayID }) else { return }
+        let excluded = content.windows.filter { excludingWindowIDs.contains($0.windowID) }
+        // 출력 창을 못 빼면 **적용하지 않는다** — 옛 필터가 남는 편이 되먹임보다 낫다.
+        if requiredWindowID != 0 && !excluded.contains(where: { $0.windowID == requiredWindowID }) {
+            DiagnosticLog.shared.log("[SCK-DISPLAY] ✗ 제외 갱신 실패 — 출력 창(\(requiredWindowID)) 미포함, 옛 필터 유지")
+            return
+        }
+        try? await stream.updateContentFilter(SCContentFilter(display: display, excludingWindows: excluded))
+        DiagnosticLog.shared.log("[SCK-DISPLAY] 제외 갱신 \(excluded.count)/\(excludingWindowIDs.count)개 (출력 창 \(requiredWindowID))")
+    }
+
     public func updateToDisplayCapture(displayID: CGDirectDisplayID,
                                        excludingWindowIDs: [CGWindowID],
                                        requiredWindowID: CGWindowID = 0) async throws {
@@ -237,6 +260,7 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
         try await stream.updateContentFilter(SCContentFilter(display: display, excludingWindows: excluded))
         try await stream.updateConfiguration(Self.makeConfig(width: w, height: h))
         isDisplayCapture = true
+        currentDisplayID = displayID   // 제외 목록 갱신 때 같은 디스플레이를 다시 찾기 위해
         // **어느 창이 빠졌는지까지 남긴다.**
         // "제외 N/M개"만으로는 빠진 게 설정 창인지 **출력 뷰어**인지 알 수 없는데, 그 차이가
         // 전부다: 출력 창이 안 빠지면 우리 출력을 우리가 다시 캡처해 **되먹임 거울**이 된다.
@@ -257,6 +281,8 @@ public final class SCKCapture: FrameSource, @unchecked Sendable {
     }
 
     /// 디스플레이 캡처 중인지 — 전체화면 이탈 시 창 캡처로 되돌릴지 판단용
+    /// 디스플레이 캡처 중인 화면 — 제외 목록 갱신에 필요
+    private var currentDisplayID: CGDirectDisplayID?
     public private(set) var isDisplayCapture = false
 
     /// 캡처 대상 창을 무중단 교체 — 전체화면/PiP가 새 창을 만들 때 재타깃 (updateContentFilter).

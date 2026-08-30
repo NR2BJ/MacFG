@@ -1536,6 +1536,7 @@ public final class AppState {
     /// 실콘텐츠(브라우저)는 PTS가 [5~99ms]로 튄다. 중앙값 간격 + 앵커 그리드로 락을 유지하고
     /// 이탈 3연속일 때만 재동기 — 즉발 재동기는 그리드 정렬 위상을 흔들어 σ를 키운다 (실측).
     @ObservationIgnored nonisolated(unsafe) private var snapTsRing: [CFTimeInterval] = []
+    @ObservationIgnored nonisolated(unsafe) private var pllDumpCount = 0
     @ObservationIgnored nonisolated(unsafe) private var snapMissStreak = 0
     @ObservationIgnored nonisolated(unsafe) private var snappedLastTimestamp: CFTimeInterval = 0
     /// 격자 원점 — snappedLastTimestamp(반환값, 단조증가)와 분리. 이탈 프레임은 raw로
@@ -2479,7 +2480,20 @@ public final class AppState {
                     // 드롭 → 갭 2배 → 3장 생성 → 4K 워프 3회 + ANE 3회 → work 50-65ms → 더 드롭.
                     // 실측(4K 디스플레이 캡처): t×3 anchors=3, present 124/240, staleDrop 103.
                     // 그래서 거버너가 개입 중이면 확장을 접고 기본 배율만 만든다.
-                    if !gapExpansionAllowed { steps = 1 }
+                    // **갭 확장 자체를 끄는 노브 (MACFG_NOGAPEXP=1). 측정용.**
+                    //
+                    // 2026-08-31 실측: 더 많이 만드는 쪽이 **더 불균일하다.**
+                    //   cover@fs/disp  인코딩 123.3 = 표시 123.3(미표시 0)  motion σ 0.30  content σ 1.80
+                    //   cover/disp     인코딩 137.5 → 표시 129.2            motion σ 0.39  content σ 2.70
+                    // 60fps ×2의 상한은 120인데 137.5를 만들고 있고, 그 초과분이 갭 확장에서 온다
+                    // (steps=2 → count=2*2−1=3장). 138장을 143틱에 밀어넣으니 97% 포화라
+                    // 8.3장이 컴포지터에서 버려지고, 남은 것도 간격이 고르지 않다.
+                    // 사용자 제보("130까지 올라가면서 안 부드럽다")와 정확히 일치한다.
+                    //
+                    // 주의: 소스가 **진짜로** 프레임을 빠뜨렸을 때는 확장이 옳다(구멍이 생긴다).
+                    // 그래서 기본값은 건드리지 않고 A/B로만 판정한다. 판정선은 표시 장수가 아니라
+                    // **motion σ와 content σ**다 — 장수는 줄어도 리듬이 좋아지면 이기는 것이다.
+                    if !gapExpansionAllowed || Knob.int("MACFG_NOGAPEXP") == 1 { steps = 1 }
                     // **갭 확장이 진짜인지 스냅 오판인지 가른다 (2026-08-30 계측).**
                     //
                     // 실사용 4K 60fps RIFE에서 생성이 소스(60/s)를 넘어 74~87/s까지 오르고
@@ -3104,19 +3118,53 @@ public final class AppState {
             //   60fps + 드랍 10%               현행 72.0fps → 신규 59.6fps
             //   30fps@144Hz 격자(5,5,4,5,5틱)  현행 28.8fps → 신규 30.0fps
             //   24fps(정확히 6틱) / 지터 없는 60fps  둘 다 불변
+            // **평균이 기본이고, 명백한 드랍만 접는다 (2026-08-31 정정).**
+            //
+            // 직전 판은 "정수 경계에서 애매한 비율(±0.35 밖)은 버린다"였는데, 실측 링을 찍어보니
+            // 그게 **양 끝을 모두 잘라 추정을 위로 편향**시켰다:
+            //   d=[18.3 9.5 26.0 9.7 17.4 20.4 11.3 17.0 19.0 18.9 18.1 19.7 8.9 27.5 16.8]
+            //   평균 17.23인데 9.5·9.7·8.9(비율 0.52~0.56)와 26.0·27.5(1.51~1.60)가 전부 버려져
+            //   17~20 구간만 남고 **cand 18.39**가 됐다. 짧은 델타와 그걸 상쇄하는 긴 델타는
+            //   같은 지터의 양면인데 둘 다 버리니 가운데만 남는다. 자기강화이기도 하다 —
+            //   후보가 오르면 짧은 쪽이 더 많이 잘린다.
+            //   그 오차가 콘텐츠 시각 배치에 실려 content σ가 win 4.30 / disp 2.50으로 갈렸다
+            //   (사용자 체감: "마우스 폴링레이트 낮은 걸로 화면 돌리는 느낌").
+            //
+            // 가드를 빼기만 하면 반대로 망가진다 — 26.0을 2슬롯으로 접어 15.21ms(65.7fps).
+            // 이 분포에는 깨끗한 배수가 없다. **버릴 게 아니라 접지 않으면 되는 것이었다.**
+            // 접기는 진짜 드랍에만 필요하고 드랍은 평균의 2배 근처로 나타나므로 1.7배를 문턱으로 둔다.
+            //
+            // 시뮬레이션 6케이스 전부 실제값 5% 이내:
+            //   실측 win 링 18.40 → **17.23** (실제 16.67) · 60fps@144격자 16.66(불변)
+            //   60fps+드랍 16.69(불변) · 30fps@144격자 33.32(불변) · 24fps 41.67 · 지터없는 60fps 16.67
             for _ in 0..<2 {
                 var slotCount = 0.0
                 var slotSpan = 0.0
                 for d in deltas {
-                    let ratio = d / candidate
-                    // **정수 경계에서 애매한 표본은 버린다.** 격자 양자화가 만든 1.5 같은 비율은
-                    // "1슬롯인지 2슬롯인지" 원리적으로 알 수 없고, 반올림하면 추정치가 반토막 난다.
-                    if abs(ratio - ratio.rounded()) > 0.35 { continue }
-                    let k = ratio.rounded()
-                    if k >= 1 { slotCount += k; slotSpan += d }
+                    // 평균의 1.7배 미만이면 무조건 1슬롯 — 지터를 배수로 오해하지 않는다.
+                    let k = d >= candidate * 1.7 ? max(1.0, (d / candidate).rounded()) : 1.0
+                    slotCount += k
+                    slotSpan += d
                 }
                 if slotCount >= 3 { candidate = slotSpan / slotCount }
             }
+        }
+        // **추정기 입력·출력 덤프 (MACFG_PLLDUMP=1). 추측을 멈추기 위한 계측.**
+        //
+        // 2026-08-31: 창 캡처에서 초당 59.3장을 수용하는데(→ 평균 간격 16.86ms) 추정치는
+        // 18.2ms(55fps)로 나온다. 링에는 수용 프레임의 raw 도착 시각이 들어가므로
+        // **추정기가 자기 입력의 평균보다 높게 나오는 셈**인데, dist 5칸으로 델타를 복원해
+        // 시뮬레이션한 두 번 모두 16.2~16.3ms가 나와 재현에 실패했다.
+        // 5칸 히스토그램으로는 원본 분포를 못 되살린다 — 실제 델타를 봐야 한다.
+        if Knob.int("MACFG_PLLDUMP") == 1, pllDumpCount < 40 {
+            pllDumpCount += 1
+            var ds: [Double] = []
+            for i in 1..<snapTsRing.count { ds.append((snapTsRing[i] - snapTsRing[i-1]) * 1000) }
+            let mean = ds.isEmpty ? 0 : ds.reduce(0,+) / Double(ds.count)
+            DiagnosticLog.shared.log(String(format: "[PLL] n=%d 평균%.2f 중앙%.2f → cand %.2f (EMA %.2f) burst=%@ d=[%@]",
+                ds.count, mean, ds.isEmpty ? 0 : ds.sorted()[ds.count/2], candidate * 1000,
+                sourceIntervalEMA * 1000, shortCount >= 2 ? "Y" : "N",
+                ds.map { String(format: "%.1f", $0) }.joined(separator: " ")))
         }
         let interval = candidate
         guard interval > 0.002 else {
@@ -3679,6 +3727,11 @@ public final class AppState {
             syncCaptureSourceForFullscreen(true)
             // 배치 전환은 **실제** 전체화면일 때만 — FORCEDISP는 캡처 소스만 바꾸는 노브다.
             guard om.sourceIsFullscreen else { return }
+            // **핀이 있으면 배치를 건드리지 않는다.**
+            // 안 그러면 핀(cover)과 AUTOFS(viewer)가 추적 틱(15~30Hz)마다 서로를 되돌리며
+            // 창을 계속 재생성한다 — 화면이 깜빡이고 [SCK-DISPLAY] 제외 갱신이 300ms에 10번 찍힌다
+            // (실측 2026-08-31). 핀은 측정용이므로 그동안 AUTOFS 배치 전환은 양보한다.
+            guard placementPin == nil else { return }
             guard selectedOverlayPlacement == .coverSource else { return }
             autoFsViewer = true
             selectedOverlayPlacement = placementPin ?? .viewerWindow
@@ -3686,6 +3739,7 @@ public final class AppState {
             DiagnosticLog.shared.log("[AUTOFS] 소스 전체화면 → viewer 자동 전환")
         } else {
             syncCaptureSourceForFullscreen(false)
+            guard placementPin == nil else { return }
             guard autoFsViewer else { return }
             autoFsViewer = false
             selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow

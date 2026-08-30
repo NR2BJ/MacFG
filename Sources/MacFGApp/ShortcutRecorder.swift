@@ -66,7 +66,15 @@ final class RecorderView: NSView {
         if f.contains(.option)  { mods |= UInt32(optionKey) }
         if f.contains(.control) { mods |= UInt32(controlKey) }
         if f.contains(.shift)   { mods |= UInt32(shiftKey) }
-        guard mods != 0 else { NSSound.beep(); return }   // 전역 훅은 모디파이어 필수
+        // **Shift 단독은 거부한다 (2026-08-31).**
+        // Carbon의 RegisterEventHotKey는 ⇧A 같은 조합도 noErr로 받아준다(실측). 그러면 그 키가
+        // **시스템 전역에서 삼켜져** 대문자 A가 안 쳐지고, 그 바인딩은 UserDefaults에 저장돼
+        // 재실행해도 살아난다. 사용자는 'A가 안 쳐진다'와 이 앱을 연결짓기 어렵다.
+        // 기본 바인딩 3개가 전부 ⌃⌥⌘이므로 잃는 것은 Shift 단독뿐이다.
+        // (⌘Q·⌘Tab 같은 시스템 조합은 여기 도달조차 못 한다 — 메뉴/WindowServer가 먼저 가져간다.
+        //  블랙리스트를 두지 않는 이유이고, 중복 조합 거부도 두지 않는다 —
+        //  registerHotKeys의 등록 순서 규칙이 이미 "사용자 조합이 이긴다"로 설계돼 있다.)
+        guard mods & UInt32(controlKey | optionKey | cmdKey) != 0 else { NSSound.beep(); return }
 
         // 문자/숫자 한 글자만 그대로 쓰고, 나머지는 keyName으로. 기존 조건은 && 우선순위 탓에
         // `key.isEmpty || (isLetter==false && count != 1)`로 묶여, 화살표(사설영역 문자 U+F700대)나

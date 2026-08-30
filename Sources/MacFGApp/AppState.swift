@@ -3960,28 +3960,6 @@ public final class AppState {
         //
         // 사용자 지정 바인딩들 **뒤에** 붙인다: HotKeyCenter가 배열 순서대로 등록하고 조합이
         // 겹치면 뒤엣것이 -9878로 실패하므로, 뒤에 둬야 사용자가 지정한 조합이 항상 이긴다.
-        // ⌃⌥⌘P — 배치 핀 순환 (커버 → 뷰어 → 자동). **측정용.**
-        // 2×2(소스 창모드/전체화면 × 배치 커버/뷰어)를 한 실행 안에서 채우려면 재시작 없이
-        // 배치를 바꿔야 한다. 재시작 A/B는 콘텐츠 드리프트로 교란된다(MEMORY 기록).
-        // 사용자 지정 바인딩보다 앞에 두지 않는다 — 아래 ⌃⌥⌘M 주석의 등록 순서 규칙과 같다.
-        bindings.append(.init(id: 10, keyCode: UInt32(kVK_ANSI_P),
-                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                // **2단계 토글이다 (커버 ↔ 뷰어). 3단계로 두지 말 것.**
-                // 처음엔 '자동'을 끼워 3단계로 만들었는데, 측정하는 사람이 "몇 번 눌러야 하나"를
-                // 세야 했다. A/B는 두 팔뿐이므로 한 번 누르면 반대 팔로 가는 게 맞다.
-                // 핀은 메모리에만 있어 앱을 다시 켜면 자동 파생으로 돌아간다.
-                self.placementPin = (self.placementPin == .coverSource) ? .viewerWindow : .coverSource
-                let label = self.placementPin == .coverSource ? "cover(핀)" : "viewer(핀)"
-                // 핀을 바꿨으면 즉시 반영 — AUTOFS가 잡고 있던 상태도 푼다.
-                self.autoFsViewer = false
-                self.selectedOverlayPlacement = self.placementPin
-                    ?? (self.upscaleMode == .off ? .coverSource : .viewerWindow)
-                if self.isCapturing { self.updateOverlayPlacement() }
-                DiagnosticLog.shared.log("[PLACE] 핀 → \(label)")
-            }
-        })
 
         bindings.append(.init(id: 9, keyCode: UInt32(kVK_ANSI_M),
                               modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
@@ -3989,6 +3967,28 @@ public final class AppState {
         })
         // 개발 도구 덤프 단축키 — 개발자 로그 켜진 동안만 등록 (일반 사용자에겐 미노출).
         if devLoggingEnabled {
+            // ⌃⌥⌘P — 배치 핀 순환 (커버 → 뷰어 → 자동). **측정용.**
+            // 2×2(소스 창모드/전체화면 × 배치 커버/뷰어)를 한 실행 안에서 채우려면 재시작 없이
+            // 배치를 바꿔야 한다. 재시작 A/B는 콘텐츠 드리프트로 교란된다(MEMORY 기록).
+            // 사용자 지정 바인딩보다 앞에 두지 않는다 — 아래 ⌃⌥⌘M 주석의 등록 순서 규칙과 같다.
+            bindings.append(.init(id: 10, keyCode: UInt32(kVK_ANSI_P),
+                                  modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    // **2단계 토글이다 (커버 ↔ 뷰어). 3단계로 두지 말 것.**
+                    // 처음엔 '자동'을 끼워 3단계로 만들었는데, 측정하는 사람이 "몇 번 눌러야 하나"를
+                    // 세야 했다. A/B는 두 팔뿐이므로 한 번 누르면 반대 팔로 가는 게 맞다.
+                    // 핀은 메모리에만 있어 앱을 다시 켜면 자동 파생으로 돌아간다.
+                    self.placementPin = (self.placementPin == .coverSource) ? .viewerWindow : .coverSource
+                    let label = self.placementPin == .coverSource ? "cover(핀)" : "viewer(핀)"
+                    // 핀을 바꿨으면 즉시 반영 — AUTOFS가 잡고 있던 상태도 푼다.
+                    self.autoFsViewer = false
+                    self.selectedOverlayPlacement = self.placementPin
+                        ?? (self.upscaleMode == .off ? .coverSource : .viewerWindow)
+                    if self.isCapturing { self.updateOverlayPlacement() }
+                    DiagnosticLog.shared.log("[PLACE] 핀 → \(label)")
+                }
+            })
             bindings.append(.init(id: 5, keyCode: UInt32(kVK_ANSI_D),
                                   modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
                 self?.startFrameDump()   // 실프레임 삼중항 캡처

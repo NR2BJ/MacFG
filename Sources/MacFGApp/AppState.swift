@@ -272,6 +272,21 @@ public final class AppState {
 
     // 전체화면 자동 뷰어: 소스가 전체화면이면 Cover→Viewer 자동(수동 토글 불필요), 창 복귀 시 원복.
     @ObservationIgnored private var autoFsViewer = false
+    /// **배치 핀 — 설정/AUTOFS 파생을 모두 이긴다 (2026-08-30).**
+    ///
+    /// 커버가 뷰어보다 초당 20장을 잃는다는 측정이 **통제되지 않았다**: 뷰어 실측이 AUTOFS
+    /// 경로였던 탓에 배치 말고도 캡처 소스(창→디스플레이), 소스 Space, 빌드(18.5시간 차),
+    /// 소스 도착률(59.5 vs 54.9)까지 같이 달랐다. 게다가 같은 커버 구성에서 무너지지 않은
+    /// 세션도 로그에 있다(tick 143.3 / 미표시 10.2 vs 134.9 / 48.0).
+    /// 배치를 가르려면 **2×2**(소스 창모드/전체화면 × 배치 커버/뷰어)를 한 실행 안에서
+    /// 채워야 하는데, 기존 `s.placement`는 loadSettings에서만 읽히고(재시작 A/B밖에 안 됨)
+    /// stopCapture(:1250)가 autoFsViewer 뒤에 조용히 무시했다.
+    /// 핀은 세 경로(설정 파생, stopCapture 원복, AUTOFS)가 전부 존중하고 ⌃⌥⌘P로 즉시 순환한다.
+    /// nil = 핀 없음(기존 파생 규칙).
+    @ObservationIgnored nonisolated(unsafe) var placementPin: OverlayPlacement?
+    /// 배치 라벨 미러 — [SCHED]는 렌더 스레드에서 찍히므로 MainActor 속성을 직접 못 읽는다.
+    /// 거버너 미러(gapExpansionAllowed/tCountCap)와 같은 규약. 추적 타이머(MainActor)가 갱신한다.
+    @ObservationIgnored nonisolated(unsafe) var placeTagMirror = "?" 
     /// 마지막으로 소스 프레임이 도착한 시각 — 좀비 오버레이(얼어붙은 화면) 판정의 직접 신호.
     @ObservationIgnored nonisolated(unsafe) var lastFrameArrivalAt: CFAbsoluteTime = 0
 
@@ -677,10 +692,9 @@ public final class AppState {
         //   defaults write com.macfg.MacFG s.placement -string viewer
         //   defaults delete com.macfg.MacFG s.placement     ← 파생 규칙으로 복귀
         if let forced = d.string(forKey: "s.placement") {
-            selectedOverlayPlacement = (forced == "viewer" || forced == "beside") ? .viewerWindow : .coverSource
-        } else {
-            selectedOverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+            placementPin = (forced == "viewer" || forced == "beside") ? .viewerWindow : .coverSource
         }
+        selectedOverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
     }
 
     /// 오클루전 방향별 워프 토글 (실험) — 정적 var를 워프가 매 쌍 읽으므로 캡처 중에도 즉시 반영.
@@ -1088,7 +1102,17 @@ public final class AppState {
             // 2026-08-20에 제거됐다. 지금 남은 용도는 소스 창 이동/리사이즈 감지(캡처 재구성)뿐이라
             // 더 낮춰도 될 가능성이 크다 — 다만 낮췄을 때 재구성이 늦어지는지 안 재봤으므로
             // 값은 그대로 둔다. 렌더는 전용 스레드라 메인 CGWindowList 15Hz는 틱에 무해하다.
-            let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
+            // **커버가 뷰어의 2배로 폴링한다 — 커버 모드 프레임 밀림의 용의자다 (2026-08-30).**
+            // 실측(같은 4K 60fps 소스, RIFE):
+            //   뷰어  slip 215/0/0/0 (100% 정시)  미표시 0.6/창
+            //   커버  slip  82/98/0/0 ( 46% 정시)  미표시 **30~40/창** = 초당 20장이 버려진다
+            // 이 타이머가 부르는 updateTracking → pollGeometry → CGWindowListCopyWindowInfo는
+            // 메인 스레드에서 WindowServer로 가는 **동기 왕복**이고, worklog에
+            // r(WindowServer CPU, 미표시) = +0.858이 이미 기록돼 있다.
+            // 다만 커버는 소스 위에 겹쳐 4K 표면 두 장을 합성시키기도 하므로 용의자가 둘이다.
+            // 노브로 가른다 — 15로 낮춰 미표시가 줄면 폴링, 그대로면 합성이다.
+            let coverHz = Knob.double("MACFG_TRACKHZ") ?? 30.0
+            let trackHz: Double = selectedOverlayPlacement == .coverSource ? coverHz : 15.0
             trackingTimer = makeTrackingTimer(hz: trackHz)
 
             // 자동 숨김 기준용 소스 PID + 초기 표시 상태
@@ -1157,7 +1181,17 @@ public final class AppState {
     /// 한다. 안 하면 시작 시점 배치의 주기(cover 30Hz / 뷰어 15Hz)에 영구 고정 (리뷰 확정).
     private func restartTrackingTimer() {
         guard isCapturing else { return }
-        let trackHz: Double = selectedOverlayPlacement == .coverSource ? 30.0 : 15.0
+        // **커버가 뷰어의 2배로 폴링한다 — 커버 모드 프레임 밀림의 용의자다 (2026-08-30).**
+        // 실측(같은 4K 60fps 소스, RIFE):
+        //   뷰어  slip 215/0/0/0 (100% 정시)  미표시 0.6/창
+        //   커버  slip  82/98/0/0 ( 46% 정시)  미표시 **30~40/창** = 초당 20장이 버려진다
+        // 이 타이머가 부르는 updateTracking → pollGeometry → CGWindowListCopyWindowInfo는
+        // 메인 스레드에서 WindowServer로 가는 **동기 왕복**이고, worklog에
+        // r(WindowServer CPU, 미표시) = +0.858이 이미 기록돼 있다.
+        // 다만 커버는 소스 위에 겹쳐 4K 표면 두 장을 합성시키기도 하므로 용의자가 둘이다.
+        // 노브로 가른다 — 15로 낮춰 미표시가 줄면 폴링, 그대로면 합성이다.
+        let coverHz = Knob.double("MACFG_TRACKHZ") ?? 30.0
+        let trackHz: Double = selectedOverlayPlacement == .coverSource ? coverHz : 15.0
         trackingTimer?.invalidate()
         trackingTimer = makeTrackingTimer(hz: trackHz)
     }
@@ -1166,6 +1200,10 @@ public final class AppState {
         addCommonTimer(1.0 / hz) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                // 배치/캡처소스 라벨 미러 갱신 — [SCHED] 한 줄로 2×2를 사후에 가르기 위한 것.
+                self.placeTagMirror = (self.selectedOverlayPlacement == .coverSource ? "cover" : "viewer")
+                    + (self.placementPin != nil ? "!" : "") + (self.autoFsViewer ? "@fs" : "")
+                    + "/" + (self.captureManager.isDisplayCapture ? "disp" : "win")
                 self.overlayManager?.updateTracking()
                 // 창 종료/리사이즈 감지 (렌더 틱에서 이관 — overlayManager는 MainActor)
                 guard self.isCapturing else { return }
@@ -1229,7 +1267,8 @@ public final class AppState {
         // 잘못 시작한다 (리뷰 확정). 사용자 설정(upscaleMode)에서 배치를 다시 유도.
         if autoFsViewer {
             autoFsViewer = false
-            selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
+            // 핀이 있으면 그것이 이긴다 — 없으면 기존대로 사용자 설정에서 재유도.
+            selectedOverlayPlacement = placementPin ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
         }
         fsSample = false
         fsStableSince = 0
@@ -3346,7 +3385,12 @@ public final class AppState {
         let gpuLateSnapshot = diagGpuLateHist
         stageLock.unlock()
         stageLock.lock(); let waitSnapshot = stgWaitEMA; stageLock.unlock()
-        let msg = "[SCHED] src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
+        // **배치와 캡처 소스를 매 창에 찍는다 (2026-08-30).**
+        // 커버/뷰어 A/B가 다섯 변수로 교락됐던 이유 중 둘이 여기에 안 찍혀 있었기 때문이다 —
+        // 배치는 [WIN] 로그에만, 캡처 소스는 [SCK-DISPLAY]에만 나와서 창 단위로 못 맞췄다.
+        // 매 창에 라벨이 있으면 사용자가 아무 순서로 토글해도 사후에 2×2로 가를 수 있다.
+        // (측정 절차를 사람이 정확히 지키게 만들 게 아니라, 지표가 엉성한 입력을 견뎌야 한다.)
+        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -3561,7 +3605,7 @@ public final class AppState {
         // 설정 변경에 검은 화면 번쩍임 + 스케줄러 리셋 2회 + attachRenderDriver 2회.
         // 전체화면 이탈 경로가 살아있는 upscaleMode로 배치를 다시 유도하므로 사용자 선택은 보존된다.
         guard !autoFsViewer else { return }
-        let target: OverlayPlacement = upscaleMode == .off ? .coverSource : .viewerWindow
+        let target: OverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
         guard target != selectedOverlayPlacement else { return }
         selectedOverlayPlacement = target
         if isCapturing { updateOverlayPlacement() }
@@ -3615,7 +3659,7 @@ public final class AppState {
             syncCaptureSourceForFullscreen(true)
             guard selectedOverlayPlacement == .coverSource else { return }
             autoFsViewer = true
-            selectedOverlayPlacement = .viewerWindow
+            selectedOverlayPlacement = placementPin ?? .viewerWindow
             updateOverlayPlacement()
             DiagnosticLog.shared.log("[AUTOFS] 소스 전체화면 → viewer 자동 전환")
         } else {
@@ -3826,6 +3870,29 @@ public final class AppState {
         //
         // 사용자 지정 바인딩들 **뒤에** 붙인다: HotKeyCenter가 배열 순서대로 등록하고 조합이
         // 겹치면 뒤엣것이 -9878로 실패하므로, 뒤에 둬야 사용자가 지정한 조합이 항상 이긴다.
+        // ⌃⌥⌘P — 배치 핀 순환 (커버 → 뷰어 → 자동). **측정용.**
+        // 2×2(소스 창모드/전체화면 × 배치 커버/뷰어)를 한 실행 안에서 채우려면 재시작 없이
+        // 배치를 바꿔야 한다. 재시작 A/B는 콘텐츠 드리프트로 교란된다(MEMORY 기록).
+        // 사용자 지정 바인딩보다 앞에 두지 않는다 — 아래 ⌃⌥⌘M 주석의 등록 순서 규칙과 같다.
+        bindings.append(.init(id: 10, keyCode: UInt32(kVK_ANSI_P),
+                              modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                switch self.placementPin {
+                case .none:          self.placementPin = .coverSource
+                case .coverSource:   self.placementPin = .viewerWindow
+                case .viewerWindow:  self.placementPin = nil
+                }
+                let label = self.placementPin.map { $0 == .coverSource ? "cover(핀)" : "viewer(핀)" } ?? "자동"
+                // 핀을 바꿨으면 즉시 반영 — AUTOFS가 잡고 있던 상태도 푼다.
+                self.autoFsViewer = false
+                self.selectedOverlayPlacement = self.placementPin
+                    ?? (self.upscaleMode == .off ? .coverSource : .viewerWindow)
+                if self.isCapturing { self.updateOverlayPlacement() }
+                DiagnosticLog.shared.log("[PLACE] 핀 → \(label)")
+            }
+        })
+
         bindings.append(.init(id: 9, keyCode: UInt32(kVK_ANSI_M),
                               modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
             self?.openSettingsWindow()

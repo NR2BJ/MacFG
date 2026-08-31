@@ -265,10 +265,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var seedPending = true
 
     private let captureManager = CaptureManager()
-    // U2 전체화면 재타깃: 사용자가 고른 원 창 / 현재 실제 캡처 중인 창(전체화면 시 전환).
-    private var originalCaptureWindowID: CGWindowID = 0
-    private var currentTargetWindowID: CGWindowID = 0
-    private var retargetInFlight = false
+    /// 캡처 소스 전환(창 ↔ 디스플레이)이 진행 중 — 겹쳐 들어오는 전환과 풀 리사이즈를 막는다.
+    private var captureSwitchInFlight = false
 
     // 전체화면 자동 뷰어: 소스가 전체화면이면 Cover→Viewer 자동(수동 토글 불필요), 창 복귀 시 원복.
     @ObservationIgnored private var autoFsViewer = false
@@ -1111,7 +1109,6 @@ public final class AppState {
             statsTimer = addCommonTimer(0.5) { [weak self] _ in
                 Task { @MainActor in
                     self?.updateStats()
-                    self?.detectFullscreenRetarget()
                 }
             }
 
@@ -1136,8 +1133,6 @@ public final class AppState {
 
             // 자동 숨김 기준용 소스 PID + 초기 표시 상태
             sourceOwnerPID = ownerPID(of: windowID)
-        originalCaptureWindowID = windowID
-        currentTargetWindowID = windowID
             overlayUserHidden = false
             overlayHiddenState = false
             isCapturing = true
@@ -1245,7 +1240,7 @@ public final class AppState {
                     self.lastResizeCheck = nowT
                     let headingFullscreen = self.overlayManager?.sourceIsFullscreen ?? false
                     if !headingFullscreen,
-                       !self.isRestartingCapture, !self.retargetInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
+                       !self.isRestartingCapture, !self.captureSwitchInFlight, self.captureRegion == nil, self.stablePoolWidth > 0,
                        let src = self.overlayManager?.sourcePixelSize {
                         // 캡처 배율(MACFG_CAPSCALE)이 걸려 있으면 배달 프레임(=풀)은 소스 픽셀의
                         // 배율 크기다 — 소스 원본과 직접 비교하면 구조적으로 영원히 불일치라서
@@ -3770,7 +3765,7 @@ public final class AppState {
     /// 전체화면 자동 뷰어 — 트래킹 0.5s 폴에서 호출. 2회 연속(=1s) 안정 시에만 1회 전환
     /// (전체화면 전환 애니메이션 중 떨림/썰기 방지). 업스케일로 이미 viewer면 무관.
     private func detectFullscreenAutoViewer() {
-        guard isCapturing, !retargetInFlight, captureRegion == nil,
+        guard isCapturing, !captureSwitchInFlight, captureRegion == nil,
               let om = overlayManager else { return }
         // **캡처 소스 강제 (MACFG_FORCEDISP, 측정용).**
         //
@@ -3826,12 +3821,12 @@ public final class AppState {
     /// 여백으로 드러난다. 전체화면이면 소스가 화면 전체를 차지하므로 디스플레이를 캡처해
     /// **합성 결과 그대로** 가져온다 (추정 크롭 없이 보이는 대로).
     private func syncCaptureSourceForFullscreen(_ fullscreen: Bool) {
-        guard isCapturing, !isRestartingCapture, !retargetInFlight, captureRegion == nil else { return }
+        guard isCapturing, !isRestartingCapture, !captureSwitchInFlight, captureRegion == nil else { return }
         guard captureManager.isDisplayCapture != fullscreen else { return }   // 이미 원하는 모드
         guard let om = overlayManager else { return }
-        retargetInFlight = true
+        captureSwitchInFlight = true
         Task { @MainActor in
-            defer { retargetInFlight = false }
+            defer { captureSwitchInFlight = false }
             do {
                 if fullscreen {
                     guard let scr = om.sourceScreen,
@@ -3906,48 +3901,6 @@ public final class AppState {
         }
     }
 
-
-    /// U2 전체화면/PiP 재타깃: 소스 앱(PID)의 온스크린 창 중 디스플레이를 거의 덮는(≥92%)
-    /// 전체화면 창이 새로 나타나면 그리로 무중단 재타깃, 사라지면 원 창 복귀. YouTube 등 HTML5
-    /// 전체화면이 새 창을 만들어 원 창엔 검정+썸네일만 남는 문제 대응. statsTimer(0.5s)에서 호출.
-    /// **MACFG_RETARGET=1일 때만 동작하는 opt-in이다** (기본 OFF). 예전 주석은 "MACFG_NO_RETARGET로
-    /// 비활성"이라 적혀 있었는데 그런 노브는 존재한 적이 없고 극성도 반대였다 — 아래 guard 참조.
-    /// 영역캡처 중엔 비활성(크롭이 원 창 기준이라).
-    private func detectFullscreenRetarget() {
-        // MACFG_RETARGET=1일 때만 동작 (기본 OFF — 일반 캡처에서 PiP/잔재 창 오탐으로 회귀).
-        // 소스 앱이 만든 전체화면 창(f키 플레이어 전체화면)을 전 화면 후보에서 추적해 재타깃.
-        guard Knob.string("MACFG_RETARGET") != nil,
-              isCapturing, !retargetInFlight, captureRegion == nil,
-              sourceOwnerPID > 0, originalCaptureWindowID > 0 else { return }
-        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return }
-        let regions: [CGRect] = NSScreen.screens.map(\.frame)
-        var fullscreenWID: CGWindowID = 0
-        for info in list {
-            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == sourceOwnerPID,
-                  let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer < 24,
-                  let wid = info[kCGWindowNumber as String] as? CGWindowID, wid != originalCaptureWindowID,
-                  let b = info[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
-            let wf = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
-            if regions.contains(where: { wf.width >= $0.width * 0.92 && wf.height >= $0.height * 0.92 && $0.contains(CGPoint(x: wf.midX, y: wf.midY)) }) {
-                fullscreenWID = wid; break
-            }
-        }
-        let desired = fullscreenWID != 0 ? fullscreenWID : originalCaptureWindowID
-        guard desired != currentTargetWindowID else { return }
-        retargetInFlight = true
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                try await self.captureManager.updateTargetWindow(windowID: desired)
-                self.currentTargetWindowID = desired
-                DiagnosticLog.shared.log("[RETARGET] \(desired == self.originalCaptureWindowID ? "원창 복귀 " : "전체화면 전환 ")wid=\(desired)")
-            } catch {
-                DiagnosticLog.shared.log("[RETARGET] 실패 wid=\(desired): \(error)")
-            }
-            self.retargetInFlight = false
-        }
-    }
 
     /// 현재 최전면 앱의 '가장 위(z-order)' 일반 창 (MacFG 제외). ⌃⌥⌘U 원샷 캡처용.
     /// 목록은 앞→뒤 순서라 첫 유효 창 = 최상단. PiP는 항상-위 창이라 최대화 브라우저보다 위에

@@ -72,12 +72,6 @@ public final class CaptureManager: Sendable {
         try await sckCapture.updateConfiguration(width: width, height: height)
     }
 
-    /// 캡처 대상 창 무중단 교체 (SCK 전용). 전체화면/PiP 새 창 재타깃 (U2).
-    public func updateTargetWindow(windowID: CGWindowID) async throws {
-        guard _activeMethod == .screenCaptureKit else { throw CaptureError.notCapturing }
-        try await sckCapture.updateTargetWindow(windowID: windowID)
-    }
-
     /// 디스플레이 캡처로 무중단 전환 (SCK 전용) — 소스가 자체 Space 전체화면일 때.
     /// 디스플레이 캡처 중 출력 창이 재생성됐을 때 제외 목록 갱신 (되먹임 방지) — 상세는 SCKCapture 참조.
     public func refreshDisplayExclusions(excludingWindowIDs: [CGWindowID], requiredWindowID: CGWindowID = 0) async {

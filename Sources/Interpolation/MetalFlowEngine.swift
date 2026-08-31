@@ -270,6 +270,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 하단: flow raw(예리, 디테일↑). 상단: flow 박스+워프블러(에러 완만, AppleFI 느낌).
         let sm = min(max(Self.motionSmoothness, 0), 1)
         var smoothAmt: Float = min(sm * 2, 1)                       // flow 박스스무딩: 0→raw, 0.5→full, 1→full
+        // **상반부(0.5~1.0)는 측정상 무효다 (2026-08-31 실측). 죽은 코드는 아니다.**
+        // flowBlur는 셰이더까지 제대로 연결돼 flow 필드를 실제로 블러한다(아래 mfWarp 참조).
+        // 그런데 smoothAmt가 이미 0.5에서 포화(min(sm*2,1))라 flow가 완전 평활 상태이고,
+        // 거기 블러를 더해도 결과가 안 바뀐다:
+        //   sm 0.0 → 0.5 : med PSNR +3.36dB (하반부는 크게 작동)
+        //   sm 0.5 → 1.0 : **+0.01dB**, sharp는 소수점 3자리까지 동일 (2시퀀스 확인)
+        // 매핑을 0~1로 펴면 해상도는 좋아지지만 저장된 값의 의미가 바뀌어 마이그레이션이 필요하고
+        // 얻는 것이 슬라이더 눈금뿐이라 **의도적으로 두었다.** 다시 재보지 말 것.
         let flowBlur: Float = max((sm - 0.5) * 2, 0)               // 워프 flow 블러: 0(≤0.5)→1(=1.0)
         // 경계 폴백 폭 = boundarySoftness 슬라이더 (별도 축). crisp(0)=±0.03(거의 단일프레임=저더),
         // 0.5=±0.16(= v1.0.4 기본 동작), soft(1)=±0.29(넓은 블렌드=부드럽지만 고스팅). 콘텐츠 취향.

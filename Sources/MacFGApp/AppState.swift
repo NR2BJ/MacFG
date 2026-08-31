@@ -284,32 +284,6 @@ public final class AppState {
     /// 핀은 세 경로(설정 파생, stopCapture 원복, AUTOFS)가 전부 존중하고 ⌃⌥⌘P로 즉시 순환한다.
     /// nil = 핀 없음(기존 파생 규칙).
     @ObservationIgnored nonisolated(unsafe) var placementPin: OverlayPlacement?
-
-    /// **사용자 배치 선호 (0=자동, 1=커버, 2=뷰어). 측정용 placementPin과 별개다.**
-    ///
-    /// 지금까지 배치는 upscale 모드에서만 파생돼(off=커버, 그 외=뷰어) 사용자가 고를 수 없었다.
-    /// 업스케일을 끄면 커버에 갇히는데, 커버는 단일 모니터에서 소스 위 다른 창을 가리고
-    /// 창모드에서 표시가 20장/s 적다(2026-08-31 실측). 선택지를 준다.
-    ///
-    /// **전체화면 안전장치(AUTOFS)는 이 선호를 이긴다.** 소스가 자기 Space로 전체화면이 되면
-    /// 커버 창은 그 위에 못 올라가 화면이 깨진다(실사용 확인). 그때는 선호와 무관하게 뷰어로 간다.
-    /// 반면 placementPin은 측정 도구라 AUTOFS까지 무시한다 — 그래서 둘을 갈라 둔다.
-    var placementChoice: Int = 0 {
-        didSet {
-            guard placementChoice != oldValue else { return }
-            UserDefaults.standard.set(["auto", "cover", "viewer"][max(0, min(2, placementChoice))],
-                                      forKey: "s.placement")
-            autoSelectPlacementForUpscale()
-        }
-    }
-    /// 선호가 지정한 배치 (자동이면 nil → upscale 파생)
-    private var preferredPlacement: OverlayPlacement? {
-        switch placementChoice {
-        case 1: return .coverSource
-        case 2: return .viewerWindow
-        default: return nil
-        }
-    }
     /// 배치 라벨 미러 — [SCHED]는 렌더 스레드에서 찍히므로 MainActor 속성을 직접 못 읽는다.
     /// 거버너 미러(gapExpansionAllowed/tCountCap)와 같은 규약. 추적 타이머(MainActor)가 갱신한다.
     @ObservationIgnored nonisolated(unsafe) var placeTagMirror = "?" 
@@ -732,13 +706,10 @@ public final class AppState {
         // (마우스 진입 시 프레임 드랍 제보)를 시험할 수 없었다.
         //   defaults write com.macfg.MacFG s.placement -string viewer
         //   defaults delete com.macfg.MacFG s.placement     ← 파생 규칙으로 복귀
-        switch d.string(forKey: "s.placement") {
-        case "cover":                placementChoice = 1
-        case "viewer", "beside":     placementChoice = 2
-        default:                     placementChoice = 0
+        if let forced = d.string(forKey: "s.placement") {
+            placementPin = (forced == "viewer" || forced == "beside") ? .viewerWindow : .coverSource
         }
-        selectedOverlayPlacement = placementPin ?? preferredPlacement
-            ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
+        selectedOverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
     }
 
     /// 오클루전 방향별 워프 토글 (실험) — 정적 var를 워프가 매 쌍 읽으므로 캡처 중에도 즉시 반영.
@@ -1312,8 +1283,7 @@ public final class AppState {
         if autoFsViewer {
             autoFsViewer = false
             // 핀이 있으면 그것이 이긴다 — 없으면 기존대로 사용자 설정에서 재유도.
-            selectedOverlayPlacement = placementPin ?? preferredPlacement
-                ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
+            selectedOverlayPlacement = placementPin ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
         }
         fsSample = false
         fsStableSince = 0
@@ -3719,8 +3689,7 @@ public final class AppState {
         // 설정 변경에 검은 화면 번쩍임 + 스케줄러 리셋 2회 + attachRenderDriver 2회.
         // 전체화면 이탈 경로가 살아있는 upscaleMode로 배치를 다시 유도하므로 사용자 선택은 보존된다.
         guard !autoFsViewer else { return }
-        let target: OverlayPlacement = placementPin ?? preferredPlacement
-            ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
+        let target: OverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
         guard target != selectedOverlayPlacement else { return }
         selectedOverlayPlacement = target
         if isCapturing { updateOverlayPlacement() }

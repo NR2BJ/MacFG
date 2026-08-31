@@ -524,6 +524,10 @@ public final class AppState {
     /// 무조건 "너무 빠름"으로 걸려 보간이 통째로 버려진다(Codex 지적, 2026-08-30 실측 확인).
     /// 링크 콜백 간격 중 스킵이 아닌 것만 모아 EMA로 추정한다. 공칭 대비 ±2% 밖이면 무시한다.
     @ObservationIgnored nonisolated(unsafe) private var measuredTickEMA: Double = 0
+    /// **달성 틱 레이트 (Hz) — 놓친 콜백까지 포함한 실제 표시 슬롯 수.**
+    /// 패널 주사율과 다르다: 창모드에서 패널은 144.048인데 달성은 ~139다(콜백 유실).
+    /// [SCHED]가 240틱마다 계산하는 값을 미러링한다.
+    @ObservationIgnored nonisolated(unsafe) private var achievedTickHz: Double = 0
     /// 표시 슬롯 계산에 쓸 주기 — 실측이 잡히면 그것, 아니면 공칭.
     nonisolated var effectiveDisplayInterval: Double {
         let nominal = 1.0 / max(mirrorRefreshRate, 30)
@@ -2642,8 +2646,37 @@ public final class AppState {
                 if !tValues.isEmpty, displayInterval > 0 {
                     let iv = sourceIntervalEMA > 0 ? sourceIntervalEMA : gap
                     let srcHz = iv > 0 ? 1.0 / iv : 0
-                    let refreshHz = 1.0 / displayInterval
-                    let deficitHz = max(0, refreshHz - srcHz)
+                    // **목표를 패널 주사율로 잡을 것인가, 달성 틱으로 잡을 것인가 (MACFG_QUOTATICK=1).**
+                    //
+                    // 기본은 패널(1/displayInterval)이다. 그런데 창모드에서는 패널이 144.048인데
+                    // 달성 틱이 ~139로 떨어진다(콜백 유실, r(미표시,gap)=+0.824). 그 상태에서
+                    // 144어치를 목표로 잡으면 **달성 못 할 양을 만들어 초당 20장을 버린다** —
+                    // 실측: 창모드 인코딩 124/s → 표시 104/s. GPU도 쓰고 리듬도 깨지는 이중 손해다.
+                    // 사용자 제보와 일치한다("창모드 커버는 과생성이 심하다").
+                    //
+                    // 다만 이건 되먹임이다: 덜 만들면 틱이 회복되고, 그러면 목표가 다시 올라
+                    // 진동할 수 있다. 이 저장소는 페이싱 컨트롤러로 여러 번 졌다(paceAdaptive 무효).
+                    // 그래서 **기본값을 바꾸지 않고 노브로 재본다.** 판정선은 표시 장수가 아니라
+                    // 미표시와 motion σ다 — 만드는 양이 줄어도 버리는 게 없어지면 이기는 것이다.
+                    let panelHz = 1.0 / displayInterval
+                    let refreshHz = (Knob.int("MACFG_QUOTATICK") == 1 && achievedTickHz > 30)
+                        ? min(panelHz, achievedTickHz) : panelHz
+                    // **배율을 명시했으면 그 배율이 목표다. 주사율을 채우는 게 아니다.**
+                    //
+                    // 여기는 원래 `refreshHz - srcHz`였다 — 60fps@144면 84장, 쌍당 1.4장이다.
+                    // 그건 **Auto(주사율 채우기) 규칙**인데 배율을 2로 지정해도 그대로 적용됐다.
+                    // 그래서 갭 확장이 한 쌍에 3장을 만들어도 쿼터가 막지 않았고, 사용자가
+                    // 60fps에 ×2(=120)를 걸어놨는데 실제로는 130~140이 나왔다.
+                    // 지표(content σ 1.25)로는 좋아 보였지만 그건 답이 아니다 —
+                    // **요청하지 않은 20장을 GPU/ANE로 만드는 것은 낭비이고 설정 무시다.**
+                    //
+                    // 배율 M이면 쌍당 M−1장, 즉 초당 (M−1)×srcHz가 목표다.
+                    // 갭 확장 자체는 남긴다(진짜 구멍을 메우는 건 옳다) — 다만 크레딧이
+                    // 총량을 잡으므로, 한 쌍이 3장을 쓰면 이후 쌍들이 0장이 되어 평균이 맞는다.
+                    let quotaHz = mirrorFrameMultiplier >= 2
+                        ? Double(mirrorFrameMultiplier - 1) * srcHz
+                        : max(0, refreshHz - srcHz)
+                    let deficitHz = min(quotaHz, max(0, refreshHz - srcHz))
                     let perPair = srcHz > 0 ? deficitHz / srcHz : Double(tValues.count)
                     // **쿼터는 정수가 아니라 크레딧으로 준다.**
                     //
@@ -3338,6 +3371,7 @@ public final class AppState {
         let nowWall = CFAbsoluteTimeGetCurrent()
         let wallSpan = diagLastLogWall > 0 ? nowWall - diagLastLogWall : 0
         let tickHz = wallSpan > 0 ? 240.0 / wallSpan : 0
+        if tickHz > 30 { achievedTickHz = achievedTickHz > 0 ? achievedTickHz * 0.7 + tickHz * 0.3 : tickHz }
         lastTickHz = tickHz   // 거버너 신호용 (다음 창에서 읽음)
         diagLastLogWallSpan = wallSpan
         diagLastLogWall = nowWall

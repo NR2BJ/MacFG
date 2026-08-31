@@ -246,6 +246,21 @@ struct WindowPickerView: View {
                 }
             }
 
+            field(L("Placement", "배치", "配置"),
+                  hint: L("Where the interpolated output appears.",
+                          "보간 출력이 어디에 뜨는지.",
+                          "補間出力がどこに出るか。"),
+                  detail: L("Auto — cover when upscaling is off, viewer window otherwise.\n\nCover — overlays the source window in place. On a single monitor it hides whatever is behind it, and in window mode it shows about 20 fewer frames a second than viewer.\n\nViewer — a separate window.\n\nA source that goes fullscreen always uses the viewer: a cover window cannot sit on top of another Space.",
+                            "자동 — 업스케일이 꺼져 있으면 커버, 아니면 뷰어 창.\n\n커버 — 소스 창 위에 그대로 덮는다. 단일 모니터에선 뒤의 창을 가리고, 창모드에선 뷰어보다 초당 20장쯤 적게 표시된다.\n\n뷰어 — 별도 창.\n\n소스가 전체화면이 되면 항상 뷰어를 쓴다 — 커버 창은 다른 Space 위에 못 올라간다.",
+                            "自動 — アップスケールがオフならカバー、それ以外はビューア。\n\nカバー — ソース窓の上に直接重ねる。単一モニタでは背後を隠し、ウィンドウモードではビューアより毎秒20枚ほど少ない。\n\nビューア — 別窓。\n\nソースが全画面になると常にビューアを使う。")) {
+                Picker("", selection: $appState.placementChoice) {
+                    Text(L("Auto", "자동", "自動")).tag(0)
+                    Text(L("Cover", "커버", "カバー")).tag(1)
+                    Text(L("Viewer", "뷰어", "ビューア")).tag(2)
+                }
+                .labelsHidden().pickerStyle(.segmented)
+            }
+
             field(L("Source", "소스", "ソース"),
                   hint: L("Resize the source to a clean native resolution first.",
                           "소스를 깔끔한 네이티브 해상도로 먼저 리사이즈.",

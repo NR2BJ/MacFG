@@ -284,6 +284,32 @@ public final class AppState {
     /// 핀은 세 경로(설정 파생, stopCapture 원복, AUTOFS)가 전부 존중하고 ⌃⌥⌘P로 즉시 순환한다.
     /// nil = 핀 없음(기존 파생 규칙).
     @ObservationIgnored nonisolated(unsafe) var placementPin: OverlayPlacement?
+
+    /// **사용자 배치 선호 (0=자동, 1=커버, 2=뷰어). 측정용 placementPin과 별개다.**
+    ///
+    /// 지금까지 배치는 upscale 모드에서만 파생돼(off=커버, 그 외=뷰어) 사용자가 고를 수 없었다.
+    /// 업스케일을 끄면 커버에 갇히는데, 커버는 단일 모니터에서 소스 위 다른 창을 가리고
+    /// 창모드에서 표시가 20장/s 적다(2026-08-31 실측). 선택지를 준다.
+    ///
+    /// **전체화면 안전장치(AUTOFS)는 이 선호를 이긴다.** 소스가 자기 Space로 전체화면이 되면
+    /// 커버 창은 그 위에 못 올라가 화면이 깨진다(실사용 확인). 그때는 선호와 무관하게 뷰어로 간다.
+    /// 반면 placementPin은 측정 도구라 AUTOFS까지 무시한다 — 그래서 둘을 갈라 둔다.
+    var placementChoice: Int = 0 {
+        didSet {
+            guard placementChoice != oldValue else { return }
+            UserDefaults.standard.set(["auto", "cover", "viewer"][max(0, min(2, placementChoice))],
+                                      forKey: "s.placement")
+            autoSelectPlacementForUpscale()
+        }
+    }
+    /// 선호가 지정한 배치 (자동이면 nil → upscale 파생)
+    private var preferredPlacement: OverlayPlacement? {
+        switch placementChoice {
+        case 1: return .coverSource
+        case 2: return .viewerWindow
+        default: return nil
+        }
+    }
     /// 배치 라벨 미러 — [SCHED]는 렌더 스레드에서 찍히므로 MainActor 속성을 직접 못 읽는다.
     /// 거버너 미러(gapExpansionAllowed/tCountCap)와 같은 규약. 추적 타이머(MainActor)가 갱신한다.
     @ObservationIgnored nonisolated(unsafe) var placeTagMirror = "?" 
@@ -516,6 +542,21 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var isCapturingMirror = false
     @ObservationIgnored nonisolated(unsafe) private var mirrorFrameMultiplier = 0
     @ObservationIgnored nonisolated(unsafe) private var mirrorRefreshRate: Double = 120
+    /// **실측 패널 주기 (초). 공칭 1/maximumFramesPerSecond가 아니다.**
+    ///
+    /// `maximumFramesPerSecond`는 정수라 144를 주지만 실측 패널은 **144.0477Hz**다
+    /// (틱 6.9421ms vs 공칭 6.9444ms). 그 2.3µs 차이가 `fast` 게이트에서 부호를 가른다 —
+    /// 문턱이 실제 틱보다 **항상 크므로**, 디스플레이 한 틱 간격으로 배달된 진짜 쌍이
+    /// 무조건 "너무 빠름"으로 걸려 보간이 통째로 버려진다(Codex 지적, 2026-08-30 실측 확인).
+    /// 링크 콜백 간격 중 스킵이 아닌 것만 모아 EMA로 추정한다. 공칭 대비 ±2% 밖이면 무시한다.
+    @ObservationIgnored nonisolated(unsafe) private var measuredTickEMA: Double = 0
+    /// 표시 슬롯 계산에 쓸 주기 — 실측이 잡히면 그것, 아니면 공칭.
+    nonisolated var effectiveDisplayInterval: Double {
+        let nominal = 1.0 / max(mirrorRefreshRate, 30)
+        guard measuredTickEMA > 0 else { return nominal }
+        let r = measuredTickEMA / nominal
+        return (r > 0.98 && r < 1.02) ? measuredTickEMA : nominal
+    }
     /// 숨김→표시 전이 시 렌더 스레드가 자기 틱에서 스케줄러/엔진을 리셋하게 하는 신호
     @ObservationIgnored nonisolated(unsafe) private var pendingShowReset = false
     /// 캡처 색공간의 렌더→메인 전파 중복 방지
@@ -691,10 +732,13 @@ public final class AppState {
         // (마우스 진입 시 프레임 드랍 제보)를 시험할 수 없었다.
         //   defaults write com.macfg.MacFG s.placement -string viewer
         //   defaults delete com.macfg.MacFG s.placement     ← 파생 규칙으로 복귀
-        if let forced = d.string(forKey: "s.placement") {
-            placementPin = (forced == "viewer" || forced == "beside") ? .viewerWindow : .coverSource
+        switch d.string(forKey: "s.placement") {
+        case "cover":                placementChoice = 1
+        case "viewer", "beside":     placementChoice = 2
+        default:                     placementChoice = 0
         }
-        selectedOverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
+        selectedOverlayPlacement = placementPin ?? preferredPlacement
+            ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
     }
 
     /// 오클루전 방향별 워프 토글 (실험) — 정적 var를 워프가 매 쌍 읽으므로 캡처 중에도 즉시 반영.
@@ -1268,7 +1312,8 @@ public final class AppState {
         if autoFsViewer {
             autoFsViewer = false
             // 핀이 있으면 그것이 이긴다 — 없으면 기존대로 사용자 설정에서 재유도.
-            selectedOverlayPlacement = placementPin ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
+            selectedOverlayPlacement = placementPin ?? preferredPlacement
+                ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
         }
         fsSample = false
         fsStableSince = 0
@@ -1848,6 +1893,12 @@ public final class AppState {
             if dt > 1.4 / max(mirrorRefreshRate, 60) {
                 diagTickGaps += 1
                 if diagPrevTickCPU > diagGapPrevCPUMax { diagGapPrevCPUMax = diagPrevTickCPU }
+            } else {
+                // 스킵이 아닌 간격 = 진짜 패널 주기. 공칭 근방만 받아 EMA로 다듬는다.
+                let nominal = 1.0 / max(mirrorRefreshRate, 30)
+                if dt > nominal * 0.9 && dt < nominal * 1.1 {
+                    measuredTickEMA = measuredTickEMA > 0 ? measuredTickEMA * 0.99 + dt * 0.01 : dt
+                }
             }
         }
         diagLastTickTs = timestamp
@@ -2366,7 +2417,8 @@ public final class AppState {
         let wantInterpolation = mirrorInterpolationEnabled && pairEngine != nil
         if wantInterpolation, let prev = prevStable {
             let gap = snappedTs - prev.timestamp
-            let displayInterval = 1.0 / max(refreshRate, 30)
+            // 공칭(1/144)이 아니라 **실측 주기**를 쓴다 — effectiveDisplayInterval 주석 참조.
+            let displayInterval = effectiveDisplayInterval
             // 갭이 디스플레이 한 프레임보다 작으면 그 사이에 표시 슬롯이 없어 보간 무의미 —
             // 게다가 브라우저 버스트 배달(30fps인데 2프레임이 7ms로 붙어 옴)에서 이 퇴화 쌍을
             // 억지로 보간하면 ANE 과부하로 engFail·아티팩트가 난다(실측). 슬롯 없는 갭은 스킵해도
@@ -3321,8 +3373,8 @@ public final class AppState {
         diagLastLogWall = nowWall
         let tickCPUAvg = diagTickCPUSum / 240.0
         let ingAvg = diagIngestSamples > 0 ? diagIngestSum / Double(diagIngestSamples) : 0
-        let tickStats = String(format: "tick=%.1fHz cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) foreign=%llu ing=%.2f/%.1fms ingOver=%d",
-                               tickHz, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax,
+        let tickStats = String(format: "tick=%.1fHz(패널%.3f) cpu=%.1f/%.1fms over=%d gap=%d(pre%.1f) foreign=%llu ing=%.2f/%.1fms ingOver=%d",
+                               tickHz, measuredTickEMA > 0 ? 1.0 / measuredTickEMA : mirrorRefreshRate, tickCPUAvg, diagTickCPUMax, diagTickOverruns, diagTickGaps, diagGapPrevCPUMax,
                                renderDriver.foreignTickDrops, ingAvg, diagIngestMax, diagIngestOver)
         diagTickCPUSum = 0; diagTickCPUMax = 0; diagTickOverruns = 0
         diagTickGaps = 0; diagGapPrevCPUMax = 0
@@ -3667,7 +3719,8 @@ public final class AppState {
         // 설정 변경에 검은 화면 번쩍임 + 스케줄러 리셋 2회 + attachRenderDriver 2회.
         // 전체화면 이탈 경로가 살아있는 upscaleMode로 배치를 다시 유도하므로 사용자 선택은 보존된다.
         guard !autoFsViewer else { return }
-        let target: OverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
+        let target: OverlayPlacement = placementPin ?? preferredPlacement
+            ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
         guard target != selectedOverlayPlacement else { return }
         selectedOverlayPlacement = target
         if isCapturing { updateOverlayPlacement() }

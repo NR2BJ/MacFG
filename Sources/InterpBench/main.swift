@@ -515,6 +515,54 @@ func readTextureBytes(_ tex: any MTLTexture, device: any MTLDevice, queue: any M
     return b
 }
 
+/// **선명도 비율 = 출력의 그래디언트 에너지 ÷ 정답의 그래디언트 에너지.**
+///
+/// PSNR만으로 화질을 판정하면 **흐리게 만드는 변경이 이긴다.** 잘 알려진 성질이고
+/// 이 벤치에서도 그대로 보인다 — 모션 보상이 전혀 없는 `blend`(A와 B의 단순 평균)가
+/// `hold`보다 2.45dB 높다. 평균을 내는 것만으로 점수가 오른다는 뜻이다.
+/// 그래서 오늘 낸 화질 판정들(마스크 블러 +0.0084, occ-dir −0.118dB, flow 해상도 −0.12dB)이
+/// 진짜 개선인지 **더 흐려진 것**인지 PSNR 하나로는 구분할 수 없다.
+///
+/// 1.0 = 정답만큼 선명 · <1 = 더 흐림 · >1 = 과선명(링잉·노이즈 증폭)
+/// PSNR과 **함께** 읽어야 한다: PSNR이 올랐는데 이 값이 떨어졌다면 흐려서 이긴 것이다.
+func computeSharpnessRatio(device: any MTLDevice, queue: any MTLCommandQueue,
+                           out: any MTLTexture, gt: any MTLTexture) -> Double {
+    func gradEnergy(_ tex: any MTLTexture) -> Double {
+        let w = tex.width, h = tex.height
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: tex.pixelFormat,
+                                                         width: w, height: h, mipmapped: false)
+        d.usage = [.shaderRead]; d.storageMode = .shared
+        guard let shared = device.makeTexture(descriptor: d),
+              let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { return 0 }
+        blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1), to: shared, destinationSlice: 0,
+                  destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        shared.getBytes(&px, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+        let row = w * 4
+        func lum(_ x: Int, _ y: Int) -> Double {
+            let i = y * row + x * 4
+            return 0.299 * Double(px[i]) + 0.587 * Double(px[i + 1]) + 0.114 * Double(px[i + 2])
+        }
+        // 전진차분의 절대값 합 — PSNR과 같은 2픽셀 스트라이드로 비용을 맞춘다.
+        var acc = 0.0, n = 0.0
+        var y = 1
+        while y < h - 1 {
+            var x = 1
+            while x < w - 1 {
+                acc += abs(lum(x + 1, y) - lum(x - 1, y)) + abs(lum(x, y + 1) - lum(x, y - 1))
+                n += 1; x += 2
+            }
+            y += 2
+        }
+        return n > 0 ? acc / n : 0
+    }
+    let g = gradEnergy(gt)
+    guard g > 0 else { return 0 }
+    return gradEnergy(out) / g
+}
+
 func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: any MTLTexture, texB: any MTLTexture) -> Double {
     func readAll(_ tex: any MTLTexture) -> [UInt8] {
         let w = tex.width, h = tex.height
@@ -593,6 +641,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
     for (key, engine) in sel {
         do { try await engine.prepare(device: device) } catch { print("  \(key): prepare 실패"); continue }
         var psnrs: [Double] = []
+        var sharps: [Double] = []
         var dt = 1.0 / 30.0
         for i in 0..<(frames.count - 2) {
             let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
@@ -603,6 +652,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             guard let interp = r?.frames.first?.texture else { continue }
             let p = computePSNRFull(device: device, queue: queue, texA: interp, texB: gt)
             psnrs.append(p)
+            sharps.append(computeSharpnessRatio(device: device, queue: queue, out: interp, gt: gt))
             if let dd = dumpDir, i == frames.count / 2 {
                 dumpPNG(interp, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_interp.png")
                 dumpPNG(gt, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_gt.png")
@@ -618,7 +668,11 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         let mn = psnrs.min() ?? 0
         let sorted = psnrs.sorted()
         let med = sorted.isEmpty ? 0 : sorted[sorted.count / 2]
-        print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  (n=\(psnrs.count))")
+        // **선명도를 PSNR 옆에 나란히 찍는다.** PSNR만 보면 흐리게 만드는 변경이 이긴다
+        // (이 벤치에서 blend가 hold보다 2.45dB 높은 것이 그 증거다 — 평균만 내도 점수가 오른다).
+        // sharp 1.0 = 정답만큼 선명, <1 = 더 흐림, >1 = 과선명. PSNR↑ + sharp↓ 면 흐려서 이긴 것이다.
+        let shAvg = sharps.isEmpty ? 0 : sharps.reduce(0, +) / Double(sharps.count)
+        print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  sharp=\(String(format: "%.3f", shAvg))  (n=\(psnrs.count))")
     }
     print("\n⏱  실프레임 = 합성보다 압축노이즈·반투명·대모션 모두 포함. 높을수록 정확.")
 }
@@ -776,6 +830,16 @@ func main() async {
     MetalFlowEngine.occlusionDirectional = config.occDirectional
     if let sm = config.smoothness { MetalFlowEngine.motionSmoothness = sm }
     if let bs = config.boundary { MetalFlowEngine.boundarySoftness = bs }
+
+    // **적용된 설정을 되찍는다 — 플래그가 안 먹은 것을 '변화 없음'으로 오독하지 않게.**
+    // 2026-08-31에 여섯 조건이 소수점까지 동일하게 나와 발견인 줄 알았는데, 셸 단어분리로
+    // 인자가 통째로 전달돼 전부 기본값으로 돈 것이었다. 그 다음엔 --flow-base 1440을 줬는데
+    // **기본값이 이미 1440**이라 또 무변화였다. 이 파일 48행 주석이 같은 함정을 이미 기록해뒀다
+    // ("실측 시도가 전부 같은 값으로 돌았다"). 실패가 침묵이면 반드시 되찍어야 한다.
+    print(String(format: "⚙ flowBase=%.0f  smoothness=%.2f  boundary=%.2f  occDir=%@  rifeShort=%d",
+                 MetalFlowEngine.flowBaseLongSide, MetalFlowEngine.motionSmoothness,
+                 MetalFlowEngine.boundarySoftness,
+                 MetalFlowEngine.occlusionDirectional ? "on" : "off", RIFEEngine.flowShortSide))
 
     guard let device = MTLCreateSystemDefaultDevice() else {
         print("❌ Metal not available"); return

@@ -268,8 +268,6 @@ public final class AppState {
     /// 캡처 소스 전환(창 ↔ 디스플레이)이 진행 중 — 겹쳐 들어오는 전환과 풀 리사이즈를 막는다.
     private var captureSwitchInFlight = false
 
-    // 전체화면 자동 뷰어: 소스가 전체화면이면 Cover→Viewer 자동(수동 토글 불필요), 창 복귀 시 원복.
-    @ObservationIgnored private var autoFsViewer = false
     /// **배치 핀 — 설정/AUTOFS 파생을 모두 이긴다 (2026-08-30).**
     ///
     /// 커버가 뷰어보다 초당 20장을 잃는다는 측정이 **통제되지 않았다**: 뷰어 실측이 AUTOFS
@@ -278,7 +276,7 @@ public final class AppState {
     /// 세션도 로그에 있다(tick 143.3 / 미표시 10.2 vs 134.9 / 48.0).
     /// 배치를 가르려면 **2×2**(소스 창모드/전체화면 × 배치 커버/뷰어)를 한 실행 안에서
     /// 채워야 하는데, 기존 `s.placement`는 loadSettings에서만 읽히고(재시작 A/B밖에 안 됨)
-    /// stopCapture(:1250)가 autoFsViewer 뒤에 조용히 무시했다.
+    /// stopCapture 원복이 그것을 조용히 무시했다.
     /// 핀은 세 경로(설정 파생, stopCapture 원복, AUTOFS)가 전부 존중하고 ⌃⌥⌘P로 즉시 순환한다.
     /// nil = 핀 없음(기존 파생 규칙).
     @ObservationIgnored nonisolated(unsafe) var placementPin: OverlayPlacement?
@@ -1214,11 +1212,14 @@ public final class AppState {
         addCommonTimer(1.0 / hz) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                // 배치/캡처소스 라벨 미러 갱신 — [SCHED] 한 줄로 2×2를 사후에 가르기 위한 것.
-                self.placeTagMirror = (self.selectedOverlayPlacement == .coverSource ? "cover" : "viewer")
-                    + (self.placementPin != nil ? "!" : "") + (self.autoFsViewer ? "@fs" : "")
-                    + "/" + (self.captureManager.isDisplayCapture ? "disp" : "win")
                 self.overlayManager?.updateTracking()
+                // 배치/캡처소스 라벨 미러 갱신 — [SCHED] 한 줄로 2×2를 사후에 가르기 위한 것.
+                // **updateTracking 뒤에 둔다** — @fs가 읽는 sourceIsFullscreen은 lastSourceFrame
+                // 기반이고 그건 updateTracking이 갱신한다. 앞에 두면 태그가 한 틱(33~66ms) 늦다.
+                self.placeTagMirror = (self.selectedOverlayPlacement == .coverSource ? "cover" : "viewer")
+                    + (self.placementPin != nil ? "!" : "")
+                    + ((self.overlayManager?.sourceIsFullscreen ?? false) ? "@fs" : "")
+                    + "/" + (self.captureManager.isDisplayCapture ? "disp" : "win")
                 // 창 종료/리사이즈 감지 (렌더 틱에서 이관 — overlayManager는 MainActor)
                 guard self.isCapturing else { return }
                 // 최소화/Space 이동 감지 — 워크스페이스 알림만으로는 안 잡혀 좀비 오버레이가 남는다
@@ -1277,13 +1278,12 @@ public final class AppState {
         isCapturingMirror = false
         captureManager.onFrameAvailable = nil   // 콜백 인제스트 즉시 차단
         configureEpoch += 1
-        // 자동 전체화면 뷰어는 이번 캡처 한정 상태 — 원복 안 하면 다음 캡처가 전체화면 뷰어로
-        // 잘못 시작한다 (리뷰 확정). 사용자 설정(upscaleMode)에서 배치를 다시 유도.
-        if autoFsViewer {
-            autoFsViewer = false
-            // 핀이 있으면 그것이 이긴다 — 없으면 기존대로 사용자 설정에서 재유도.
-            selectedOverlayPlacement = placementPin ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
-        }
+        // 전체화면 동안의 배치는 이번 캡처 한정 — 원복 안 하면 다음 캡처가 뷰어로 잘못 시작한다.
+        // **조건 없이 정산한다.** 예전엔 `if autoFsViewer`로 감쌌는데, 업스케일 ON으로 시작하면
+        // 배치가 처음부터 뷰어라 AUTOFS가 전환할 일이 없어 그 플래그가 false로 남았고, 그러면
+        // 전체화면 중에 업스케일을 끈 경우의 배치가 정산되지 않은 채 다음 캡처로 넘어갔다.
+        // 핀이 있으면 그것이 이긴다 — 없으면 사용자 설정(upscaleMode)에서 재유도.
+        selectedOverlayPlacement = placementPin ?? ((upscaleMode == .off) ? .coverSource : .viewerWindow)
         fsSample = false
         fsStableSince = 0
         renderDriver.detach()   // 동기 — 반환 후 렌더 틱 없음 보장
@@ -3712,12 +3712,19 @@ public final class AppState {
     /// 배치는 업스케일 모드에서 자동 결정 (사용자 선택 없음): 업스케일 쓰면 Separate Window(실효),
     /// 안 쓰면 Cover. 캡처 중 변경 시 오버레이 재생성.
     func autoSelectPlacementForUpscale() {
-        // 소스가 전체화면이라 뷰어를 **자동으로** 띄운 상태면 손대지 않는다. 안 그러면
-        // 업스케일을 끄는 순간 배치를 cover로 바꿔 출력 창을 재생성하고, 다음 추적 틱(15~30Hz)에
-        // detectFullscreenAutoViewer가 도로 viewer로 되돌려 또 재생성한다 — 무동작이어야 할
-        // 설정 변경에 검은 화면 번쩍임 + 스케줄러 리셋 2회 + attachRenderDriver 2회.
-        // 전체화면 이탈 경로가 살아있는 upscaleMode로 배치를 다시 유도하므로 사용자 선택은 보존된다.
-        guard !autoFsViewer else { return }
+        // **소스가 전체화면인 동안엔 배치를 건드리지 않는다.** 전체화면에선 커버가 합성되지
+        // 않아 뷰어가 강제인데, 업스케일 파생이 cover를 넣으면 다음 추적 틱(15~30Hz)에 AUTOFS가
+        // 도로 viewer로 되돌린다 — 무동작이어야 할 설정 변경에 출력 창 재생성 2회 + 검은 화면
+        // 번쩍임 + 스케줄러 리셋 2회.
+        //
+        // 예전 가드는 `!autoFsViewer`, 즉 "AUTOFS가 전환한 적이 있나"라는 **이력**이었다.
+        // 업스케일 ON으로 캡처를 시작하면 배치가 처음부터 뷰어라 AUTOFS가 전환할 게 없어
+        // (3801의 `placement == .coverSource` 가드에서 조기 리턴) 플래그가 false로 남았고,
+        // 전체화면인데도 가드가 열려 위 왕복이 그대로 일어났다. 27000줄 로그에 `place=viewer/disp`가
+        // 한 번도 없는 것이 방증이다 — 업스케일이 계속 off라 이 조합을 밟은 적이 없었다.
+        // 물어야 할 것은 "지금 전체화면인가"라는 **상태**이고, 그건 캐시 없이 바로 구할 수 있다.
+        // 전체화면 이탈 경로가 upscaleMode로 배치를 다시 유도하므로 사용자 선택은 보존된다.
+        guard !(overlayManager?.sourceIsFullscreen ?? false) else { return }
         let target: OverlayPlacement = placementPin ?? (upscaleMode == .off ? .coverSource : .viewerWindow)
         guard target != selectedOverlayPlacement else { return }
         selectedOverlayPlacement = target
@@ -3798,18 +3805,19 @@ public final class AppState {
             // (실측 2026-08-31). 핀은 측정용이므로 그동안 AUTOFS 배치 전환은 양보한다.
             guard placementPin == nil else { return }
             guard selectedOverlayPlacement == .coverSource else { return }
-            autoFsViewer = true
             selectedOverlayPlacement = placementPin ?? .viewerWindow
             updateOverlayPlacement()
             DiagnosticLog.shared.log("[AUTOFS] 소스 전체화면 → viewer 자동 전환")
         } else {
             syncCaptureSourceForFullscreen(false)
             guard placementPin == nil else { return }
-            guard autoFsViewer else { return }
-            autoFsViewer = false
-            selectedOverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
+            // **조건 없이 upscaleMode로 정산한다** — 전체화면 동안 억제됐던 파생을 여기서 갚는다.
+            // 실제로 바뀔 때만 재생성하므로 이탈마다 창이 다시 만들어지지는 않는다.
+            let target: OverlayPlacement = (upscaleMode == .off) ? .coverSource : .viewerWindow
+            guard target != selectedOverlayPlacement else { return }
+            selectedOverlayPlacement = target
             updateOverlayPlacement()
-            DiagnosticLog.shared.log("[AUTOFS] 소스 창 복귀 → \(selectedOverlayPlacement == .coverSource ? "cover" : "viewer") 원복")
+            DiagnosticLog.shared.log("[AUTOFS] 소스 창 복귀 → \(target == .coverSource ? "cover" : "viewer") 원복")
         }
     }
 
@@ -3990,8 +3998,7 @@ public final class AppState {
                     // 핀은 메모리에만 있어 앱을 다시 켜면 자동 파생으로 돌아간다.
                     self.placementPin = (self.placementPin == .coverSource) ? .viewerWindow : .coverSource
                     let label = self.placementPin == .coverSource ? "cover(핀)" : "viewer(핀)"
-                    // 핀을 바꿨으면 즉시 반영 — AUTOFS가 잡고 있던 상태도 푼다.
-                    self.autoFsViewer = false
+                    // 핀을 바꿨으면 즉시 반영 — AUTOFS가 잡고 있던 배치도 이 대입이 덮는다.
                     self.selectedOverlayPlacement = self.placementPin
                         ?? (self.upscaleMode == .off ? .coverSource : .viewerWindow)
                     if self.isCapturing { self.updateOverlayPlacement() }

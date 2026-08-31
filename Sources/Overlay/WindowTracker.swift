@@ -99,6 +99,7 @@ public final class WindowTracker {
         axObserver = nil
         axElement = nil
         windowID = 0
+        windowIsMinimized = false   // 다음 대상이 최소화 상태를 물려받지 않도록
     }
 
     // MARK: - Accessibility API
@@ -270,12 +271,38 @@ public final class WindowTracker {
         }
     }
 
+    /// 대상 창이 최소화(⌘M)됐는지 — `readCGWindowListGeometry`가 매 폴에서 갱신한다.
+    ///
+    /// **왜 캐시인가.** 확정 신호는 AX `kAXMinimized`인데 그건 IPC라 매 틱(15~30Hz) 부르면
+    /// 이미 0.5~2ms인 CGWindowList 폴 위에 그만큼이 더 얹힌다. 대신 같은 폴 응답에 공짜로 들어
+    /// 있는 `kCGWindowIsOnscreen`으로 먼저 거르고 — 화면에 보이는 창은 최소화일 수 없다 —
+    /// **false일 때만** AX로 확정한다. 정상 동작 중 추가 비용이 0이고, 답이 필요한 순간에만 정확하다.
+    ///
+    /// isOnscreen 하나만으로는 안 된다: 전체화면 전환 중에도 순간 false가 나와서, 그걸 최소화로
+    /// 읽으면 오버레이가 꺼지고 인제스트가 멈춰 텍스처 풀이 옛 크기에 고정되는 연쇄가 났다(실측).
+    /// 최소화와 전체화면 전환은 AX에서는 서로 다른 상태라 이 혼동이 없다.
+    public private(set) var windowIsMinimized = false
+
     private func readCGWindowListGeometry() -> WindowGeometry? {
         let options: CGWindowListOption = [.optionIncludingWindow]
         guard let infoList = CGWindowListCopyWindowInfo(options, windowID) as? [[String: Any]],
               let info = infoList.first,
               let bounds = info[kCGWindowBounds as String] as? [String: CGFloat] else {
             return nil
+        }
+
+        if (info[kCGWindowIsOnscreen as String] as? Bool) ?? false {
+            windowIsMinimized = false          // 보이는 창은 최소화가 아니다 — AX 불필요
+        } else if let element = axElement {
+            var value: CFTypeRef?
+            windowIsMinimized = AXUIElementCopyAttributeValue(
+                element, kAXMinimizedAttribute as CFString, &value) == .success
+                && (value as? Bool) == true
+        } else {
+            // AX 없이는 확정할 수 없다 — 옛 값을 그대로 두면 한 번 true가 된 뒤 영영 안 풀려
+            // 오버레이가 숨은 채 눌어붙는다. 확정 못 하면 false로 두고, 프레임 고갈 신호
+            // (refreshOverlayVisibility의 sourceOffScreen)에 맡긴다.
+            windowIsMinimized = false
         }
 
         let x = bounds["X"] ?? 0

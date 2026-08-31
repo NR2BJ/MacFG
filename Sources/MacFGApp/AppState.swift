@@ -3896,7 +3896,13 @@ public final class AppState {
             && lastFrameArrivalAt > 0
             && CFAbsoluteTimeGetCurrent() - lastFrameArrivalAt > 1.0
             && !(overlayManager?.sourceIsOnScreen ?? true)
-        let shouldHide = overlayUserHidden || sourceOffScreen || (!sourceFront && !coverKeepVisible)
+        // **최소화는 위 신호로 안 잡힌다.** 프레임이 끊기는 게 아니라 창 프레임이 독 타일로
+        // 줄어들 뿐이고 SCK는 그 타일을 계속 배달하므로 `lastFrameArrivalAt`이 갱신되어
+        // "1초 무프레임"이 영영 참이 안 된다 — 실측 2026-09-01: ⌘M 후에도 [OVERLAY] 0줄.
+        // AX 기반이라 즉답이고, 전체화면 전환과 혼동되지 않는다(WindowTracker 참조).
+        let sourceMinimized = overlayManager?.sourceIsMinimized ?? false
+        let shouldHide = overlayUserHidden || sourceOffScreen || sourceMinimized
+            || (!sourceFront && !coverKeepVisible)
         guard shouldHide != overlayHiddenState else { return }
         overlayHiddenState = shouldHide
         overlayManager?.setOverlayHidden(shouldHide)

@@ -41,6 +41,8 @@ public final class OverlayManager {
 
     /// 소스 창이 화면에 보이는지 — 최소화/다른 Space면 false (좀비 Cover 오버레이 방지용)
     public var sourceIsOnScreen: Bool { windowTracker.windowIsOnScreen }
+    /// 소스 창이 최소화(⌘M)됐는지 — 커버 오버레이 숨김과 추적 동결의 신호.
+    public var sourceIsMinimized: Bool { windowTracker.windowIsMinimized }
 
     /// MacFG 자신이 띄운 창들의 CGWindowID — 디스플레이 캡처 제외 목록용.
     /// 오버레이/뷰어뿐 아니라 설정 창 등 이 앱의 모든 창을 포함해야 되먹임이 없다.
@@ -301,6 +303,16 @@ public final class OverlayManager {
             return
         }
         trackingFailureCount = 0
+
+        // **최소화 중엔 추적을 동결한다.** 최소화된 창의 CGWindowList 프레임은 독 타일 크기
+        // (실측 56x57)라, 그대로 따라가면 두 가지가 동시에 깨진다 —
+        //   ① 커버 오버레이가 그 크기로 줄어 **독 아이콘 위에 겹쳐 그려진다**(사용자 제보).
+        //   ② lastSourceFrame이 56x57이 되어 리사이즈 검사가 캡처를 독 타일 크기로 재설정하고,
+        //      복원 시 비율이 안 맞아 1초쯤 찌그러진 화면이 보인다(실측 로그:
+        //      `reconfigure → 56x57` → `resources: src=56x57` → 복원 후 `→ 2503x1598`).
+        // 마지막 정상 프레임을 유지하면 복원이 무동작이 된다. trackingFailureCount는 위에서
+        // 이미 0으로 리셋했다 — 창은 멀쩡히 존재하므로 "창이 사라졌다" 정지를 걸면 안 된다.
+        if windowTracker.windowIsMinimized { return }
 
         if placement == .coverSource {
             // 위치/크기가 실제로 바뀌었을 때만 setFrame 호출 (윈도우 서버 부하 최소화)

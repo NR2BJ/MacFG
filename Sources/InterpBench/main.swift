@@ -57,6 +57,7 @@ struct BenchConfig {
     var multiT = false              // 멀티-t 화질 벤치 (t별 PSNR — 24/30fps 경로 검증)
     var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
     var qualityAB = false           // 같은 삼중항에 MetalFlow 화질 변경 4단계를 전부 돌려 비교
+    var tinStride: Int? = nil       // A5: 틴 밀도 — stride N에서 t=1/N..(N-1)/N을 실프레임 GT로 (--triplets와 함께)
 
     static func parse() -> BenchConfig {
         var config = BenchConfig()
@@ -78,6 +79,7 @@ struct BenchConfig {
             case "--multi-t": config.multiT = true
             case "--triplets": if let v = args.popFirst() { config.tripletsDir = v }
             case "--quality-ab": config.qualityAB = true
+            case "--tin-density": if let v = args.popFirst() { config.tinStride = Int(v) }
             default: break
             }
         }
@@ -601,6 +603,90 @@ func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: an
 }
 
 /// 실프레임 삼중항 모드 — frame_NNN.png 연속 3장 (A, GT, B)에서 encodePair(A,B,t=0.5) vs GT.
+/// **A5 — 배수 천장: 앵커 근사가 극단 t에서 무너지는가 (실프레임).**
+///
+/// 24fps 소스를 144Hz에 ×6으로 채우면 틴이 5장(t=1/6..5/6)이다. 배포 경로는 앵커를 하나만
+/// 뽑아 f0×(t/앵커), f1×((1−t)/(1−앵커))로 스케일하므로 t가 앵커에서 멀수록 근사가 무너진다.
+/// 그게 사실이면 ×6은 성능이 아니라 **화질**로 막히는 것이고, 앵커를 늘리는 것 말고는 길이 없다.
+///
+/// **교락 제거가 이 모드의 요점이다.** 틴을 늘리면 브래킷(=소스 간격)이 같이 커져서 "배수"와
+/// "모션 크기"가 섞인다. 그래서 두 팔을 **같은 브래킷 안에서** 비교한다:
+///   deployed : tValues에 t를 전부 넘긴 한 번의 호출 = 엔진이 스스로 앵커를 정하는 배포 경로
+///   exact    : t마다 tValues=[t]로 따로 호출 = 그 t에 앵커를 강제 (같은 브래킷, 같은 프레임)
+/// 둘의 차이가 **순수한 근사 손실**이다. exact도 같이 나쁘면 원인은 근사가 아니라 브래킷이라
+/// 앵커를 늘려도 소용없다.
+///
+/// `--multi-t`는 합성 패턴(순수 평행이동)을 쓰는데, 그건 선형 스케일 근사에 **가장 유리한**
+/// 조건이라 "거기서 안 깨졌다"가 실콘텐츠를 보증하지 못한다. 여기서는 실프레임을 쓴다.
+func runTinDensityMode(dir: String, strideN: Int, engineKeys: [String],
+                       device: any MTLDevice, queue: any MTLCommandQueue) async {
+    let fm = FileManager.default
+    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
+    guard files.count >= strideN + 1 else {
+        print("❌ 프레임 부족 (\(files.count) < \(strideN + 1)) — \(dir)"); return
+    }
+    var frames: [any MTLTexture] = []
+    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
+    guard frames.count >= strideN + 1 else { print("❌ 로드 실패"); return }
+    let ts: [Float] = (1..<strideN).map { Float($0) / Float(strideN) }
+    let srcFps = 60.0 / Double(strideN)
+    print("▶ 틴 밀도: strideN=\(strideN) (브래킷 \(String(format: "%.1f", Double(strideN) * 1000.0 / 60.0))ms = 소스 \(String(format: "%.0f", srcFps))fps, 틴 \(ts.count)장)  \(dir)")
+    print("  해상도 \(frames[0].width)x\(frames[0].height), 프레임 \(frames.count)장")
+
+    var allEngines: [(String, any PairInterpolationEngine)] = [("metalflow", MetalFlowEngine())]
+    if AppleFIEngine.isSupported { allEngines.append(("applefi", AppleFIEngine())) }
+    if RIFEEngine.modelAvailable(short: RIFEEngine.flowShortSide) { allEngines.append(("rife", RIFEEngine())) }
+    let sel = engineKeys.contains("all") ? allEngines : allEngines.filter { engineKeys.contains($0.0) }
+
+    for (key, engine) in sel {
+        do { try await engine.prepare(device: device) } catch { print("  \(key): prepare 실패"); continue }
+        var dep: [Float: [Double]] = [:]      // t -> PSNR (배포 경로)
+        var exa: [Float: [Double]] = [:]      // t -> PSNR (t별 앵커 강제)
+        let dt = 1.0 / srcFps
+        var n = 0
+        for i in stride(from: 0, to: frames.count - strideN, by: max(1, strideN / 2)) {
+            let a = frames[i], b = frames[i + strideN]
+            n += 1
+            // ① 배포 경로 — 한 번의 호출에 t 전부
+            if let cb = queue.makeCommandBuffer() {
+                let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt / Double(strideN),
+                                          tsB: Double(i + strideN) * dt / Double(strideN), tValues: ts, into: cb)
+                cb.commit(); await cb.completed()
+                for f in (r?.frames ?? []) {
+                    let k = Int((f.t * Float(strideN)).rounded())
+                    guard k >= 1, k < strideN else { continue }
+                    dep[f.t, default: []].append(
+                        computePSNRFull(device: device, queue: queue, texA: f.texture, texB: frames[i + k]))
+                }
+            }
+            // ② t별 앵커 강제 — 같은 쌍, 같은 브래킷
+            for (k, t) in ts.enumerated() {
+                guard let cb = queue.makeCommandBuffer() else { continue }
+                let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt / Double(strideN),
+                                          tsB: Double(i + strideN) * dt / Double(strideN), tValues: [t], into: cb)
+                cb.commit(); await cb.completed()
+                guard let tex = r?.frames.first?.texture else { continue }
+                exa[t, default: []].append(
+                    computePSNRFull(device: device, queue: queue, texA: tex, texB: frames[i + k + 1]))
+            }
+        }
+        engine.shutdown()
+        let avg: ([Double]) -> Double = { $0.isEmpty ? 0 : $0.reduce(0, +) / Double($0.count) }
+        print("  \(key)  (쌍 \(n)개)")
+        print("       t     배포     exact   근사손실")
+        for t in ts {
+            let d = avg(dep[t] ?? []), e = avg(exa[t] ?? [])
+            let mark = (d == 0 || e == 0) ? "  (미산출)" : ""
+            print(String(format: "   %6.3f %8.2f %8.2f %+9.2f%@", t, d, e, d - e, mark))
+        }
+    }
+    print("\n판정: 같은 브래킷 안에서 극단 t(양끝)의 근사손실이 중앙 t보다 크게 나쁘면")
+    print("      앵커 1개가 원인이다 = 앵커를 늘리면 낫는다.")
+    print("      중앙과 극단이 비슷하면 브래킷(대모션) 탓이라 앵커를 늘려도 소용없고,")
+    print("      배수 천장은 성능이 아니라 화질로 굳는다.")
+}
+
 func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, queue: any MTLCommandQueue) async {
     let fm = FileManager.default
     let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
@@ -889,7 +975,10 @@ func main() async {
     }
 
     if let td = config.tripletsDir {
-        if config.qualityAB {
+        if let stride = config.tinStride {
+            await runTinDensityMode(dir: td, strideN: stride, engineKeys: config.engines,
+                                    device: device, queue: commandQueue)
+        } else if config.qualityAB {
             await runQualityABMode(dir: td, device: device, queue: commandQueue)
         } else {
             await runTripletMode(dir: td, engineKeys: config.engines, device: device, queue: commandQueue)

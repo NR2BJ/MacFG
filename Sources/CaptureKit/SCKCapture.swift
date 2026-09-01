@@ -348,6 +348,8 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
     private let logger = Logger(subsystem: "com.macfg", category: "StreamOutput")
     private var colorSpaceLogged = false
     private var statusLogged = false
+    /// dirtyRects 프로브 카운터 (E1b) — 첫 600프레임만, 30장에 1줄.
+    private var dirtyProbeCount = 0
     private var detailFrameCount = 0   // 캡처당 리셋(핸들러 새로 생성) — 소스 디테일 진단
     /// 첫 프레임 어태치먼트에서 추출한 캡처 색공간 (이후 프레임에 재사용)
     private var cachedColorSpace: CGColorSpace?
@@ -378,6 +380,33 @@ private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Se
             if !statusLogged {
                 statusLogged = true
                 logger.info("SCK frame status type detected: \(statusRaw) → \(status == .complete ? "complete" : "other")")
+            }
+            // **dirtyRects 프로브 (E1b).** 지금까지 '얼마나 바뀌었나'(changeRatio)만 봤는데,
+            // 리페인트와 진짜 프레임을 가르는 건 '어디가 바뀌었나'일 수 있다 — 리페인트는
+            // 창 전체를 다시 그리고, 새 영상 프레임은 영상 영역만 바꾼다. 첫 600프레임만 찍는다.
+            // 창/디스플레이 두 경로를 **같은 소스·같은 콘텐츠로** 받아 비교해야 의미가 있다
+            // (콘텐츠가 다르면 분포 차이가 캡처 경로 탓인지 알 수 없다).
+            if dirtyProbeCount < 600,
+               let rectsRaw = dict[SCStreamFrameInfo.dirtyRects.rawValue] as? [Any] {
+                dirtyProbeCount += 1
+                let rects = rectsRaw.compactMap { e -> CGRect? in
+                    guard let d = e as? NSDictionary else { return nil }
+                    return CGRect(dictionaryRepresentation: d as CFDictionary)
+                }
+                let area = rects.reduce(0.0) { $0 + $1.width * $1.height }
+                let pb = sampleBuffer.imageBuffer
+                let fw = pb.map { CVPixelBufferGetWidth($0) } ?? 0
+                let fh = pb.map { CVPixelBufferGetHeight($0) } ?? 0
+                let full = Double(fw * fh)
+                if dirtyProbeCount % 30 == 1 {
+                    // 크기로 경로가 갈린다 — 화면 전체 크기면 디스플레이 캡처, 창 크기면 창 캡처.
+                    // (이 핸들러는 isDisplayCapture를 모른다. 같은 줄의 %dx%d로 사후 판별한다.)
+                    DiagnosticLog.shared.log(String(format:
+                        "[DIRTY] n=%d rects=%d area=%.1f%% status=%@ frame=%dx%d",
+                        dirtyProbeCount, rects.count,
+                        full > 0 ? area * 100.0 / full : 0,
+                        status == .complete ? "complete" : "other", fw, fh))
+                }
             }
         } else {
             // 상태를 읽을 수 없으면 새 콘텐츠로 간주

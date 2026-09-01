@@ -1743,6 +1743,10 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var overSupplyCredit: Double = 0
     /// 소스 케이던스 고정으로 걸러낸 프레임 수 (영상 프레임 사이에 낀 UI 갱신).
     @ObservationIgnored nonisolated(unsafe) private var diagSrcLockSkip = 0
+    /// 복원 규칙으로 통과시킨 장수 (E1a) — 거부 앞항만 참인 경우.
+    @ObservationIgnored nonisolated(unsafe) private var diagSrcRestore = 0
+    /// 게이트 **앞** 원시 도착 간격 분포 (E1a): <4 / <8 / <13 / <20 / >=20 ms.
+    @ObservationIgnored nonisolated(unsafe) private var diagRawIntHist = [Int](repeating: 0, count: 5)
     /// 마지막 수용분 **직전** 수용분의 타임스탬프 — 케이던스 게이트의 복원 판정(2슬롯 규칙)용.
     @ObservationIgnored nonisolated(unsafe) private var acceptedTsBeforeLast: CFTimeInterval = 0
     /// UI 전용 갱신(영상 미진행)으로 판정해 걸러낸 프레임 수.
@@ -2194,6 +2198,10 @@ public final class AppState {
         // 정지 화면을 만들 수 없는 구조다: 느린 장면은 애초에 간격이 넓어 전부 수용된다.
         // 120fps를 진짜로 받아야 하는 특수 소스는 노브로 올린다(0 = 끔).
         let srcFpsCap = Knob.double("MACFG_SRCFPS") ?? 60
+        // 복원 문턱 (E1c) — 1.6은 2026-08-25에 PiP FHD 사례로 정한 하드코딩 값이었다.
+        // 현행 창모드 수용 평균 간격이 14.5ms라 인접쌍 합의 평균이 29.0ms이고, 1.75슬롯
+        // (29.17ms)은 그 평균 바로 위에 붙는다 — 조이면 절반쯤이 갈릴 자리라 A/B가 필요하다.
+        let srcRestoreSlots = Knob.double("MACFG_SRCRESTORE") ?? 1.6
         if srcFpsCap >= 1, lastAcceptedTimestamp > 0 {
             let lockedInterval = 1.0 / srcFpsCap
             let sinceLast = slot.timestamp - lastAcceptedTimestamp
@@ -2207,10 +2215,20 @@ public final class AppState {
             // 어느 쌍을 잡아도 2슬롯을 못 채우므로 여전히 걸러진다.
             let sinceBeforeLast = acceptedTsBeforeLast > 0
                 ? slot.timestamp - acceptedTsBeforeLast : .infinity
-            if sinceLast < lockedInterval * 0.75, sinceBeforeLast < lockedInterval * 1.6 {
+            // **원시 도착 간격 히스토그램 (E1a).** 게이트 앞에서 센다 — 무엇이 들어오는지를
+            // 봐야 무엇을 버리는지 판단할 수 있다. 창 캡처와 디스플레이 캡처의 서명이 갈리는
+            // 지점이 여기다(실측: /win은 8~13ms 칸에 17.6~43.0%, /disp는 <8ms 칸에 11.9~22.6%).
+            let rawMs = sinceLast * 1000.0
+            let rb = rawMs < 4 ? 0 : rawMs < 8 ? 1 : rawMs < 13 ? 2 : rawMs < 20 ? 3 : 4
+            diagRawIntHist[rb] += 1
+            if sinceLast < lockedInterval * 0.75, sinceBeforeLast < lockedInterval * srcRestoreSlots {
                 diagSrcLockSkip += 1
                 return
             }
+            // **복원 규칙으로 살아난 장수 (E1a).** 거부 조건의 앞항만 참인 경우 = 간격은
+            // 좁은데 인접쌍 합이 문턱을 넘어 통과시킨 프레임이다. 이 값이 없으면 복원이
+            // "얼마나 발동하는가"를 알 수 없고, 문턱(E1c)을 조일 근거도 생기지 않는다.
+            if sinceLast < lockedInterval * 0.75 { diagSrcRestore += 1 }
         }
         // 수용 정책: 픽셀 변화(fingerprint) 우선. SCK status는 fingerprint가 없을 때만 폴백.
         // (게이트를 1/120으로 연 뒤 SCK가 60fps 창에도 status=complete를 ~112fps로 남발하는 것을
@@ -3516,7 +3534,7 @@ public final class AppState {
         // 배치는 [WIN] 로그에만, 캡처 소스는 [SCK-DISPLAY]에만 나와서 창 단위로 못 맞췄다.
         // 매 창에 라벨이 있으면 사용자가 아무 순서로 토글해도 사후에 2×2로 가를 수 있다.
         // (측정 절차를 사람이 정확히 지키게 만들 게 아니라, 지표가 엉성한 입력을 견뎌야 한다.)
-        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
+        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) srcRestore=\(diagSrcRestore) rawDist=\(diagRawIntHist.map(String.init).joined(separator: "/")) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -3551,6 +3569,8 @@ public final class AppState {
         diagDupSkipCount = 0
         diagChangeHist = [0, 0, 0, 0, 0]
         diagSrcLockSkip = 0
+        diagSrcRestore = 0
+        for i in diagRawIntHist.indices { diagRawIntHist[i] = 0 }
         diagUiGateSkip = 0
         stageLock.lock(); diagGpuLateHist = [0, 0, 0, 0, 0]; stageLock.unlock()
         diagTsRejectCount = 0

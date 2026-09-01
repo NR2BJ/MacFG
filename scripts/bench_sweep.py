@@ -48,8 +48,16 @@ for n, d in enumerate(seqs, 1):
         continue
     # avg=NN.NNdB 가 순서대로 hold / blend / 엔진
     v = [float(x) for x in re.findall(r"avg=([\d.]+)dB", out)]
+    # **최악값과 선명도도 같이 거둔다 (B4).** 중앙값 비교는 "빠른 모션에서 무너지는가"를
+    # 덮지 못한다 — 엔진 간 격차가 큰 쪽이 min이다(실측 RIFE 27.52 vs MetalFlow 32.64).
+    # min=은 hold/blend/엔진 세 줄 모두에 있고 sharp=는 엔진 줄에만 있다.
+    mn = [float(x) for x in re.findall(r"min=([\d.]+)dB", out)]
+    sh = re.search(r"sharp=([\d.]+)", out)
     if len(v) >= 3:
-        rows.append((d.name, v[0], v[1], v[2]))
+        rows.append((d.name, v[0], v[1], v[2],
+                     mn[0] if len(mn) >= 3 else 0.0,     # hold min
+                     mn[2] if len(mn) >= 3 else 0.0,     # 엔진 min
+                     float(sh.group(1)) if sh else 0.0))
 print(" " * 60, file=sys.stderr)
 
 if not rows:
@@ -60,15 +68,27 @@ bad = [r for r in rows if r[3] <= r[1]]
 print("엔진 %s   플래그 %s" % (engine, " ".join(args) or "(기본)"))
 print("시퀀스 %d개  —  정상 %d / 병리 %d  (병리 = 보간이 hold 이하)" % (len(rows), len(clean), len(bad)))
 print()
-print("   %-20s %8s %8s %8s %9s" % ("시퀀스", "hold", "blend", engine, "-hold"))
-for name, h, b, m in sorted(rows, key=lambda r: r[3] - r[1]):
-    print("%s %-20s %8.2f %8.2f %8.2f %+9.2f" % ("  " if m > h else "PP", name, h, b, m, m - h))
+print("   %-20s %8s %8s %8s %9s %8s %8s %7s"
+      % ("시퀀스", "hold", "blend", engine, "-hold", "holdMin", "engMin", "sharp"))
+for name, h, b, m, hm, em, sp in sorted(rows, key=lambda r: r[3] - r[1]):
+    print("%s %-20s %8.2f %8.2f %8.2f %+9.2f %8.2f %8.2f %7.3f"
+          % ("  " if m > h else "PP", name, h, b, m, m - h, hm, em, sp))
 print()
 if clean:
     d = [r[3] - r[1] for r in clean]
     print("판정 수치 — 깨끗한 %d개의 **중앙값**: %+.3f dB   (평균 %+.3f, 범위 %+.2f~%+.2f)"
           % (len(clean), st.median(d), st.mean(d), min(d), max(d)))
     print("절대 PSNR 중앙값: %.3f dB" % st.median([r[3] for r in clean]))
+    # **B4의 판정 수치** — 최악값과 선명도. 중앙값이 같아도 여기서 갈릴 수 있다.
+    print("최악값(min) 중앙값: %.3f dB   |  최악값의 최악: %.3f dB   |  선명도 중앙값: %.3f"
+          % (st.median([r[5] for r in clean]), min(r[5] for r in clean),
+             st.median([r[6] for r in clean])))
+    # 빠른 모션 슬라이스 = blend가 hold를 크게 이기는 시퀀스(=A와 GT가 많이 다르다).
+    fast = [r for r in clean if r[2] - r[1] >= 2.0]
+    if fast:
+        print("빠른 모션 %d개(blend-hold>=2dB) — 중앙값 %+.3f dB · min 중앙값 %.3f dB · 선명도 %.3f"
+              % (len(fast), st.median([r[3] - r[1] for r in fast]),
+                 st.median([r[5] for r in fast]), st.median([r[6] for r in fast])))
 if bad:
     print()
     print("PP 로 표시한 병리 %d개는 판정에서 제외했다." % len(bad))

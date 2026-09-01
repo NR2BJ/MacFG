@@ -748,6 +748,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
 
         // ── ③ 호출자 cb: 이벤트 대기 → 앵커별 unpack → t별 최근접 앵커 워프
         commandBuffer.encodeWaitForEvent(slot.event, value: signalValue)
+        lastEncodedCB = commandBuffer      // shutdown이 배웅할 대상 (D6d)
         // 시간적 스무딩은 단일 앵커(60fps 영상 경로 — 워블 체감 지점)에만. 캘러 cb들이 같은
         // 큐에서 직렬이라 prev 텍스처의 쌍 간 read→write 순서는 큐가 보장.
         let (prevF, prevM, prevValid) = slotLock.withLock {
@@ -975,9 +976,23 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 표시 직전 검증 — stamp가 아직 어느 슬롯의 현 세대면 유효(안 덮임). 렌더 스레드 전용.
     public func isFrameLive(_ stamp: UInt64) -> Bool { slotStamps.contains(stamp) }
 
+    /// 마지막으로 인코딩해 넘긴 커맨드버퍼 — AppleFI와 같은 이유로 붙잡는다(D6d).
+    private var lastEncodedCB: (any MTLCommandBuffer)?
+
     public func shutdown() {
         cancelled.withLock { $0 = true }
         worker.sync {}          // 진행 중 predict 드레인 (이후 워커 항목은 cancelled로 즉시 signal)
+        // **인플라이트 커맨드버퍼를 먼저 배웅한다 (D6d).** encodePair는 호출자의 커맨드버퍼에
+        // 인코딩만 하고 커밋은 호출자가 한다 — 그래서 여기서 자원을 놓는 순간 GPU/ANE가 아직
+        // 그 버퍼를 실행 중일 수 있다. 엔진을 빠르게 갈아치우면(설정 세그먼트 연타) 해제된
+        // 세션/버퍼로 명령이 떨어진다.
+        // **미커밋 버퍼를 기다리면 교착이므로** 상태를 반드시 본다: .committed/.scheduled만
+        // 기다리고, .notEnqueued/.enqueued(아직 커밋 전)는 애초에 GPU에 없으니 건너뛴다.
+        if let cb = lastEncodedCB {
+            let st = cb.status
+            if st == .committed || st == .scheduled { cb.waitUntilCompleted() }
+            lastEncodedCB = nil
+        }
         model = nil
         slots = []
         outputPool = []

@@ -85,8 +85,21 @@ public final class UIStaticDetector {
     }
 
     /// 해상도 세팅/재세팅 — 소스 크기의 1/2(텍스트 보존 + 저비용).
+    /// 마스크 격자 축소비 (소스 대비). **해상도가 올라가면 이 값도 올려야 한다.**
+    ///
+    /// 이 클래스의 공간 연산자는 전부 **마스크 픽셀** 단위다 — hp의 3x3 박스, 5탭 σ=2 블러.
+    /// 축소비가 2로 고정이면 마스크 픽셀은 항상 소스 2px이므로, 같은 UI가 4K에서 픽셀로 2배
+    /// 커질 때 연산자는 UI 대비 **절반 폭**이 된다. 그러면 hp 응답이 약해져 cons가 낮아지고
+    /// UI를 덜 잡는다. 실측(2026-09-02, 같은 4K 소스를 4K/1080p로, 나머지 전부 고정):
+    ///   1080p 커버 6.4% · ROI이득 +0.316 · full이득 −0.008  (배포 파라미터 전부 통과)
+    ///   4K    커버 4.1% · ROI이득 +0.322 · full이득 −0.029  (배포 파라미터 **전부 탈락**)
+    /// ROI 이득은 같은데 전체 손해만 3.5배다. 축소비를 해상도에 맞춰 키우면 연산자의 화면
+    /// 상대 폭이 보존된다(4K에서 4 = 1080p에서 2와 같은 화면 비율).
+    public nonisolated(unsafe) static var maskDiv: Int = 2
+
     private func ensure(srcW: Int, srcH: Int) {
-        let mw = max(64, srcW / 2), mh = max(64, srcH / 2)
+        let dv = max(1, Self.maskDiv)
+        let mw = max(64, srcW / dv), mh = max(64, srcH / dv)
         guard mw != w || mh != h || maskTex.isEmpty else { return }
         w = mw; h = mh
         func tex(_ fmt: MTLPixelFormat, _ usage: MTLTextureUsage) -> (any MTLTexture)? {

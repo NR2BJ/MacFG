@@ -834,21 +834,28 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         print("  ⚠️ 워밍업이 \(75 * uiStride)장에 못 미친다(프레임 부족) — EMA 미수렴. 결과를 앱 값으로 옮기지 말 것.")
     }
 
-    let points: [(String, Float, Float, Float, Float)] = [
-        ("현재 .04/.5/1.7", 0.04, 0.5, 1.7, 1.0),
-        ("clo 0.8",        0.04, 0.8, 2.0, 1.0),
-        ("clo 1.2",        0.04, 1.2, 2.4, 1.0),
-        ("clo 0.3",        0.04, 0.3, 1.5, 1.0),
-        ("창 50f(.02)",    0.02, 0.5, 1.7, 1.0),
-        ("창 12f(.08)",    0.08, 0.5, 1.7, 1.0),
-        ("strength 0.6",   0.04, 0.5, 1.7, 0.6),
+    // 마지막 항은 마스크 축소비 — 소스/div. 연산자가 마스크 픽셀 단위라 이 값이 곧
+    // "연산자가 화면의 몇 퍼센트를 덮는가"를 정한다. 4K에서 div 4 = 1080p에서 div 2와 동일 비율.
+    let points: [(String, Float, Float, Float, Float, Int)] = [
+        ("현재 .04/.5/1.7", 0.04, 0.5, 1.7, 1.0, 2),
+        ("clo 0.8",        0.04, 0.8, 2.0, 1.0, 2),
+        ("clo 1.2",        0.04, 1.2, 2.4, 1.0, 2),
+        ("clo 0.3",        0.04, 0.3, 1.5, 1.0, 2),
+        ("창 50f(.02)",    0.02, 0.5, 1.7, 1.0, 2),
+        ("창 12f(.08)",    0.08, 0.5, 1.7, 1.0, 2),
+        ("strength 0.6",   0.04, 0.5, 1.7, 0.6, 2),
+        ("div4 clo .5",    0.04, 0.5, 1.7, 1.0, 4),
+        ("div4 clo 0.3",   0.04, 0.3, 1.5, 1.0, 4),
+        ("div4 clo 0.8",   0.04, 0.8, 2.0, 1.0, 4),
+        ("div3 clo .5",    0.04, 0.5, 1.7, 1.0, 3),
     ]
     print("  설정              cover     ROI(on)  ROI(off)  ROI이득    full이득")
     for pt in points {
-        let (name, alpha, clo, chi, strength) = pt
+        let (name, alpha, clo, chi, strength, div) = pt
         UIStaticDetector.enabled = true
         UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
         UIStaticDetector.chi = chi; UIStaticDetector.strength = strength
+        UIStaticDetector.maskDiv = div
 
         let det = UIStaticDetector(device: device)
         try? await det.prepare(); det.reset()

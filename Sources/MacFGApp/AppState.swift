@@ -905,7 +905,7 @@ public final class AppState {
             DiagnosticLog.shared.log("[AUTO] sharpen=\(v)")
         }
         if let mIdx = args.firstIndex(of: "--multiplier"), mIdx + 1 < args.count,
-           let m = Int(args[mIdx + 1]), (2...5).contains(m) {
+           let m = Int(args[mIdx + 1]), (2...6).contains(m) {
             frameMultiplier = m
             DiagnosticLog.shared.log("[AUTO] frameMultiplier=×\(m)")
         }

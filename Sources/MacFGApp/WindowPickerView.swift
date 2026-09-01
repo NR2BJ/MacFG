@@ -134,7 +134,15 @@ struct WindowPickerView: View {
                             "디스플레이 주사율이 상한: 60fps ×3 = 180은 180Hz+ 필요(120Hz는 120까지). Auto는 디스플레이가 낼 수 있는 최대로.",
                             "上限はディスプレイのリフレッシュレート: 60fps ×3 = 180には180Hz+が必要(120Hzなら120)。Autoは表示可能な最大に。")) {
                 Picker("", selection: $appState.frameMultiplier) {
-                    Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3); Text("×4").tag(4); Text("×5").tag(5)
+                    // ×6까지 — 24fps 소스를 144Hz에 채우는 배수다. **Auto는 이미 ×6을 쓰고 있었고**
+                    // (nRaw=6 → t 5장, 쿼터 perPair=(144−24)/24=5로 정확히 허용) 명시 피커에만
+                    // 상한이 없었다. 화질 근거(A5, 2026-09-01, RIFE 실프레임 27쌍): 앵커 1개 근사의
+                    // 손실은 t가 앵커에서 멀수록 커지지만 브래킷이 좁으면 작다 — 브래킷 50ms에서
+                    // t=1/3 손실 0.071dB, 100ms에서 0.273dB. 24fps의 브래킷은 41.7ms로 그보다도
+                    // 좁아 극단 t에서도 0.2dB 안쪽으로 추정된다(직접 측정은 불가 — 60fps 덤프로
+                    // t=1/6을 만들려면 stride 6이 되어 브래킷이 100ms로 커진다).
+                    Text("Auto").tag(0); Text("×2").tag(2); Text("×3").tag(3)
+                    Text("×4").tag(4); Text("×5").tag(5); Text("×6").tag(6)
                 }
                 .labelsHidden().pickerStyle(.segmented)
                 .onChange(of: appState.frameMultiplier) { appState.persistSettings() }

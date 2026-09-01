@@ -204,7 +204,9 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var presentQueue: (any MTLCommandQueue)?
     /// cb1(stable blit + UI 검출) 전용 copy 큐 (O1-3) — workQueue에서 분리하면 cb2(warp)의
     /// predict 이벤트 대기가 다음 프레임 blit을 head-of-line 블로킹하던 것을 없애 파이프라인
-    /// 중첩(predict↔warp)을 복원. MACFG_SPLITQ=1로 활성(검증 전 기본 OFF — 동시성 변경).
+    /// 중첩(predict↔warp)을 복원. **기본값은 엔진별 런타임 결정이다**(:4170 — RIFE ON, 그 외 OFF).
+    /// MACFG_SPLITQ는 수동 오버라이드. 옛 주석은 "검증 전 기본 OFF"라 적혀 있었는데 반대였고,
+    /// 그 문장이 「열린 이슈」 C6("기본 OFF를 재평가")을 만들어 냈다.
     @ObservationIgnored nonisolated(unsafe) private var copyQueue: (any MTLCommandQueue)?
     /// cb1(blit)을 별도 copy 큐로 분리할지 — **엔진별로 다르다.**
     /// 이 분리가 노리는 병목은 "cb2가 RIFE predict(ANE) 이벤트를 기다리며 workQueue를 점유해
@@ -4149,13 +4151,20 @@ public final class AppState {
     /// 메인에서 직접 shutdown/nil 하면 encodePair 도중 엔진 풀이 비워져 인덱스 트랩/레이스
     /// (감사 확정 — ⌃⌥⌘I 토글·모드 전환이 캡처 중 이 경로를 탐). perform은 틱과 같은
     /// 런루프라 절대 안 겹치고, 렌더 스레드 미기동 시엔 틱이 없어 직접 대입이 안전.
-    private func swapPairEngine(_ newEngine: (any PairInterpolationEngine)?) {
+    /// `splitQueue`를 함께 받는다 — `splitQueueEnabled`도 렌더 스레드 전용 판독값이라
+    /// 엔진 교체와 같은 직렬화 지점에서 기입해야 규약이 지켜진다.
+    private func swapPairEngine(_ newEngine: (any PairInterpolationEngine)?,
+                                splitQueue: Bool? = nil) {
         if renderDriver.isRunning {
             // perform은 동기 + 틱과 직렬 — 블록 실행 중 메인은 대기하므로 실제 동시 접근 없음
             nonisolated(unsafe) let engineRef = newEngine
-            renderDriver.perform { [weak self] in self?.pairEngine = engineRef }
+            renderDriver.perform { [weak self] in
+                self?.pairEngine = engineRef
+                if let splitQueue { self?.splitQueueEnabled = splitQueue }
+            }
         } else {
             pairEngine = newEngine
+            if let splitQueue { splitQueueEnabled = splitQueue }
         }
     }
 
@@ -4166,12 +4175,18 @@ public final class AppState {
     private var configureEpoch = 0
 
     private func configurePairEngine() async {
-        // 큐 분리는 predict 대기가 있는 엔진(RIFE)에서만 이득 — 위 선언부 주석의 실측 근거 참조
-        splitQueueEnabled = splitQueueOverride ?? (selectedRenderMode == .rife && isInterpolationEnabled)
+        // 큐 분리는 predict 대기가 있는 엔진(RIFE)에서만 이득 — 위 선언부 주석의 실측 근거 참조.
+        // **기입은 아래 swapPairEngine(nil)과 함께 렌더 드라이버로 직렬화한다.** 이 값은 렌더
+        // 스레드 전용 함수(drainAndIngest, checkRenderThread로 강제)가 읽으므로 MainActor에서
+        // 그냥 대입하면 규약 위반이다. 지금은 무해하다 — cb2는 splitQ와 무관하게 항상
+        // stableReadyEvent를 기다리므로(2026-07-26 색노이즈 실측 이후) 최악이 "한 프레임의 cb1이
+        // 반대 큐로 감"이고 `?? workQueue` 폴백이 nil을 막는다 — 그러나 그 무해함은 cb2의 대기
+        // 규칙에 딸린 것이라, 그쪽이 바뀌면 조용히 깨진다.
+        let wantSplit = splitQueueOverride ?? (selectedRenderMode == .rife && isInterpolationEnabled)
         configureEpoch += 1
         let epoch = configureEpoch
         let old = pairEngine
-        swapPairEngine(nil)          // 틱이 더는 old를 못 보게 먼저 떼어낸 뒤
+        swapPairEngine(nil, splitQueue: wantSplit)   // 틱이 더는 old를 못 보게 먼저 떼어낸 뒤
         old?.shutdown()              // 안전하게 해체 (렌더 스레드는 이미 nil만 봄)
 
         guard isInterpolationEnabled else {

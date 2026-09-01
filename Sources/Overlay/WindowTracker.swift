@@ -151,6 +151,17 @@ public final class WindowTracker {
         self.axElement = targetWindow
         self.trackingMethod = .accessibility
 
+        // **동기 AX 호출에 타임아웃을 건다 (2026-09-01).**
+        // AXUIElementCopyAttributeValue는 대상 프로세스로 가는 동기 IPC다. 기본값은 무한 대기라
+        // 소스 앱이 멎으면 호출자가 같이 멎는데, 호출자는 **메인 스레드 30Hz 추적 타이머**다
+        // (AppState.makeTrackingTimer → updateTracking → pollAndUpdateFrame → pollGeometry에서
+        // 매 폴 kAXMinimized를 읽는다). 메인 런루프가 잡히면 Carbon 전역 단축키 배달도 같이
+        // 죽는데, LSUIElement라 Dock 아이콘이 없어 그 단축키가 캡처를 끄는 유일한 탈출구다.
+        // 값은 폴(kAXMinimized)만 보면 50ms로 충분하나, 같은 엘리먼트의 소스 리사이즈
+        // (kAXPosition/kAXSize 쓰기)도 지배하므로 그쪽이 실패하지 않을 0.25s로 잡는다.
+        // 타임아웃 시 결과는 `!= .success` → windowIsMinimized=false로, 이미 안전한 폴백이다.
+        AXUIElementSetMessagingTimeout(targetWindow, 0.25)
+
         // 초기 위치 읽기 — CGWindowList 우선 (정확한 windowID 기반)
         if let geom = readCGWindowListGeometry() ?? readAXGeometry(targetWindow) {
             lastGeometry = geom

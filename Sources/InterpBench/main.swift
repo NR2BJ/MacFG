@@ -901,6 +901,14 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
             guard let mask = det.mask else { i += measureStep; continue }
             let ms = readMaskStats(mask, device: device, queue: queue)
             covs.append(ms.mean); hards.append(ms.hard)
+            // **마스크 시각화 (B2, 여태 미구현).** 숫자로는 "무엇을 놓쳤나"를 못 본다.
+            // 소스 위에 마스크를 초록으로 얹어 한 장 남긴다 — 어디가 얼려지고 어디가 안
+            // 얼려지는지가 한눈에 보인다. 반투명 채팅처럼 배경이 비쳐 시간축 일관성이 깨지는
+            // 영역을 디텍터가 잡는지 여부가 이 그림에서 바로 갈린다.
+            if let dd = Knob.string("MACFG_MASKDUMP"), covs.count == 5 {
+                dumpMaskOverlay(src: a, mask: mask, device: device, queue: queue,
+                                path: "\(dd)/mask_\(name.replacingOccurrences(of: " ", with: "_")).png")
+            }
             var outs: [any MTLTexture] = []
             for useMask in [true, false] {
                 engine.setUIMask(useMask ? mask : nil)
@@ -974,6 +982,43 @@ func maskedSquaredError(device: any MTLDevice, queue: any MTLCommandQueue,
         }
     }
     return (rs, rn, fs, fn)
+}
+
+/// 소스 위에 마스크를 얹은 진단 이미지. 초록 = 마스크가 얼리는 곳(밝을수록 강하게).
+/// 숫자(커버·경도)는 **얼마나**를 말하지만 **어디를**은 말하지 않는다. 정지 UI 검출의
+/// 실패는 대개 위치의 문제다 — 반투명 채팅을 통째로 놓쳤는지, 움직이는 배경을 잘못 잡았는지.
+func dumpMaskOverlay(src: any MTLTexture, mask: any MTLTexture,
+                     device: any MTLDevice, queue: any MTLCommandQueue, path: String) {
+    let s = readTextureBytes(src, device: device, queue: queue)
+    let m = readMaskFloats(mask, device: device, queue: queue)
+    guard !s.isEmpty, !m.isEmpty else { return }
+    let w = src.width, h = src.height, mw = mask.width, mh = mask.height
+    var out = [UInt8](repeating: 0, count: w * h * 4)
+    for y in 0..<h {
+        let my = min(mh - 1, y * mh / h)
+        for x in 0..<w {
+            let mx = min(mw - 1, x * mw / w)
+            let v = Double(min(max(m[my * mw + mx], 0), 1))
+            let i = y * w * 4 + x * 4
+            // BGRA. 원본을 어둡게 깔고 마스크를 초록으로 더한다 — 겹쳐도 원본 구조가 보인다.
+            let b = Double(s[i]), g = Double(s[i + 1]), r = Double(s[i + 2])
+            out[i]     = UInt8(min(255, b * (1 - v * 0.6)))
+            out[i + 1] = UInt8(min(255, g * (1 - v * 0.6) + 255 * v * 0.7))
+            out[i + 2] = UInt8(min(255, r * (1 - v * 0.6)))
+            out[i + 3] = 255
+        }
+    }
+    // BGRA → RGBA 후 PNG (dumpPNG과 같은 경로)
+    for i in stride(from: 0, to: out.count, by: 4) { out.swapAt(i, i + 2) }
+    let cs = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(data: &out, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+          let img = ctx.makeImage(),
+          let dst = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL,
+                                                    UTType.png.identifier as CFString, 1, nil) else { return }
+    CGImageDestinationAddImage(dst, img, nil)
+    CGImageDestinationFinalize(dst)
+    print("  [MASKDUMP] \(path)")
 }
 
 /// r16Float 마스크를 Float 배열로 읽는다.

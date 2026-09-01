@@ -4238,6 +4238,23 @@ public final class AppState {
             return
         }
 
+        // **정지-UI 파라미터를 노브로 연다 (B2, 2026-09-01).**
+        // 지금까지 이 값들은 하드코딩 static var라 **런타임 A/B 자체가 불가능**했다 —
+        // 「열린 이슈」 B2의 "런타임 실측 미실시 / 파라미터 튜닝 미완"이 그래서다.
+        // 매 configure마다 읽어 캡처를 껐다 켜면 새 값이 먹는다(앱 재시작 불요).
+        // 값 범위는 셰이더 가정에 맞춰 좁게 클램프한다: clo < chi가 아니면 smoothstep이 뒤집힌다.
+        if let v = Knob.double("MACFG_UIALPHA") { UIStaticDetector.alpha = Float(min(max(v, 0.005), 0.5)) }
+        if let v = Knob.double("MACFG_UISTRENGTH") { UIStaticDetector.strength = Float(min(max(v, 0), 1)) }
+        if let v = Knob.double("MACFG_UICLO") { UIStaticDetector.clo = Float(max(v, 0)) }
+        if let v = Knob.double("MACFG_UICHI") { UIStaticDetector.chi = Float(max(v, 0)) }
+        if UIStaticDetector.chi <= UIStaticDetector.clo {
+            UIStaticDetector.chi = UIStaticDetector.clo + 0.1   // 뒤집힘 방지
+        }
+        if let v = Knob.int("MACFG_UIMASK") { UIStaticDetector.enabled = v != 0 }
+        DiagnosticLog.shared.log(String(format: "[UISTATIC] alpha=%.3f clo=%.2f chi=%.2f strength=%.2f enabled=%@",
+                                        UIStaticDetector.alpha, UIStaticDetector.clo, UIStaticDetector.chi,
+                                        UIStaticDetector.strength, UIStaticDetector.enabled ? "1" : "0"))
+
         // 정지-UI 검출기 1회 준비 (엔진 무관 공유). 렌더 스레드 미기동이라 여기서 안전하게 생성.
         if uiDetector == nil {
             let det = UIStaticDetector(device: device)

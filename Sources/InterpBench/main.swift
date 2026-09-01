@@ -1,3 +1,5 @@
+import Interpolation
+
 /// InterpBench — 프레임 보간 엔진 벤치마크 (실사용 엔진 대상)
 ///
 /// 사용법: swift run InterpBench [--width 3840] [--height 2160] [--frames 30]
@@ -57,6 +59,7 @@ struct BenchConfig {
     var multiT = false              // 멀티-t 화질 벤치 (t별 PSNR — 24/30fps 경로 검증)
     var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
     var qualityAB = false           // 같은 삼중항에 MetalFlow 화질 변경 4단계를 전부 돌려 비교
+    var uiSweep = false             // B2: 정지-UI 마스크 파라미터 스윕 (--triplets와 함께)
     var tinStride: Int? = nil       // A5: 틴 밀도 — stride N에서 t=1/N..(N-1)/N을 실프레임 GT로 (--triplets와 함께)
 
     static func parse() -> BenchConfig {
@@ -80,6 +83,7 @@ struct BenchConfig {
             case "--triplets": if let v = args.popFirst() { config.tripletsDir = v }
             case "--quality-ab": config.qualityAB = true
             case "--tin-density": if let v = args.popFirst() { config.tinStride = Int(v) }
+            case "--ui-sweep": config.uiSweep = true
             default: break
             }
         }
@@ -774,6 +778,184 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
 ///  - PSNR      : t=0.5 정답과의 공간적 정확도. 높을수록 정확.
 ///  - staticDev : 정지한 픽셀이 원본에서 벗어난 정도. 높을수록 **텍스트/UI가 안정**.
 /// 7/25 변경은 PSNR을 올리면서 staticDev를 떨어뜨렸을 가능성이 크다(눈에 보인 게 그쪽이다).
+/// **B2 정지-UI 마스크 스윕 — 정답(GT) 기준 짝지은 A/B.**
+///
+/// `UIStaticDetector`는 앱에만 배선돼 있고 InterpBench엔 참조가 0건이었다 — B2가 "튜닝 미완"이던
+/// 진짜 이유는 **잴 경로가 없었던 것**이다.
+///
+/// **첫 판(2026-09-01)은 지표를 틀리게 잡았다. 그 실패를 여기 남긴다.**
+/// `staticDev`(정지 픽셀이 A에서 벗어난 정도)와 그 반대 지표로 만든 `freezeErr`를 썼는데,
+/// 둘 다 **산술적으로 퇴화**한다:
+///   - staticDev는 `|A−B| ≤ tol(3)`인 픽셀만 골라 `|interp − A|`를 잰다. 그런데 t=0.5의 프리즈
+///     결과는 (A+B)/2(MetalFlow·RIFE) 또는 B(AppleFI)라 그 게이트가 오차에 **상한을 씌운다**
+///     (각각 ≤1.5, ≤3 ⇒ 항상 ≥44.6dB, ≥38.6dB). 반면 정답 GT는 그 게이트에 안 묶여 상한이 없다.
+///     **즉 "얼리기"가 "정답"을 14~21dB 이긴다.** 마스크를 키우면 좋아지는 게 당연하다.
+///   - `freezeErr`도 `|interp − A|`라 프리즈 타깃(=(A+B)/2)과 정답이 A에서 비슷한 거리에 있고,
+///     커버가 7~17%라 희석돼 판정 문턱에 닿지 못한다 → **모든 행이 후보로 통과**했다(실측).
+///
+/// **그래서 정답을 기준으로, 마스크가 실제로 덮는 영역에서, 짝지어 잰다.**
+/// 파라미터 점마다 같은 프레임·같은 마스크로 두 팔을 돌린다:
+///   on  = setUIMask(mask) 로 보간   /   off = setUIMask(nil) 로 보간
+/// 그리고 **마스크 영역(ROI)에서만** GT 대비 PSNR을 비교한다. 차이가 곧 "이 픽셀들을 얼려서
+/// 정답에 더 가까워졌는가"이고, 이건 마스크를 키운다고 공짜로 오르지 않는다.
+/// full은 화면 전체 — ROI가 좋아지면서 full이 나빠지면 다른 데를 망친 것이다.
+///
+/// **dB는 평균 내지 않고 MSE를 풀링한다.** 삼중항별 dB 평균은 준정지 구간(99dB 포화)이 열 전체를
+/// 끌어올린다 — 기존 코드의 결함이었다.
+///
+/// **EMA 워밍업**: 디텍터는 `frames >= 8`이어야 마스크를 내주고 alpha(기본 0.04)는 25갱신 창이다.
+/// 여기서는 매 프레임 갱신하므로 창의 3배(75장)를 흘린 뒤 측정한다.
+/// **주의**: 앱은 6프레임마다 갱신하므로(AppState `uiDetectFrame % 6`) 실효 창이 150 소스프레임이다
+/// — 벤치와 앱의 시간 상수가 다르다. 여기 결과를 앱 값으로 그대로 옮기지 말 것.
+func runUIMaskSweep(dir: String, engineKey: String, device: any MTLDevice,
+                    queue: any MTLCommandQueue) async {
+    let fm = FileManager.default
+    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
+    guard files.count >= 100 else {
+        print("❌ 프레임 \(files.count)장 — EMA 수렴에 최소 100장 필요. bench_frames는 전부 12장이라 못 쓴다.")
+        return
+    }
+    var frames: [any MTLTexture] = []
+    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
+    guard frames.count >= 100 else { print("❌ 로드 실패"); return }
+    let W = frames[0].width, H = frames[0].height
+    let warm = 75
+    print("▶ 정지-UI 마스크 (GT 기준 짝A/B): \(frames.count)장 \(W)x\(H) (마스크 \(W/2)x\(H/2)) 워밍업 \(warm)  \(dir)")
+
+    let points: [(String, Float, Float, Float, Float)] = [
+        ("현재 .04/.5/1.7", 0.04, 0.5, 1.7, 1.0),
+        ("clo 0.8",        0.04, 0.8, 2.0, 1.0),
+        ("clo 1.2",        0.04, 1.2, 2.4, 1.0),
+        ("clo 0.3",        0.04, 0.3, 1.5, 1.0),
+        ("창 50f(.02)",    0.02, 0.5, 1.7, 1.0),
+        ("창 12f(.08)",    0.08, 0.5, 1.7, 1.0),
+        ("strength 0.6",   0.04, 0.5, 1.7, 0.6),
+    ]
+    print("  설정              cover     ROI(on)  ROI(off)  ROI이득    full이득")
+    for pt in points {
+        let (name, alpha, clo, chi, strength) = pt
+        UIStaticDetector.enabled = true
+        UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
+        UIStaticDetector.chi = chi; UIStaticDetector.strength = strength
+
+        let det = UIStaticDetector(device: device)
+        try? await det.prepare(); det.reset()
+        let engine: any PairInterpolationEngine
+        switch engineKey {
+        case "applefi": engine = AppleFIEngine()
+        case "rife":    engine = RIFEEngine()
+        default:        engine = MetalFlowEngine()
+        }
+        do { try await engine.prepare(device: device) } catch { print("  \(name): prepare 실패"); continue }
+
+        for i in 0..<warm {
+            guard let cb = queue.makeCommandBuffer() else { break }
+            det.update(source: frames[i], into: cb); cb.commit(); await cb.completed()
+        }
+        // MSE 풀링 누적 — (roiOn, roiOff, fullOn, fullOff) 각각 (제곱합, 표본수)
+        var acc = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+        var covs: [Double] = []
+        var i = warm
+        while i + 2 < frames.count {
+            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
+            guard let cbu = queue.makeCommandBuffer() else { break }
+            det.update(source: a, into: cbu); cbu.commit(); await cbu.completed()
+            guard let mask = det.mask else { i += 2; continue }
+            covs.append(readMaskCoverage(mask, device: device, queue: queue))
+            var outs: [any MTLTexture] = []
+            for useMask in [true, false] {
+                engine.setUIMask(useMask ? mask : nil)
+                guard let cb = queue.makeCommandBuffer() else { break }
+                let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) / 60.0,
+                                          tsB: Double(i + 2) / 60.0, tValues: [0.5], into: cb)
+                cb.commit(); await cb.completed()
+                guard let t = r?.frames.first?.texture else { break }
+                // 링 슬롯 재사용으로 덮이기 전에 즉시 읽어야 한다 — 두 팔을 모아 뒀다 재면 안 된다.
+                outs.append(t)
+                let (rs, rn, fs, fn) = maskedSquaredError(device: device, queue: queue,
+                                                          out: t, gt: gt, mask: mask)
+                let k = useMask ? 0 : 1
+                acc[k].0 += rs; acc[k].1 += rn
+                acc[k + 2].0 += fs; acc[k + 2].1 += fn
+            }
+            _ = outs
+            i += 2
+        }
+        engine.shutdown()
+        let db: ((Double, Double)) -> Double = { p in
+            guard p.1 > 0 else { return 0 }
+            let mse = p.0 / p.1
+            return mse <= 0 ? 99 : 10 * log10(255 * 255 / mse)
+        }
+        let rOn = db(acc[0]), rOff = db(acc[1]), fOn = db(acc[2]), fOff = db(acc[3])
+        let C = covs.isEmpty ? 0 : covs.reduce(0, +) / Double(covs.count)
+        let lbl = name.count >= 16 ? name : name + String(repeating: " ", count: 16 - name.count)
+        let mark = (rOn - rOff) > 0.02 && (fOn - fOff) > -0.02 ? "  ✅" : ""
+        print(lbl + String(format: " %5.1f%%  %9.3f %9.3f  %+8.3f  %+8.3f",
+                           C * 100, rOn, rOff, rOn - rOff, fOn - fOff) + mark)
+    }
+    print("\n  ROI = 마스크가 덮는 픽셀만, GT 기준. ROI이득 = 마스크 켬 − 끔 (짝지은 같은 프레임·같은 마스크).")
+    print("  ✅ = ROI이득 > +0.02dB 이면서 full이득 > −0.02dB. 마스크를 키운다고 공짜로 오르지 않는다.")
+}
+
+/// 마스크 가중 제곱오차와 전체 제곱오차를 **한 번에** 낸다 — (ROI합, ROI표본, 전체합, 전체표본).
+/// dB로 바꾸지 않고 합을 돌려주는 이유: 호출측이 시퀀스 전체를 **MSE로 풀링**해야 하기 때문이다.
+/// 삼중항별 dB를 평균하면 준정지 구간(99dB 포화)이 결과를 끌어올린다.
+func maskedSquaredError(device: any MTLDevice, queue: any MTLCommandQueue,
+                        out: any MTLTexture, gt: any MTLTexture,
+                        mask: any MTLTexture, thresh: Double = 0.25)
+                        -> (Double, Double, Double, Double) {
+    let o = readTextureBytes(out, device: device, queue: queue)
+    let g = readTextureBytes(gt, device: device, queue: queue)
+    guard !o.isEmpty, o.count == g.count else { return (0, 0, 0, 0) }
+    let m = readMaskFloats(mask, device: device, queue: queue)
+    guard !m.isEmpty else { return (0, 0, 0, 0) }
+    let w = min(out.width, gt.width), h = min(out.height, gt.height)
+    let rowO = out.width * 4, rowG = gt.width * 4
+    let mw = mask.width, mh = mask.height
+    var rs = 0.0, rn = 0.0, fs = 0.0, fn = 0.0
+    for y in stride(from: 0, to: h, by: 2) {
+        let my = min(mh - 1, y * mh / h)
+        for x in stride(from: 0, to: w, by: 2) {
+            let mx = min(mw - 1, x * mw / w)
+            let inROI = Double(m[my * mw + mx]) >= thresh
+            for c in 0..<3 {
+                let d = Double(o[y * rowO + x * 4 + c]) - Double(g[y * rowG + x * 4 + c])
+                let sq = d * d
+                fs += sq; fn += 1
+                if inROI { rs += sq; rn += 1 }
+            }
+        }
+    }
+    return (rs, rn, fs, fn)
+}
+
+/// r16Float 마스크를 Float 배열로 읽는다.
+func readMaskFloats(_ mask: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue) -> [Float] {
+    let w = mask.width, h = mask.height
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: w, height: h, mipmapped: false)
+    d.storageMode = .shared; d.usage = [.shaderRead, .shaderWrite]
+    guard let dst = device.makeTexture(descriptor: d),
+          let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { return [] }
+    blit.copy(from: mask, sourceSlice: 0, sourceLevel: 0,
+              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              sourceSize: MTLSize(width: w, height: h, depth: 1),
+              to: dst, destinationSlice: 0, destinationLevel: 0,
+              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+    blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+    var raw = [UInt16](repeating: 0, count: w * h)
+    dst.getBytes(&raw, bytesPerRow: w * 2, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+    return raw.map { Float(Float16(bitPattern: $0)) }
+}
+
+/// 마스크 평균(프리즈 비율).
+func readMaskCoverage(_ mask: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue) -> Double {
+    let f = readMaskFloats(mask, device: device, queue: queue)
+    guard !f.isEmpty else { return 0 }
+    return f.reduce(0.0) { $0 + Double($1) } / Double(f.count)
+}
+
 func runQualityABMode(dir: String, device: any MTLDevice, queue: any MTLCommandQueue) async {
     let fm = FileManager.default
     let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
@@ -975,7 +1157,10 @@ func main() async {
     }
 
     if let td = config.tripletsDir {
-        if let stride = config.tinStride {
+        if config.uiSweep {
+            await runUIMaskSweep(dir: td, engineKey: config.engines.first ?? "metalflow",
+                                 device: device, queue: commandQueue)
+        } else if let stride = config.tinStride {
             await runTinDensityMode(dir: td, strideN: stride, engineKeys: config.engines,
                                     device: device, queue: commandQueue)
         } else if config.qualityAB {

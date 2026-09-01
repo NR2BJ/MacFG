@@ -2,6 +2,7 @@ import AppKit
 import Metal
 import CoreGraphics
 import FramePacing
+import Monitoring
 import os
 
 public enum OverlayPlacement: String, CaseIterable, Identifiable, Sendable {
@@ -43,6 +44,8 @@ public final class OverlayManager {
     public var sourceIsOnScreen: Bool { windowTracker.windowIsOnScreen }
     /// 소스 창이 최소화(⌘M)됐는지 — 커버 오버레이 숨김과 추적 동결의 신호.
     public var sourceIsMinimized: Bool { windowTracker.windowIsMinimized }
+    /// 추적이 동결된 상태인지 — 최소화(AX) 또는 독 타일 기하 거부. 오버레이 숨김도 이걸 본다.
+    public private(set) var trackingFrozen = false
 
     /// MacFG 자신이 띄운 창들의 CGWindowID — 디스플레이 캡처 제외 목록용.
     /// 오버레이/뷰어뿐 아니라 설정 창 등 이 앱의 모든 창을 포함해야 되먹임이 없다.
@@ -312,7 +315,32 @@ public final class OverlayManager {
         //      `reconfigure → 56x57` → `resources: src=56x57` → 복원 후 `→ 2503x1598`).
         // 마지막 정상 프레임을 유지하면 복원이 무동작이 된다. trackingFailureCount는 위에서
         // 이미 0으로 리셋했다 — 창은 멀쩡히 존재하므로 "창이 사라졌다" 정지를 걸면 안 된다.
-        if windowTracker.windowIsMinimized { return }
+        if windowTracker.windowIsMinimized {
+            if !trackingFrozen {
+                trackingFrozen = true
+                DiagnosticLog.shared.log("[TRACK] 동결: 최소화(AX) — 프레임 \(Int(lastSourceFrame.width))x\(Int(lastSourceFrame.height)) 유지")
+            }
+            return
+        }
+
+        // **두 번째 방어선 — 독 타일 크기의 기하는 믿지 않는다.**
+        // AX가 최소화를 놓치거나(권한 없음, 앱이 AX를 제대로 안 채움) 최소화 애니메이션이
+        // AX 플래그보다 먼저 프레임을 줄이는 구간이 있으면 위 가드만으로는 샌다. 영상 창이
+        // 200pt 미만으로 줄면서 직전 대비 면적이 1/4 이하가 되는 일은 사용자 리사이즈로는
+        // 일어나지 않는다 — 독 타일(실측 56x57 ~ 70x65)이다.
+        let prev = lastSourceFrame
+        if prev.width > 400, prev.height > 400,
+           geom.size.width < 200, geom.size.height < 200 {
+            if !trackingFrozen {
+                trackingFrozen = true
+                DiagnosticLog.shared.log("[TRACK] 동결: 타일 크기 기하 \(Int(geom.size.width))x\(Int(geom.size.height)) 거부 — \(Int(prev.width))x\(Int(prev.height)) 유지")
+            }
+            return
+        }
+        if trackingFrozen {
+            trackingFrozen = false
+            DiagnosticLog.shared.log("[TRACK] 해제 → \(Int(geom.size.width))x\(Int(geom.size.height))")
+        }
 
         if placement == .coverSource {
             // 위치/크기가 실제로 바뀌었을 때만 setFrame 호출 (윈도우 서버 부하 최소화)

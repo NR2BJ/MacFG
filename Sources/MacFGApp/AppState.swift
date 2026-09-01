@@ -3900,14 +3900,16 @@ public final class AppState {
         // 줄어들 뿐이고 SCK는 그 타일을 계속 배달하므로 `lastFrameArrivalAt`이 갱신되어
         // "1초 무프레임"이 영영 참이 안 된다 — 실측 2026-09-01: ⌘M 후에도 [OVERLAY] 0줄.
         // AX 기반이라 즉답이고, 전체화면 전환과 혼동되지 않는다(WindowTracker 참조).
-        let sourceMinimized = overlayManager?.sourceIsMinimized ?? false
+        // 기하 거부(독 타일)로 동결된 경우도 포함 — AX가 최소화를 놓쳐도 숨겨야 한다.
+        let sourceMinimized = (overlayManager?.sourceIsMinimized ?? false)
+            || (overlayManager?.trackingFrozen ?? false)
         let shouldHide = overlayUserHidden || sourceOffScreen || sourceMinimized
             || (!sourceFront && !coverKeepVisible)
         guard shouldHide != overlayHiddenState else { return }
         overlayHiddenState = shouldHide
         overlayManager?.setOverlayHidden(shouldHide)
         if shouldHide {
-            DiagnosticLog.shared.log("[OVERLAY] hidden (front≠source or manual)")
+            DiagnosticLog.shared.log("[OVERLAY] hidden — \(sourceMinimized ? "최소화" : sourceOffScreen ? "프레임 고갈" : overlayUserHidden ? "수동" : "소스 비최전면")")
         } else {
             // 숨김 동안 프레임을 버려 연속성이 끊김 — 리셋은 렌더 스레드가 자기 틱에서 수행
             pendingShowReset = true

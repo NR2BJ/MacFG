@@ -273,14 +273,18 @@ public final class WindowTracker {
 
     /// 대상 창이 최소화(⌘M)됐는지 — `readCGWindowListGeometry`가 매 폴에서 갱신한다.
     ///
-    /// **왜 캐시인가.** 확정 신호는 AX `kAXMinimized`인데 그건 IPC라 매 틱(15~30Hz) 부르면
-    /// 이미 0.5~2ms인 CGWindowList 폴 위에 그만큼이 더 얹힌다. 대신 같은 폴 응답에 공짜로 들어
-    /// 있는 `kCGWindowIsOnscreen`으로 먼저 거르고 — 화면에 보이는 창은 최소화일 수 없다 —
-    /// **false일 때만** AX로 확정한다. 정상 동작 중 추가 비용이 0이고, 답이 필요한 순간에만 정확하다.
+    /// **`kCGWindowIsOnscreen`으로는 판정할 수 없다.** 최소화된 창은 독 타일로 남고 그 타일이
+    /// 화면에 있으므로 isOnscreen이 **true**다(실측 2026-09-01). 한때 "보이는 창은 최소화가
+    /// 아니다"로 먼저 걸러 AX 호출을 아끼려 했는데, 그 전제가 거짓이라 최소화가 매 폴 false로
+    /// 되돌려졌다 — 로그에 hidden 37ms 뒤 shown이 찍히고 커버가 독 위치(23,1391,70,65)로 옮겨갔다.
     ///
-    /// isOnscreen 하나만으로는 안 된다: 전체화면 전환 중에도 순간 false가 나와서, 그걸 최소화로
+    /// **그리고 아낄 것도 없었다.** 실측: AX `kAXMinimized` **17.6us**,
+    /// 같은 창 하나짜리 `CGWindowListCopyWindowInfo` **134.0us** — 이미 매 폴 부르는 쪽이
+    /// 7.6배 비싸다. 30Hz에서 AX는 0.53ms/s(0.05% CPU)다. 조건 없이 부른다.
+    ///
+    /// AX를 쓰는 또 다른 이유: isOnscreen은 전체화면 전환 중 순간 false로 튀어서 그걸 최소화로
     /// 읽으면 오버레이가 꺼지고 인제스트가 멈춰 텍스처 풀이 옛 크기에 고정되는 연쇄가 났다(실측).
-    /// 최소화와 전체화면 전환은 AX에서는 서로 다른 상태라 이 혼동이 없다.
+    /// AX에서 최소화와 전체화면 전환은 서로 다른 상태라 이 혼동이 없다.
     public private(set) var windowIsMinimized = false
 
     private func readCGWindowListGeometry() -> WindowGeometry? {
@@ -291,9 +295,7 @@ public final class WindowTracker {
             return nil
         }
 
-        if (info[kCGWindowIsOnscreen as String] as? Bool) ?? false {
-            windowIsMinimized = false          // 보이는 창은 최소화가 아니다 — AX 불필요
-        } else if let element = axElement {
+        if let element = axElement {
             var value: CFTypeRef?
             windowIsMinimized = AXUIElementCopyAttributeValue(
                 element, kAXMinimizedAttribute as CFString, &value) == .success

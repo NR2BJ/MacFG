@@ -1224,6 +1224,17 @@ public final class AppState {
                 guard self.isCapturing else { return }
                 // 최소화/Space 이동 감지 — 워크스페이스 알림만으로는 안 잡혀 좀비 오버레이가 남는다
                 self.refreshOverlayVisibility()
+                // **소스가 최소화되면 캡처를 정지한다 (사용자 지정, 2026-09-01).**
+                // 최소화 중에도 계속 돌리려던 앞선 두 시도(추적 동결 + 오버레이 숨김)는
+                // 최소화 창의 기하가 독 타일로 바뀐다는 사실과 계속 싸워야 했다 — 커버가 독
+                // 아이콘 위로 옮겨가고, 캡처가 타일 크기로 재설정돼 복원 직후 화면이 찌그러졌다.
+                // 정지하면 그 상태가 아예 존재하지 않는다. 복귀는 ⌃⌘Z(캡처 토글)로 사용자가 한다.
+                // 기하 방어선(OverlayManager)은 AX가 최소화를 놓치는 경우를 위해 남겨둔다.
+                if self.overlayManager?.sourceIsMinimized == true {
+                    DiagnosticLog.shared.log("[CAPTURE] 소스 최소화 → 정지")
+                    await self.stopCapture()
+                    return
+                }
                 if self.hasReceivedFirstFrame, (self.overlayManager?.trackingFailureCount ?? 0) > 30 {
                     DiagnosticLog.shared.log("[CAPTURE] target window gone (tracking) → stop")
                     await self.stopCapture()

@@ -4252,6 +4252,7 @@ public final class AppState {
         }
         if let v = Knob.int("MACFG_UIMASK") { UIStaticDetector.enabled = v != 0 }
         if let v = Knob.int("MACFG_UIMASKDIV") { UIStaticDetector.maskDiv = max(1, min(v, 8)) }
+        if let v = Knob.double("MACFG_UIEPS") { UIStaticDetector.noiseEps = Float(max(v, 0.0001)) }
         DiagnosticLog.shared.log(String(format: "[UISTATIC] alpha=%.3f clo=%.2f chi=%.2f strength=%.2f div=%d enabled=%@",
                                         UIStaticDetector.alpha, UIStaticDetector.clo, UIStaticDetector.chi,
                                         UIStaticDetector.strength, UIStaticDetector.maskDiv,

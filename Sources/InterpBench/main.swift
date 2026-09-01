@@ -854,9 +854,17 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         ("div6 clo .15",   0.04, 0.15, 1.2, 1.0, 6),
         ("div4 clo .15",   0.04, 0.15, 1.2, 1.0, 4),
     ]
+    // cons 분모의 잡음 바닥 축 — 배포 파라미터를 고정한 채 이것만 바꾼다.
+    // 깨끗한 소스와 잡음 있는 소스에서 **최적점이 다르면** 코덱 의존성이 여기 있다는 뜻이다.
+    let epsPoints: [Float] = [0.001, 0.002, 0.004, 0.008, 0.016]
     print("  설정             cover  경도>.75  ROI이득   full이득   선명도Δ")
-    for pt in points {
-        let (name, alpha, clo, chi, strength, div) = pt
+    var allPoints = points.map { ($0.0, $0.1, $0.2, $0.3, $0.4, $0.5, Float(0.004)) }
+    for e in epsPoints {
+        allPoints.append((String(format: "eps %.3f", e), 0.04, 0.5, 1.7, 1.0, 2, e))
+    }
+    for pt in allPoints {
+        let (name, alpha, clo, chi, strength, div, eps) = pt
+        UIStaticDetector.noiseEps = eps
         UIStaticDetector.enabled = true
         UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
         UIStaticDetector.chi = chi; UIStaticDetector.strength = strength

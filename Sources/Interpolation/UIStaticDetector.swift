@@ -97,6 +97,18 @@ public final class UIStaticDetector {
     /// 상대 폭이 보존된다(4K에서 4 = 1080p에서 2와 같은 화면 비율).
     public nonisolated(unsafe) static var maskDiv: Int = 2
 
+    /// **cons 분모의 잡음 바닥 (기본 0.004).** 코덱 의존성이 여기 있다.
+    ///
+    /// `cons = |EMA(hp)| / (sqrt(var) + eps)`에서 정지 픽셀의 `sqrt(var)`은 **소스의 시간축
+    /// 잡음 그 자체**다. 깨끗한 인코드(VP9 고비트레이트)면 그게 eps보다 작아 **eps가 스케일을
+    /// 지배**하고, 잡음이 있으면(AV1 스트리밍) 실제 잡음이 지배한다 — 같은 UI인데 cons가 몇 배
+    /// 달라지고, 그래서 같은 clo가 콘텐츠마다 다른 뜻이 된다.
+    /// 실측(2026-09-02, 같은 1080p·같은 경도·같은 full이득): 선명도 손해가 AV1 −0.0012 대
+    /// VP9 −0.0040으로 3.3배 갈렸다.
+    /// 최종 목표는 이 값을 소스 잡음에서 추정해 자동으로 맞추는 것이다 — 그래야 화질과 무관하게
+    /// 같은 동작을 준다. 이 노브는 그 전에 "정말 이 상수가 범인인가"를 가르기 위한 것이다.
+    public nonisolated(unsafe) static var noiseEps: Float = 0.004
+
     private func ensure(srcW: Int, srcH: Int) {
         let dv = max(1, Self.maskDiv)
         let mw = max(64, srcW / dv), mh = max(64, srcH / dv)
@@ -183,6 +195,8 @@ public final class UIStaticDetector {
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         var strength = Self.strength
         enc.setBytes(&strength, length: MemoryLayout<Float>.size, index: 1)
+        var p2 = SIMD4<Float>(Self.noiseEps, 0, 0, 0)
+        enc.setBytes(&p2, length: MemoryLayout<SIMD4<Float>>.size, index: 2)
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1), threadsPerThreadgroup: tg)
         enc.endEncoding()
@@ -222,6 +236,7 @@ public final class UIStaticDetector {
         texture2d<float, access::read>  boost [[texture(6)]],   // Vision 텍스트 박스 (r8)
         constant float4& p [[buffer(0)]],       // alpha, clo, chi, reset
         constant float&  strength [[buffer(1)]],
+        constant float4& p2 [[buffer(2)]],      // x=noiseEps, y/z/w 예약
         uint2 gid [[thread_position_in_grid]])
     {
         uint w = maskOut.get_width(), h = maskOut.get_height();
@@ -248,7 +263,8 @@ public final class UIStaticDetector {
         meanOut.write(float4(m0), gid);
         sqOut.write(float4(s0), gid);
         float var0 = max(s0 - m0 * m0, 0.0);
-        float cons = fabs(m0) / (sqrt(var0) + 0.004);        // 시간적 일관성 (정지구조=큼)
+        // 분모의 잡음 바닥은 상수가 아니라 파라미터다 — 소스 코덱에 따라 스케일이 달라진다.
+        float cons = fabs(m0) / (sqrt(var0) + p2.x);         // 시간적 일관성 (정지구조=큼)
         // 구조 게이트: 고주파 크기가 너무 작으면(평탄 배경) UI 아님 — 오검출 방지
         float structured = smoothstep(0.004, 0.02, fabs(m0));
         float m = smoothstep(p.y, p.z, cons) * structured;

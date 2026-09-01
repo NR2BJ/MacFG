@@ -3036,7 +3036,9 @@ public final class AppState {
             inFlightRef.withLock { $0 = max(0, $0 - 1) }
             if let self {
                 // 핸들러는 임의 스레드 — diagSlipHist와 같은 stageLock 규약.
-                let b = leadMs < 0 ? 0 : leadMs < 2 ? 1 : leadMs < 5 ? 2 : leadMs < 10 ? 3 : 4
+                // 칸 경계는 실측 후 넓혔다 — 첫 판(<0/<2/<5/<10)은 전부 마지막 칸에 몰려
+                // 포화됐다. 여유는 항상 10ms를 넘는다(지연 오프셋 3~4슬롯 ≈ 21~28ms).
+                let b = leadMs < 0 ? 0 : leadMs < 10 ? 1 : leadMs < 20 ? 2 : leadMs < 30 ? 3 : 4
                 self.stageLock.lock()
                 if d.presentedTime > 0 { self.diagLeadShown[b] += 1 } else { self.diagLeadDrop[b] += 1 }
                 self.stageLock.unlock()

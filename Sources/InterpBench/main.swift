@@ -60,6 +60,9 @@ struct BenchConfig {
     var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
     var qualityAB = false           // 같은 삼중항에 MetalFlow 화질 변경 4단계를 전부 돌려 비교
     var uiSweep = false             // B2: 정지-UI 마스크 파라미터 스윕 (--triplets와 함께)
+    /// 디텍터 갱신 주기(프레임). 앱은 6(AppState `uiDetectFrame % 6`)이고 벤치 기본은 1이다 —
+    /// 6으로 맞추면 EMA 시간 상수가 앱과 같아져 결과를 그대로 옮길 수 있다(대신 워밍업 450장).
+    var uiStride = 1
     var tinStride: Int? = nil       // A5: 틴 밀도 — stride N에서 t=1/N..(N-1)/N을 실프레임 GT로 (--triplets와 함께)
 
     static func parse() -> BenchConfig {
@@ -84,6 +87,7 @@ struct BenchConfig {
             case "--quality-ab": config.qualityAB = true
             case "--tin-density": if let v = args.popFirst() { config.tinStride = Int(v) }
             case "--ui-sweep": config.uiSweep = true
+            case "--ui-stride": if let v = args.popFirst() { config.uiStride = max(1, Int(v) ?? 1) }
             default: break
             }
         }
@@ -807,8 +811,8 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
 /// 여기서는 매 프레임 갱신하므로 창의 3배(75장)를 흘린 뒤 측정한다.
 /// **주의**: 앱은 6프레임마다 갱신하므로(AppState `uiDetectFrame % 6`) 실효 창이 150 소스프레임이다
 /// — 벤치와 앱의 시간 상수가 다르다. 여기 결과를 앱 값으로 그대로 옮기지 말 것.
-func runUIMaskSweep(dir: String, engineKey: String, device: any MTLDevice,
-                    queue: any MTLCommandQueue) async {
+func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
+                    device: any MTLDevice, queue: any MTLCommandQueue) async {
     let fm = FileManager.default
     let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
         .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
@@ -820,8 +824,15 @@ func runUIMaskSweep(dir: String, engineKey: String, device: any MTLDevice,
     for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
     guard frames.count >= 100 else { print("❌ 로드 실패"); return }
     let W = frames[0].width, H = frames[0].height
-    let warm = 75
-    print("▶ 정지-UI 마스크 (GT 기준 짝A/B): \(frames.count)장 \(W)x\(H) (마스크 \(W/2)x\(H/2)) 워밍업 \(warm)  \(dir)")
+    // **워밍업은 스트라이드에 비례한다.** EMA 창은 alpha 기준 25 **갱신**이고, 갱신은
+    // uiStride 프레임마다 일어난다 → 소스 프레임 기준 창 = 25 × stride. 3 시상수를 흘린다.
+    // stride 1(벤치 기본)이면 75장, stride 6(앱과 동일)이면 450장이 필요하다.
+    let warm = min(75 * uiStride, max(20, frames.count / 2))
+    print("▶ 정지-UI 마스크 (GT 기준 짝A/B): \(frames.count)장 \(W)x\(H) (마스크 \(W/2)x\(H/2))"
+          + " 갱신주기 \(uiStride)프레임 워밍업 \(warm)  \(dir)")
+    if warm < 75 * uiStride {
+        print("  ⚠️ 워밍업이 \(75 * uiStride)장에 못 미친다(프레임 부족) — EMA 미수렴. 결과를 앱 값으로 옮기지 말 것.")
+    }
 
     let points: [(String, Float, Float, Float, Float)] = [
         ("현재 .04/.5/1.7", 0.04, 0.5, 1.7, 1.0),
@@ -849,19 +860,25 @@ func runUIMaskSweep(dir: String, engineKey: String, device: any MTLDevice,
         }
         do { try await engine.prepare(device: device) } catch { print("  \(name): prepare 실패"); continue }
 
-        for i in 0..<warm {
+        for i in stride(from: 0, to: warm, by: uiStride) {
             guard let cb = queue.makeCommandBuffer() else { break }
             det.update(source: frames[i], into: cb); cb.commit(); await cb.completed()
         }
         // MSE 풀링 누적 — (roiOn, roiOff, fullOn, fullOff) 각각 (제곱합, 표본수)
         var acc = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
         var covs: [Double] = []
+        // 측정 삼중항 상한 — 4K에서 CPU 오차 누적이 병목이라 전수는 비싸다. 40개면 MSE 풀링에
+        // 충분하고(픽셀 단위 표본이 4K 40삼중항 = 8천만 개), 파라미터 점 7개 × 두 팔이 감당된다.
+        let measureStep = max(2, 2 * ((frames.count - warm) / 2 / 40))
         var i = warm
         while i + 2 < frames.count {
             let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
-            guard let cbu = queue.makeCommandBuffer() else { break }
-            det.update(source: a, into: cbu); cbu.commit(); await cbu.completed()
-            guard let mask = det.mask else { i += 2; continue }
+            // 앱과 같은 주기로만 갱신한다 — 매 프레임 갱신하면 EMA 시간 상수가 앱과 달라진다.
+            if (i - warm) % uiStride == 0 {
+                guard let cbu = queue.makeCommandBuffer() else { break }
+                det.update(source: a, into: cbu); cbu.commit(); await cbu.completed()
+            }
+            guard let mask = det.mask else { i += measureStep; continue }
             covs.append(readMaskCoverage(mask, device: device, queue: queue))
             var outs: [any MTLTexture] = []
             for useMask in [true, false] {
@@ -880,7 +897,7 @@ func runUIMaskSweep(dir: String, engineKey: String, device: any MTLDevice,
                 acc[k + 2].0 += fs; acc[k + 2].1 += fn
             }
             _ = outs
-            i += 2
+            i += measureStep
         }
         engine.shutdown()
         let db: ((Double, Double)) -> Double = { p in
@@ -1159,7 +1176,7 @@ func main() async {
     if let td = config.tripletsDir {
         if config.uiSweep {
             await runUIMaskSweep(dir: td, engineKey: config.engines.first ?? "metalflow",
-                                 device: device, queue: commandQueue)
+                                 stride: config.uiStride, device: device, queue: commandQueue)
         } else if let stride = config.tinStride {
             await runTinDensityMode(dir: td, strideN: stride, engineKeys: config.engines,
                                     device: device, queue: commandQueue)

@@ -848,8 +848,13 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         ("div4 clo 0.3",   0.04, 0.3, 1.5, 1.0, 4),
         ("div4 clo 0.8",   0.04, 0.8, 2.0, 1.0, 4),
         ("div3 clo .5",    0.04, 0.5, 1.7, 1.0, 3),
+        // 어디서 뒤집히는지 — div4가 세 팔 전부에서 이겼으므로 더 밀어 본다.
+        ("div6 clo 0.3",   0.04, 0.3, 1.5, 1.0, 6),
+        ("div8 clo 0.3",   0.04, 0.3, 1.5, 1.0, 8),
+        ("div6 clo .15",   0.04, 0.15, 1.2, 1.0, 6),
+        ("div4 clo .15",   0.04, 0.15, 1.2, 1.0, 4),
     ]
-    print("  설정              cover     ROI(on)  ROI(off)  ROI이득    full이득")
+    print("  설정             cover  경도>.75  ROI이득   full이득   선명도Δ")
     for pt in points {
         let (name, alpha, clo, chi, strength, div) = pt
         UIStaticDetector.enabled = true
@@ -873,7 +878,7 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         }
         // MSE 풀링 누적 — (roiOn, roiOff, fullOn, fullOff) 각각 (제곱합, 표본수)
         var acc = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
-        var covs: [Double] = []
+        var covs: [Double] = [], hards: [Double] = [], shOn: [Double] = [], shOff: [Double] = []
         // 측정 삼중항 상한 — 4K에서 CPU 오차 누적이 병목이라 전수는 비싸다. 40개면 MSE 풀링에
         // 충분하고(픽셀 단위 표본이 4K 40삼중항 = 8천만 개), 파라미터 점 7개 × 두 팔이 감당된다.
         let measureStep = max(2, 2 * ((frames.count - warm) / 2 / 40))
@@ -886,7 +891,8 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
                 det.update(source: a, into: cbu); cbu.commit(); await cbu.completed()
             }
             guard let mask = det.mask else { i += measureStep; continue }
-            covs.append(readMaskCoverage(mask, device: device, queue: queue))
+            let ms = readMaskStats(mask, device: device, queue: queue)
+            covs.append(ms.mean); hards.append(ms.hard)
             var outs: [any MTLTexture] = []
             for useMask in [true, false] {
                 engine.setUIMask(useMask ? mask : nil)
@@ -897,6 +903,10 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
                 guard let t = r?.frames.first?.texture else { break }
                 // 링 슬롯 재사용으로 덮이기 전에 즉시 읽어야 한다 — 두 팔을 모아 뒀다 재면 안 된다.
                 outs.append(t)
+                // **선명도를 두 팔 각각 잰다.** full이득이 양수인데 선명도가 떨어졌다면
+                // 마스크가 UI를 얼린 게 아니라 전체를 흐리게 해서 PSNR을 번 것이다.
+                let sh = computeSharpnessRatio(device: device, queue: queue, out: t, gt: gt)
+                if useMask { shOn.append(sh) } else { shOff.append(sh) }
                 let (rs, rn, fs, fn) = maskedSquaredError(device: device, queue: queue,
                                                           out: t, gt: gt, mask: mask)
                 let k = useMask ? 0 : 1
@@ -913,11 +923,14 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
             return mse <= 0 ? 99 : 10 * log10(255 * 255 / mse)
         }
         let rOn = db(acc[0]), rOff = db(acc[1]), fOn = db(acc[2]), fOff = db(acc[3])
-        let C = covs.isEmpty ? 0 : covs.reduce(0, +) / Double(covs.count)
+        let mean: ([Double]) -> Double = { $0.isEmpty ? 0 : $0.reduce(0, +) / Double($0.count) }
+        let C = mean(covs), Hd = mean(hards), dSharp = mean(shOn) - mean(shOff)
         let lbl = name.count >= 16 ? name : name + String(repeating: " ", count: 16 - name.count)
-        let mark = (rOn - rOff) > 0.02 && (fOn - fOff) > -0.02 ? "  ✅" : ""
-        print(lbl + String(format: " %5.1f%%  %9.3f %9.3f  %+8.3f  %+8.3f",
-                           C * 100, rOn, rOff, rOn - rOff, fOn - fOff) + mark)
+        // 선명도가 떨어지면(−0.002 초과) 이득의 출처를 의심해야 한다 — 블러로 번 것일 수 있다.
+        let blurry = dSharp < -0.002
+        let mark = blurry ? "  ⚠️흐려짐" : ((fOn - fOff) > -0.02 ? "  ✅" : "  ✗")
+        print(lbl + String(format: " %5.1f%% %5.1f%%  %+7.3f  %+7.3f  %+7.4f",
+                           C * 100, Hd * 100, rOn - rOff, fOn - fOff, dSharp) + mark)
     }
     print("\n  ROI = 마스크가 덮는 픽셀만, GT 기준. ROI이득 = 마스크 켬 − 끔 (짝지은 같은 프레임·같은 마스크).")
     print("  ✅ = ROI이득 > +0.02dB 이면서 full이득 > −0.02dB. 마스크를 키운다고 공짜로 오르지 않는다.")
@@ -973,11 +986,19 @@ func readMaskFloats(_ mask: any MTLTexture, device: any MTLDevice, queue: any MT
     return raw.map { Float(Float16(bitPattern: $0)) }
 }
 
-/// 마스크 평균(프리즈 비율).
-func readMaskCoverage(_ mask: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue) -> Double {
+/// 마스크 평균(프리즈 비율)과 **경도** — 0.75를 넘는 픽셀 비율.
+///
+/// 평균만 보면 속는다. 격자를 거칠게 하면(maskDiv↑) 업샘플이 마스크를 뭉개서 **화면 전체에
+/// 옅은 블렌드**가 되는데, 평균은 그것도 "커버가 늘었다"로 읽는다. 그건 UI를 얼린 게 아니라
+/// 전부를 살짝 흐리게 한 것이고, PSNR은 블러를 보상하므로 점수만 오른다(이 저장소에 기록된
+/// 함정). 경도가 낮은데 평균만 높으면 그 경우다.
+func readMaskStats(_ mask: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue)
+                   -> (mean: Double, hard: Double) {
     let f = readMaskFloats(mask, device: device, queue: queue)
-    guard !f.isEmpty else { return 0 }
-    return f.reduce(0.0) { $0 + Double($1) } / Double(f.count)
+    guard !f.isEmpty else { return (0, 0) }
+    var sum = 0.0, hard = 0.0
+    for v in f { sum += Double(v); if v > 0.75 { hard += 1 } }
+    return (sum / Double(f.count), hard / Double(f.count))
 }
 
 func runQualityABMode(dir: String, device: any MTLDevice, queue: any MTLCommandQueue) async {

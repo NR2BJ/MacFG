@@ -109,6 +109,39 @@ public final class UIStaticDetector {
     /// 같은 동작을 준다. 이 노브는 그 전에 "정말 이 상수가 범인인가"를 가르기 위한 것이다.
     public nonisolated(unsafe) static var noiseEps: Float = 0.004
 
+    /// **hp 박스 반경 (마스크 픽셀). 0 = 소스 해상도에서 자동.**
+    ///
+    /// `hp = luma − boxAvg(luma)`의 박스가 (2R+1)² 크기다. 이 반경은 **마스크 픽셀** 단위이고
+    /// 마스크는 소스/`maskDiv`이므로, R이 고정이면 박스가 덮는 **소스 영역도 고정**이다.
+    /// 그런데 같은 UI는 4K에서 픽셀로 2배 크므로, 고정 박스는 UI 대비 **절반 폭**이 되어
+    /// 고주파 응답이 약해지고 검출이 떨어진다.
+    /// 실측(2026-09-02, 같은 콘텐츠·해상도만 다름): 경도 3.1%(1080p) → **1.7%(4K)**.
+    ///
+    /// **`maskDiv`를 키우는 것과 다르다.** div를 키우면 분석 스케일과 **마스크 해상도**가 같이
+    /// 내려가, 업샘플 때 마스크가 뭉개져 화면 전체가 옅게 블렌드된다(실측 선명도 −0.0040).
+    /// 반경만 키우면 마스크는 소스/2로 선명하게 유지된다 — 그게 이 파라미터의 존재 이유다.
+    public nonisolated(unsafe) static var hpRadius: Int = 0
+
+    /// 기본 반경 = **2 (5x5)**. 해상도와 무관하게 고정이다.
+    ///
+    /// 처음엔 해상도에 비례시키려 했는데(1080p=1, 4K=2), 실측은 **R2가 모든 해상도에서 R1을
+    /// 이겼다** — 연산자가 애초에 전부에서 좁았던 것이다:
+    /// ```
+    ///                 경도(R1 → R2)      선명도Δ(R1 → R2)   갱신비용
+    /// ow_fhd  1080p   5.8% → 7.9%       +0.0000 → -0.0002   (미미)
+    /// 위      1080p   3.1% → 5.2%       -0.0014 → -0.0020
+    /// 위      4K      1.7% → 3.9%       -0.0011 → -0.0014   4.04 → 4.96ms
+    /// ```
+    /// R3(7x7)은 4K에서 경도 5.1%로 1080p 수준을 회복하지만 갱신이 **6.48ms(+60%)**다.
+    /// 이 패스는 이미 비싸서 앱이 6프레임마다만 돌린다(cb1 +3ms → work +11ms 증폭 기록).
+    /// 그래서 기본은 2로 두고 R3은 `MACFG_UIRADIUS=3`으로 남긴다 — 4K에서 검출을 더 원하고
+    /// 프레임 여유가 있으면 쓸 수 있다.
+    ///
+    /// **`maskDiv`를 키우는 것과 왜 다른가**: div는 분석 스케일과 마스크 해상도를 **같이**
+    /// 내려 업샘플에서 마스크가 뭉개진다(4K div4: 경도 3.0% · 선명도 −0.0024). 반경만 키우면
+    /// 마스크는 소스/2로 선명하다(4K R2: 경도 3.9% · 선명도 −0.0014) — 더 잡고 덜 흐리다.
+    static func autoRadius(srcShortSide: Int) -> Int { 2 }
+
     private func ensure(srcW: Int, srcH: Int) {
         let dv = max(1, Self.maskDiv)
         let mw = max(64, srcW / dv), mh = max(64, srcH / dv)
@@ -195,7 +228,11 @@ public final class UIStaticDetector {
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         var strength = Self.strength
         enc.setBytes(&strength, length: MemoryLayout<Float>.size, index: 1)
-        var p2 = SIMD4<Float>(Self.noiseEps, 0, 0, 0)
+        // 반경은 0(자동)이면 소스 해상도에서 유도한다. `w`는 마스크 폭이므로 소스 짧은 변은
+        // `min(w,h) * maskDiv`다.
+        let R = Self.hpRadius > 0 ? Self.hpRadius
+                                  : Self.autoRadius(srcShortSide: min(w, h) * max(1, Self.maskDiv))
+        var p2 = SIMD4<Float>(Self.noiseEps, Float(R), 0, 0)
         enc.setBytes(&p2, length: MemoryLayout<SIMD4<Float>>.size, index: 2)
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1), threadsPerThreadgroup: tg)
@@ -249,10 +286,12 @@ public final class UIStaticDetector {
         // 3x3 박스 대비 고주파 (마스크 해상도 = 소스 1/2, bilinear 자동 다운샘플)
         half lc = dot(src.sample(s, uv).rgb, kL);
         half acc = 0.0h;
-        for (int dy = -1; dy <= 1; dy++)
-          for (int dx = -1; dx <= 1; dx++)
+        int R = max(1, int(p2.y));               // 박스 반경 — 해상도에서 유도(호출측)
+        int n = (2 * R + 1) * (2 * R + 1);
+        for (int dy = -R; dy <= R; dy++)
+          for (int dx = -R; dx <= R; dx++)
             acc += dot(src.sample(s, uv + float2(float(dx), float(dy)) * e).rgb, kL);
-        float hp = float(lc - acc / 9.0h);       // 고주파 (구조=큼, 평탄=0)
+        float hp = float(lc - acc / half(n));    // 고주파 (구조=큼, 평탄=0)
         float a = p.x;
         float m0, s0;
         if (p.w > 0.5) { m0 = hp; s0 = hp * hp; }           // reset

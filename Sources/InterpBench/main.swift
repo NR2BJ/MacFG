@@ -857,14 +857,24 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
     // cons 분모의 잡음 바닥 축 — 배포 파라미터를 고정한 채 이것만 바꾼다.
     // 깨끗한 소스와 잡음 있는 소스에서 **최적점이 다르면** 코덱 의존성이 여기 있다는 뜻이다.
     let epsPoints: [Float] = [0.001, 0.002, 0.004, 0.008, 0.016]
-    print("  설정             cover  경도>.75  ROI이득   full이득   선명도Δ")
-    var allPoints = points.map { ($0.0, $0.1, $0.2, $0.3, $0.4, $0.5, Float(0.004)) }
+    // **반경 축 — maskDiv와 달리 마스크 해상도는 소스/2로 유지한다.**
+    // div를 키우면 분석 스케일과 마스크 해상도가 같이 내려가 업샘플에서 뭉개졌다(선명도 −0.0040).
+    // 반경만 키우면 분석 스케일만 넓어지므로, 검출 이득을 얻으면서 블러가 없어야 한다 —
+    // 그 예측이 맞는지가 이 축의 전부다. 0 = 소스 해상도에서 자동(1080p→1, 4K→2).
+    let radiusPoints: [Int] = [1, 2, 3, 0]
+    print("  설정             cover  경도>.75  ROI이득   full이득   선명도Δ  갱신비용")
+    var allPoints = points.map { ($0.0, $0.1, $0.2, $0.3, $0.4, $0.5, Float(0.004), 1) }
     for e in epsPoints {
-        allPoints.append((String(format: "eps %.3f", e), 0.04, 0.5, 1.7, 1.0, 2, e))
+        allPoints.append((String(format: "eps %.3f", e), 0.04, 0.5, 1.7, 1.0, 2, e, 1))
+    }
+    for r in radiusPoints {
+        allPoints.append((r == 0 ? "R auto" : "R \(r) (\(2*r+1)x\(2*r+1))",
+                          0.04, 0.5, 1.7, 1.0, 2, 0.004, r))
     }
     for pt in allPoints {
-        let (name, alpha, clo, chi, strength, div, eps) = pt
+        let (name, alpha, clo, chi, strength, div, eps, rad) = pt
         UIStaticDetector.noiseEps = eps
+        UIStaticDetector.hpRadius = rad
         UIStaticDetector.enabled = true
         UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
         UIStaticDetector.chi = chi; UIStaticDetector.strength = strength
@@ -880,10 +890,18 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         }
         do { try await engine.prepare(device: device) } catch { print("  \(name): prepare 실패"); continue }
 
+        // **디텍터 갱신 비용을 같이 잰다.** 박스 반경을 R로 키우면 텍스처 샘플이 (2R+1)²로
+        // 늘어난다(3x3=9 → 7x7=49, 5.4배). 이 패스는 4K에서 cb1 +3ms이고 workQueue 백로그가
+        // 그걸 +11ms work로 증폭한다고 기록돼 있다 — 화질 이득을 성능으로 사는 것이면 알아야 한다.
+        var updMs: [Double] = []
         for i in stride(from: 0, to: warm, by: uiStride) {
             guard let cb = queue.makeCommandBuffer() else { break }
+            let t0 = CFAbsoluteTimeGetCurrent()
             det.update(source: frames[i], into: cb); cb.commit(); await cb.completed()
+            updMs.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         }
+        let updAvg = updMs.count > 8
+            ? updMs.suffix(updMs.count - 8).reduce(0, +) / Double(updMs.count - 8) : 0
         // MSE 풀링 누적 — (roiOn, roiOff, fullOn, fullOff) 각각 (제곱합, 표본수)
         var acc = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
         var covs: [Double] = [], hards: [Double] = [], shOn: [Double] = [], shOff: [Double] = []
@@ -945,8 +963,8 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         // 선명도가 떨어지면(−0.002 초과) 이득의 출처를 의심해야 한다 — 블러로 번 것일 수 있다.
         let blurry = dSharp < -0.002
         let mark = blurry ? "  ⚠️흐려짐" : ((fOn - fOff) > -0.02 ? "  ✅" : "  ✗")
-        print(lbl + String(format: " %5.1f%% %5.1f%%  %+7.3f  %+7.3f  %+7.4f",
-                           C * 100, Hd * 100, rOn - rOff, fOn - fOff, dSharp) + mark)
+        print(lbl + String(format: " %5.1f%% %5.1f%%  %+7.3f  %+7.3f  %+7.4f %6.2fms",
+                           C * 100, Hd * 100, rOn - rOff, fOn - fOff, dSharp, updAvg) + mark)
     }
     print("\n  ROI = 마스크가 덮는 픽셀만, GT 기준. ROI이득 = 마스크 켬 − 끔 (짝지은 같은 프레임·같은 마스크).")
     print("  ✅ = ROI이득 > +0.02dB 이면서 full이득 > −0.02dB. 마스크를 키운다고 공짜로 오르지 않는다.")

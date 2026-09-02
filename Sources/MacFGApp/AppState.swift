@@ -4253,9 +4253,11 @@ public final class AppState {
         if let v = Knob.int("MACFG_UIMASK") { UIStaticDetector.enabled = v != 0 }
         if let v = Knob.int("MACFG_UIMASKDIV") { UIStaticDetector.maskDiv = max(1, min(v, 8)) }
         if let v = Knob.double("MACFG_UIEPS") { UIStaticDetector.noiseEps = Float(max(v, 0.0001)) }
-        DiagnosticLog.shared.log(String(format: "[UISTATIC] alpha=%.3f clo=%.2f chi=%.2f strength=%.2f div=%d enabled=%@",
+        if let v = Knob.int("MACFG_UIRADIUS") { UIStaticDetector.hpRadius = max(0, min(v, 3)) }
+        DiagnosticLog.shared.log(String(format: "[UISTATIC] alpha=%.3f clo=%.2f chi=%.2f strength=%.2f div=%d R=%d enabled=%@",
                                         UIStaticDetector.alpha, UIStaticDetector.clo, UIStaticDetector.chi,
                                         UIStaticDetector.strength, UIStaticDetector.maskDiv,
+                                        UIStaticDetector.hpRadius,
                                         UIStaticDetector.enabled ? "1" : "0"))
 
         // 정지-UI 검출기 1회 준비 (엔진 무관 공유). 렌더 스레드 미기동이라 여기서 안전하게 생성.

@@ -867,6 +867,11 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
     for e in epsPoints {
         allPoints.append((String(format: "eps %.3f", e), 0.04, 0.5, 1.7, 1.0, 2, e, 1))
     }
+    // MetalFlow 전용 축: UI 마스크 타깃 (B 원본 vs (A+B)/2). 자체 staticness와 충돌하는지 본다.
+    if engineKey == "metalflow" || engineKey.isEmpty {
+        allPoints.append(("UI→(A+B)/2 옛", 0.04, 0.5, 1.7, 1.0, 2, 0.004, -1))
+        allPoints.append(("UI→B 신 R1",     0.04, 0.5, 1.7, 1.0, 2, 0.004, -2))
+    }
     for r in radiusPoints {
         allPoints.append((r == 0 ? "R auto" : "R \(r) (\(2*r+1)x\(2*r+1))",
                           0.04, 0.5, 1.7, 1.0, 2, 0.004, r))
@@ -874,7 +879,9 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
     for pt in allPoints {
         let (name, alpha, clo, chi, strength, div, eps, rad) = pt
         UIStaticDetector.noiseEps = eps
-        UIStaticDetector.hpRadius = rad
+        // rad < 0 = MetalFlow UI 타깃 축 (반경은 1로 고정해 타깃만 가른다)
+        MetalFlowEngine.uiMaskToB = rad != -1
+        UIStaticDetector.hpRadius = rad < 0 ? 1 : rad
         UIStaticDetector.enabled = true
         UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
         UIStaticDetector.chi = chi; UIStaticDetector.strength = strength

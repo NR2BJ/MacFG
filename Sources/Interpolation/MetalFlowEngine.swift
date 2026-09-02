@@ -485,7 +485,17 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var useUIMask: Float = 0
         var confMax: Float = MetalFlowEngine.confMax
         var confGamma: Float = MetalFlowEngine.confGamma
+        /// UI 마스크 타깃: 1 = bOrig(B 원본, 자체 staticness와 같은 곳), 0 = nearestPix((A+B)/2, 옛 동작).
+        var uiToB: Float = MetalFlowEngine.uiMaskToB ? 1 : 0
     }
+
+    /// UI 마스크를 `bOrig`로 보낼지 — **기본 false(=(A+B)/2). 시험했고 명확히 나빴다.**
+    /// 실측(ow_fhd, 2026-09-02): ROI이득 +0.477 → **−0.523**, full −0.017 → −0.090.
+    /// 선명도는 올랐지만(+0.0018) 정확도가 무너진다 — t=0.5의 정답은 중간 프레임이고 B는
+    /// 반 프레임 늦다. 그리고 **반투명 UI에서 글자 자체는 A와 B가 같아** 타깃을 바꿔도 안 변한다;
+    /// 바뀌는 것은 뒤에 비치는 배경뿐이고 거기선 (A+B)/2가 정답에 가깝다.
+    /// 플래그는 회귀 확인용으로만 남긴다.
+    public nonisolated(unsafe) static var uiMaskToB = false
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
         let tg = MTLSize(width: 16, height: 16, depth: 1)
@@ -596,7 +606,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; };
     struct FinalizeParams { float confLo; float confHi; float confRel; float photoLo; float photoHi; float statLo; float statHi; };
-    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -902,10 +912,20 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                                half(smoothstep(p.fadeLo, p.fadeHi, t)));
         half3 moving = mix(nearestPix, interp, conf);
         half3 outc = mix(moving, bOrig, half(staticness)); // 정적 → B 원본 (선명)
-        // 시간축 정지-UI 프리즈 (staticness가 못 잡는 반투명/저대비 UI) — 소스로 고정
+        // 시간축 정지-UI 프리즈 (staticness가 못 잡는 반투명/저대비 UI) — 소스로 고정.
+        //
+        // **타깃 선택 (2026-09-02).** 여태 `nearestPix`(t=0.5에서 (A+B)/2)로 갔는데, 바로 위
+        // `staticness` 경로는 `bOrig`(B 원본, 선명)로 간다. 두 경로가 겹치는 픽셀에서 UI 마스크가
+        // **자기 엔진의 선명한 프리즈를 고스트로 되돌린다.** RIFE엔 이 충돌이 없다 —
+        // 거기선 자체 정적 경로와 UI 마스크가 둘 다 srcBlend로 간다(RIFEEngine :1185/:1190).
+        // 실측으로도 MetalFlow만 마스크의 full이득이 음수다(−0.017 대 RIFE +0.059, AppleFI +0.412).
+        // 완전 정지 픽셀(A==B)에서는 두 타깃이 같으므로, 차이는 **반투명 UI 뒤로 배경이 흐르는**
+        // 바로 그 경우에만 난다 — 사용자가 "채팅 흔들림은 MetalFlow가 더 심하다"고 한 상황이다.
+        // **시험 결과 bOrig는 명확히 나빴다(위 uiMaskToB 주석의 수치). 기본은 nearestPix다.**
         if (p.useUIMask > 0.5) {
             float uim = clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
-            outc = mix(outc, nearestPix, half(uim));
+            half3 uiTarget = p.uiToB > 0.5 ? bOrig : nearestPix;
+            outc = mix(outc, uiTarget, half(uim));
         }
         dst.write(half4(outc, 1.0h), gid);
     }

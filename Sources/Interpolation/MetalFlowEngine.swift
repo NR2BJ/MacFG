@@ -204,7 +204,30 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     private var nextStamp: UInt64 = 0
     /// 화면정지 UI 마스크 (UIStaticDetector) — 워프가 이 영역을 소스로 프리즈
     private var uiMaskTex: (any MTLTexture)?
-    public func setUIMask(_ texture: (any MTLTexture)?) { uiMaskTex = texture }
+
+    /// **MetalFlow는 정지-UI 마스크를 기본으로 쓰지 않는다 (2026-09-02).**
+    ///
+    /// 이 엔진에는 이미 자체 정적 경로가 있다 — `staticness`가 소스 변화 없는 픽셀을 `bOrig`로
+    /// 보낸다. RIFE에는 그게 없어서 정적 UI가 flow에 끌려 찢겼고(RIFEEngine :1180 주석),
+    /// UIStaticDetector 마스크는 원래 **그 공백을 메우려고** 만든 것이다.
+    /// MetalFlow에 같은 마스크를 덧씌우면 이미 잘 처리된 영역을 (A+B)/2로 덮어 **좋은 flow를 버린다.**
+    ///
+    /// 실측 — 사용자가 육안으로 RIFE와 차이를 확인한 두 구간(오버워치 방송 29:54 / 21:00):
+    /// ```
+    ///          ROI이득    full이득
+    /// rife      +1.348    +0.110   /  +1.983  +0.202     마스크가 크게 이득
+    /// metalflow -0.474    -0.055   /  -1.184  -0.115     마스크가 **손해**
+    /// ```
+    /// 부호가 엔진 간에 뒤집힌다. 일반 코퍼스 평균에서는 MetalFlow도 ROI +0.42로 약한 이득이지만
+    /// full은 −0.013으로 손해이고, **눈에 띄는 것은 어려운 구간이므로** 그쪽에 맞춘다.
+    /// AppleFI(+3.60)와 RIFE(+0.86)는 계속 쓴다 — 거기선 강한 이득이다.
+    /// `MACFG_MFUIMASK=1`로 되돌릴 수 있다.
+    public nonisolated(unsafe) static var useUIMask =
+        Knob.string("MACFG_MFUIMASK") == "1"
+
+    public func setUIMask(_ texture: (any MTLTexture)?) {
+        uiMaskTex = Self.useUIMask ? texture : nil
+    }
     // 히스토그램은 쌍당 1개 — 별도 링
     private var statsBuffers: [any MTLBuffer] = []
     private var statsIndex = 0

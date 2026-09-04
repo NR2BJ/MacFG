@@ -60,6 +60,7 @@ struct BenchConfig {
     var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
     var qualityAB = false           // 같은 삼중항에 MetalFlow 화질 변경 4단계를 전부 돌려 비교
     var uiSweep = false             // B2: 정지-UI 마스크 파라미터 스윕 (--triplets와 함께)
+    var uiShimmer = false           // B2: 흔들림(교대) 지표 — 엔진·대조군 비교 (--triplets와 함께)
     /// 디텍터 갱신 주기(프레임). 앱은 6(AppState `uiDetectFrame % 6`)이고 벤치 기본은 1이다 —
     /// 6으로 맞추면 EMA 시간 상수가 앱과 같아져 결과를 그대로 옮길 수 있다(대신 워밍업 450장).
     var uiStride = 1
@@ -87,6 +88,7 @@ struct BenchConfig {
             case "--quality-ab": config.qualityAB = true
             case "--tin-density": if let v = args.popFirst() { config.tinStride = Int(v) }
             case "--ui-sweep": config.uiSweep = true
+            case "--ui-shimmer": config.uiShimmer = true
             case "--ui-stride": if let v = args.popFirst() { config.uiStride = max(1, Int(v) ?? 1) }
             default: break
             }
@@ -1095,6 +1097,167 @@ func readMaskStats(_ mask: any MTLTexture, device: any MTLDevice, queue: any MTL
     return (sum / Double(f.count), hard / Double(f.count))
 }
 
+/// **흔들림(교대) 지표 — B2의 지각과 맞는 숫자를 찾기 위한 모드 (`--ui-shimmer`).**
+///
+/// 눈이 보는 "글자 흔들림"은 단일 프레임 오차가 아니라 소스/보간 프레임 간 **교대**다:
+/// 소스 프레임에서 글자는 정확하고 보간 프레임에서 δ만큼 어긋나면, 120Hz에서 정확/어긋남이
+/// 60Hz로 번갈아 보인다. PSNR은 |δ|를 재지만 그것이 일정한지 깜박이는지는 구분 못 한다.
+///
+/// 정의 (Codex 제안을 따름): 출력 스트림 O=[A, interp, B, …]와 정답 G=[i, i+1, i+2, …]에서
+///   e_k = H(O_k) − H(G_k)   (H = 3x3 박스 대비 고주파, **글자 ROI**만)
+///   T   = mean_k |e_{k+1} − e_k|
+/// 소스 프레임은 e=0이므로 보간 프레임 오차가 그대로 교대 크기가 된다.
+/// 글자 ROI = mask>0.5 ∧ |A−B|<tol — **모든 팔에 같은 ROI**(마스크는 고정, 첫 팔에서 뽑음).
+///
+/// 이 지표도 얼리면 T≈0이라 단독으로는 퇴화한다. 그래서 같이 찍는다:
+///   ghost  — 글자 ROI 바깥 링(팽창−마스크)의 고주파 초과 = 워프가 글자를 밖으로 끌어낸 유령 획
+///   moving — |A−B|≥tol 픽셀의 GT 대비 PSNR = 모션을 망쳤는지 (얼리기를 벌한다)
+///   sharp  — 선명도 비율
+/// 그리고 **대조군** hold(=A 복사)·blend((A+B)/2)를 같은 표에 넣어, 각 지표가 각 결함을
+/// 실제로 잡는지 먼저 본다. hold는 T·ghost가 0에 가깝고 moving이 최악이어야 정상이다.
+func runUIShimmerMode(dir: String, engineKeys: [String], device: any MTLDevice,
+                      queue: any MTLCommandQueue) async {
+    let fm = FileManager.default
+    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
+    guard files.count >= 100 else { print("❌ 프레임 \(files.count)장 — 100장 이상 필요"); return }
+    var frames: [any MTLTexture] = []
+    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
+    guard frames.count >= 100 else { print("❌ 로드 실패"); return }
+    let W = frames[0].width, H = frames[0].height
+    let warm = 75, step = max(2, 2 * ((frames.count - warm) / 2 / 30))
+    print("▶ 흔들림(교대) 지표: \(frames.count)장 \(W)x\(H)  \(dir)")
+
+    // 마스크는 배포 기본 디텍터로 한 번만 뽑아 모든 팔이 공유한다 (ROI 고정).
+    UIStaticDetector.enabled = true; UIStaticDetector.hpRadius = 0
+    let det = UIStaticDetector(device: device); try? await det.prepare(); det.reset()
+    for i in 0..<warm {
+        guard let cb = queue.makeCommandBuffer() else { break }
+        det.update(source: frames[i], into: cb); cb.commit(); await cb.completed()
+    }
+    // 측정 인덱스와 그 시점 마스크(Float 배열)를 미리 확보 — 팔마다 디텍터를 다시 돌리지 않는다.
+    var idx: [Int] = [], masks: [[Float]] = []
+    var fed = warm, i = warm
+    while i + 2 < frames.count {
+        while fed <= i {
+            guard let cb = queue.makeCommandBuffer() else { break }
+            det.update(source: frames[fed], into: cb); cb.commit(); await cb.completed(); fed += 1
+        }
+        if let m = det.mask { idx.append(i); masks.append(readMaskFloats(m, device: device, queue: queue)) }
+        i += step
+    }
+    guard !idx.isEmpty, let maskTexRef = det.mask else { print("❌ 마스크 없음"); return }
+    let mw = maskTexRef.width, mh = maskTexRef.height
+
+    var arms: [(String, (any PairInterpolationEngine)?)] = [("hold(A)", nil), ("blend", nil)]
+    let all: [(String, any PairInterpolationEngine)] = [("metalflow", MetalFlowEngine()),
+        ("applefi", AppleFIEngine()), ("rife", RIFEEngine())]
+    for (k, e) in all where engineKeys.contains("all") || engineKeys.contains(k) { arms.append((k, e)) }
+
+    print("  팔            T(교대)   ghost    moving    sharp   |  T·ghost 낮고 moving 높아야 좋다")
+    for (name, engine) in arms {
+        if let e = engine { do { try await e.prepare(device: device) } catch { print("  \(name) prepare 실패"); continue } }
+        // 두 인스턴스가 아니라 한 팔이므로 이력 공유 문제 없음. 마스크는 항상 켠다(배포 조건).
+        var Tsum = 0.0, Tn = 0.0, ghostSum = 0.0, ghostN = 0.0
+        var movSq = 0.0, movN = 0.0, sharps: [Double] = []
+        for (k, i) in idx.enumerated() {
+            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
+            let mask = masks[k]
+            let out: any MTLTexture
+            if let e = engine {
+                // 이 팔의 엔진에 이 시점 마스크를 텍스처로 다시 올려야 하지만, 디텍터 마스크
+                // 텍스처는 하나뿐이다 — 대신 디텍터 '현재' 마스크를 그대로 쓴다. 측정 인덱스
+                // 진행과 디텍터 상태가 위에서 같은 순서로 갱신됐으므로 마지막 마스크와 거의 같다.
+                e.setUIMask(det.mask)
+                guard let cb = queue.makeCommandBuffer() else { break }
+                let r = e.encodePair(stableA: a, stableB: b, tsA: Double(i) / 60.0,
+                                     tsB: Double(i + 2) / 60.0, tValues: [0.5], into: cb)
+                cb.commit(); await cb.completed()
+                guard let t = r?.frames.first?.texture else { continue }
+                out = t
+            } else if name == "hold(A)" { out = a }
+            else { guard let bl = makeBlend(a, b, device: device, queue: queue) else { continue }; out = bl }
+
+            let (T, gh, mq, mn) = shimmerStats(device: device, queue: queue, a: a, b: b, gt: gt,
+                                               out: out, mask: mask, mw: mw, mh: mh)
+            Tsum += T.0; Tn += T.1; ghostSum += gh.0; ghostN += gh.1; movSq += mq; movN += mn
+            sharps.append(computeSharpnessRatio(device: device, queue: queue, out: out, gt: gt))
+        }
+        engine?.shutdown()
+        let Tv = Tn > 0 ? Tsum / Tn : 0, gv = ghostN > 0 ? ghostSum / ghostN : 0
+        let mov = movN > 0 ? 10 * log10(255 * 255 / max(movSq / movN, 1e-9)) : 0
+        let sh = sharps.isEmpty ? 0 : sharps.reduce(0, +) / Double(sharps.count)
+        let lbl = name.count >= 12 ? name : name + String(repeating: " ", count: 12 - name.count)
+        print("  " + lbl + String(format: " %8.3f %8.3f %8.2f %8.3f", Tv, gv, mov, sh))
+    }
+    print("\n  T = 글자 ROI 고주파 오차의 프레임 간 변화량(교대). ghost = ROI 바깥 링의 고주파 초과.")
+    print("  moving = 움직인 픽셀의 GT 대비 PSNR(얼리기를 벌함). hold 행이 T≈0·moving 최악이면 지표가 작동하는 것.")
+}
+
+/// 글자 ROI 교대량·유령 링·움직임 오차를 한 번에. ROI = mask>0.5 ∧ |A−B|<tol.
+/// 반환: (T합, T표본), (ghost합, ghost표본), moving제곱합, moving표본.
+func shimmerStats(device: any MTLDevice, queue: any MTLCommandQueue,
+                  a: any MTLTexture, b: any MTLTexture, gt: any MTLTexture, out: any MTLTexture,
+                  mask: [Float], mw: Int, mh: Int, tol: Double = 6.0)
+                  -> ((Double, Double), (Double, Double), Double, Double) {
+    let A = readTextureBytes(a, device: device, queue: queue)
+    let B = readTextureBytes(b, device: device, queue: queue)
+    let G = readTextureBytes(gt, device: device, queue: queue)
+    let O = readTextureBytes(out, device: device, queue: queue)
+    guard !A.isEmpty, A.count == B.count, A.count == G.count, A.count == O.count else { return ((0,0),(0,0),0,0) }
+    let w = a.width, h = a.height, row = w * 4
+    @inline(__always) func lum(_ p: [UInt8], _ x: Int, _ y: Int) -> Double {
+        let i = y * row + x * 4
+        return 0.114 * Double(p[i]) + 0.587 * Double(p[i+1]) + 0.299 * Double(p[i+2])
+    }
+    @inline(__always) func hp(_ p: [UInt8], _ x: Int, _ y: Int) -> Double {
+        var acc = 0.0
+        for dy in -1...1 { for dx in -1...1 { acc += lum(p, x + dx, y + dy) } }
+        return lum(p, x, y) - acc / 9.0
+    }
+    @inline(__always) func m(_ x: Int, _ y: Int) -> Float {
+        mask[min(mh - 1, y * mh / h) * mw + min(mw - 1, x * mw / w)]
+    }
+    var Ts = 0.0, Tn = 0.0, gs = 0.0, gn = 0.0, mq = 0.0, mn = 0.0
+    // 교대: 소스 프레임 e=0이므로 |e_interp − 0| + |0 − e_interp| 의 평균 = |e_interp|.
+    // 즉 T는 글자 ROI에서 보간 프레임의 고주파 오차 절대값 평균이다(소스와의 교대 폭).
+    for y in stride(from: 2, to: h - 2, by: 2) {
+        for x in stride(from: 2, to: w - 2, by: 2) {
+            let dAB = abs(lum(A, x, y) - lum(B, x, y))
+            let mv = Double(m(x, y))
+            if mv > 0.5 && dAB < tol {
+                Ts += abs(hp(O, x, y) - hp(G, x, y)); Tn += 1
+            } else if dAB >= tol {
+                // 움직인 픽셀: GT 대비 제곱오차 (얼리면 여기서 벌 받는다)
+                let i = y * row + x * 4
+                for c in 0..<3 { let d = Double(O[i+c]) - Double(G[i+c]); mq += d * d; mn += 1 }
+            }
+            // 유령 링: 마스크 경계 바깥 4px 안쪽(팽창−마스크)에서 출력이 GT보다 고주파가 많은 만큼
+            if mv <= 0.5 {
+                var nearMask = false
+                for dy in stride(from: -4, through: 4, by: 4) where !nearMask {
+                    for dx in stride(from: -4, through: 4, by: 4) where m(min(max(x+dx,0),w-1), min(max(y+dy,0),h-1)) > 0.5 { nearMask = true; break }
+                }
+                if nearMask { gs += max(0, abs(hp(O, x, y)) - abs(hp(G, x, y))); gn += 1 }
+            }
+        }
+    }
+    return ((Ts, Tn), (gs, gn), mq, mn)
+}
+
+/// (A+B)/2 텍스처 (대조군용).
+func makeBlend(_ a: any MTLTexture, _ b: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue) -> (any MTLTexture)? {
+    let A = readTextureBytes(a, device: device, queue: queue), B = readTextureBytes(b, device: device, queue: queue)
+    guard !A.isEmpty, A.count == B.count else { return nil }
+    var out = [UInt8](repeating: 0, count: A.count)
+    for i in 0..<A.count { out[i] = UInt8((Int(A[i]) + Int(B[i])) / 2) }
+    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: a.width, height: a.height, mipmapped: false)
+    d.storageMode = .shared; d.usage = [.shaderRead]
+    guard let t = device.makeTexture(descriptor: d) else { return nil }
+    t.replace(region: MTLRegionMake2D(0, 0, a.width, a.height), mipmapLevel: 0, withBytes: out, bytesPerRow: a.width * 4)
+    return t
+}
+
 func runQualityABMode(dir: String, device: any MTLDevice, queue: any MTLCommandQueue) async {
     let fm = FileManager.default
     let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
@@ -1296,7 +1459,9 @@ func main() async {
     }
 
     if let td = config.tripletsDir {
-        if config.uiSweep {
+        if config.uiShimmer {
+            await runUIShimmerMode(dir: td, engineKeys: config.engines, device: device, queue: commandQueue)
+        } else if config.uiSweep {
             await runUIMaskSweep(dir: td, engineKey: config.engines.first ?? "metalflow",
                                  stride: config.uiStride, device: device, queue: commandQueue)
         } else if let stride = config.tinStride {

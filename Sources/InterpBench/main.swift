@@ -879,8 +879,11 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
     for pt in allPoints {
         let (name, alpha, clo, chi, strength, div, eps, rad) = pt
         UIStaticDetector.noiseEps = eps
-        // rad < 0 = MetalFlow UI 타깃 축 (반경은 1로 고정해 타깃만 가른다)
-        MetalFlowEngine.uiMaskToB = rad != -1
+        // rad < 0 = MetalFlow UI 타깃 축 (반경은 1로 고정해 타깃만 가른다).
+        // **버그 정정(2026-09-02, Codex 지적)**: 전엔 `rad != -1`이라 일반 행 전부가 B 타깃으로
+        // 돌았다 — 배포 기본((A+B)/2)과 달랐고, 어려운 구간의 MetalFlow 음수(−0.47/−1.18)가
+        // 그 버그의 산물일 수 있다. 이제 전용 행(rad=-2)만 B, 나머지는 엔진 기본값이다.
+        MetalFlowEngine.uiMaskToB = rad == -2
         UIStaticDetector.hpRadius = rad < 0 ? 1 : rad
         UIStaticDetector.enabled = true
         UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
@@ -889,13 +892,20 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
 
         let det = UIStaticDetector(device: device)
         try? await det.prepare(); det.reset()
-        let engine: any PairInterpolationEngine
-        switch engineKey {
-        case "applefi": engine = AppleFIEngine()
-        case "rife":    engine = RIFEEngine()
-        default:        engine = MetalFlowEngine()
+        // **두 팔에 엔진 인스턴스를 따로 둔다 (Codex 지적).** MetalFlow는 호출마다 코스 flow를
+        // 다음 쌍의 prior로 저장하고 RIFE도 시간축 상태가 있어, 같은 인스턴스로 ON→OFF를 연속
+        // 호출하면 OFF가 ON의 flow를 물려받는다 — 차이가 마스크 효과만이 아니게 된다.
+        // 두 인스턴스에 **같은 쌍을 같은 순서로** 먹여 이력을 동일하게 유지한다.
+        func makeEngine() -> any PairInterpolationEngine {
+            switch engineKey {
+            case "applefi": return AppleFIEngine()
+            case "rife":    return RIFEEngine()
+            default:        return MetalFlowEngine()
+            }
         }
-        do { try await engine.prepare(device: device) } catch { print("  \(name): prepare 실패"); continue }
+        let engOn = makeEngine(), engOff = makeEngine()
+        do { try await engOn.prepare(device: device); try await engOff.prepare(device: device) }
+        catch { print("  \(name): prepare 실패"); continue }
 
         // **디텍터 갱신 비용을 같이 잰다.** 박스 반경을 R로 키우면 텍스처 샘플이 (2R+1)²로
         // 늘어난다(3x3=9 → 7x7=49, 5.4배). 이 패스는 4K에서 cb1 +3ms이고 workQueue 백로그가
@@ -916,12 +926,17 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
         // 충분하고(픽셀 단위 표본이 4K 40삼중항 = 8천만 개), 파라미터 점 7개 × 두 팔이 감당된다.
         let measureStep = max(2, 2 * ((frames.count - warm) / 2 / 40))
         var i = warm
+        // **디텍터에는 예정된 소스를 전부 공급한다 (Codex 지적).** 측정 삼중항은 measureStep으로
+        // 건너뛰더라도, 그 사이 프레임을 디텍터가 안 보면 예열과 측정의 EMA 시간축이 달라진다.
+        var fed = warm
         while i + 2 < frames.count {
             let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
-            // 앱과 같은 주기로만 갱신한다 — 매 프레임 갱신하면 EMA 시간 상수가 앱과 달라진다.
-            if (i - warm) % uiStride == 0 {
-                guard let cbu = queue.makeCommandBuffer() else { break }
-                det.update(source: a, into: cbu); cbu.commit(); await cbu.completed()
+            while fed <= i {
+                if (fed - warm) % uiStride == 0 {
+                    guard let cbu = queue.makeCommandBuffer() else { break }
+                    det.update(source: frames[fed], into: cbu); cbu.commit(); await cbu.completed()
+                }
+                fed += 1
             }
             guard let mask = det.mask else { i += measureStep; continue }
             let ms = readMaskStats(mask, device: device, queue: queue)
@@ -936,6 +951,7 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
             }
             var outs: [any MTLTexture] = []
             for useMask in [true, false] {
+                let engine = useMask ? engOn : engOff
                 engine.setUIMask(useMask ? mask : nil)
                 guard let cb = queue.makeCommandBuffer() else { break }
                 let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) / 60.0,
@@ -957,7 +973,7 @@ func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
             _ = outs
             i += measureStep
         }
-        engine.shutdown()
+        engOn.shutdown(); engOff.shutdown()
         let db: ((Double, Double)) -> Double = { p in
             guard p.1 > 0 else { return 0 }
             let mse = p.0 / p.1

@@ -1747,6 +1747,10 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var overSupplyCredit: Double = 0
     /// 소스 케이던스 고정으로 걸러낸 프레임 수 (영상 프레임 사이에 낀 UI 갱신).
     @ObservationIgnored nonisolated(unsafe) private var diagSrcLockSkip = 0
+    /// 컷 리셋에서 디텍터를 건너뛴 횟수 (창당) — 오판 컷이 얼마나 자주 오는지의 직접 계수.
+    @ObservationIgnored nonisolated(unsafe) private var diagUiCutResetSkipped = 0
+    /// 컷 시 정지-UI 디텍터도 리셋할지. 기본 false. 근거는 렌더 틱의 컷 처리 주석 참조.
+    nonisolated(unsafe) static let uiDetectorResetsOnCut = Knob.string("MACFG_UICUTRESET") == "1"
     /// 복원 규칙으로 통과시킨 장수 (E1a) — 거부 앞항만 참인 경우.
     @ObservationIgnored nonisolated(unsafe) private var diagSrcRestore = 0
     /// 게이트 **앞** 원시 도착 간격 분포 (E1a): <4 / <8 / <13 / <20 / >=20 ms.
@@ -1918,7 +1922,17 @@ public final class AppState {
         // 여기는 렌더 스레드라 MetalFlow.reset()의 무락 상태도 안전하다.
         if pendingSceneCutReset.withLock({ was in let v = was; was = false; return v }) {
             pairEngine?.reset()
-            uiDetector?.reset()
+            // **정지-UI 디텍터는 컷 리셋에서 뗀다 (2026-09-11).**
+            // 컷 판정은 밝기 히스토그램 교집합이라 빠른 시점 이동(밝은 하늘→어두운 복도)을 컷으로
+            // 오판한다 — 실측: 오버워치 방송 23분 세션에 78회, 최대 모션 구간 한 창(1.67s)에 8회.
+            // 리셋되면 마스크가 8갱신×6프레임=0.8초간 nil이고, 그 뒤엔 var=0이라 **과발화**한 채
+            // ~2.5초에 걸쳐 수렴한다. 즉 하필 어려운 순간마다 마스크가 죽거나 엉뚱한 곳을 얼렸다.
+            // 벤치엔 이 경로가 없어 마스크가 잘 작동해 보였다 — 벤치/런타임 불일치의 원인.
+            // 디텍터는 cons=|EMA(hp)|/std(hp)라 내용이 바뀌면 std가 커져 스스로 풀린다. 진짜 컷 뒤
+            // ~2.5초 옛 마스크가 남는 대가는 있지만, 방송에서 진짜 레이아웃 컷은 드물고 오판은 잦다.
+            // `MACFG_UICUTRESET=1`이면 옛 동작(리셋).
+            if Self.uiDetectorResetsOnCut { uiDetector?.reset() }
+            else { diagUiCutResetSkipped &+= 1 }
         }
         let (newEntries, released, presented) = mailbox.drain(current: renderGen)
         for id in released { inFlightTextures.removeValue(forKey: id) }
@@ -3555,7 +3569,7 @@ public final class AppState {
         // 배치는 [WIN] 로그에만, 캡처 소스는 [SCK-DISPLAY]에만 나와서 창 단위로 못 맞췄다.
         // 매 창에 라벨이 있으면 사용자가 아무 순서로 토글해도 사후에 2×2로 가를 수 있다.
         // (측정 절차를 사람이 정확히 지키게 만들 게 아니라, 지표가 엉성한 입력을 견뎌야 한다.)
-        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) srcRestore=\(diagSrcRestore) rawDist=\(diagRawIntHist.map(String.init).joined(separator: "/")) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | lead(shown)=\(diagLeadShown.map(String.init).joined(separator: "/")) lead(drop)=\(diagLeadDrop.map(String.init).joined(separator: "/")) | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
+        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) srcRestore=\(diagSrcRestore) uiCutSkip=\(diagUiCutResetSkipped) rawDist=\(diagRawIntHist.map(String.init).joined(separator: "/")) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | lead(shown)=\(diagLeadShown.map(String.init).joined(separator: "/")) lead(drop)=\(diagLeadDrop.map(String.init).joined(separator: "/")) | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -3591,6 +3605,7 @@ public final class AppState {
         diagChangeHist = [0, 0, 0, 0, 0]
         diagSrcLockSkip = 0
         diagSrcRestore = 0
+        diagUiCutResetSkipped = 0
         stageLock.lock()
         for i in diagLeadShown.indices { diagLeadShown[i] = 0; diagLeadDrop[i] = 0 }
         stageLock.unlock()

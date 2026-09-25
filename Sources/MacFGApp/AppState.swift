@@ -265,6 +265,8 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var stgLastSpikeLog = 0.0
     /// UI 정적 검출 스트라이드 카운터 — 매 6프레임만 4K 검출 갱신 (백로그 증폭 방지)
     @ObservationIgnored nonisolated(unsafe) private var uiDetectFrame = 0
+    /// 정지-UI 디텍터 갱신 주기(프레임). `MACFG_UISTRIDE`, 기본 2.
+    nonisolated(unsafe) static let uiDetectStride: Int = max(1, Int(Knob.string("MACFG_UISTRIDE") ?? "") ?? 2)
     /// 보간 엔진(cb2)의 GPU 실행시간 EMA [ms] — 자동 flow 스케일러 입력
     @ObservationIgnored nonisolated(unsafe) private var engineGpuMsEMA: Double = 0
     /// 기기 시딩 대기 — 소스 해상도가 정해지는 첫 프레임에서 1회 수행
@@ -2346,8 +2348,12 @@ public final class AppState {
         // +11ms work로 증폭한다(진단 확정). UI 정적 영역은 초 단위로 지속하므로 매 프레임 갱신은
         // 낭비 — 갱신 안 하면 직전 누적 마스크가 그대로 유효(maskTex 미재기록). MetalFlow 4K에서
         // work 40→목표↓의 최대 단일 레버.
+        // **2026-09-25: 6 → 2 (`MACFG_UISTRIDE`).** 6이면 alpha 0.217로도 새 자막이 완전 마스크되기까지
+        // 6갱신 = 36프레임 = 0.6초라, 자막이 바뀐 직후 0.3~0.6초 동안 배경 flow로 워프돼 글리프 조각이
+        // 튀고 흔들린다(덤프 205048 = 자막 등장 ≤10프레임 뒤; 오프라인 재현: 스트라이드 6이면 프레임당
+        // 조각 47~240px, 1·2·3이면 0). 4K 갱신 GPU 2.25ms → 스트라이드 2면 평균 +1.1ms/프레임.
         uiDetectFrame &+= 1
-        if uiDetector != nil, uiDetectFrame % 6 == 0 {
+        if uiDetector != nil, uiDetectFrame % Self.uiDetectStride == 0 {
             uiDetector?.update(source: stable, into: cb)
         }
         // Vision 텍스트 검출 (~2초 주기) — cb1에 스냅샷 blit, 완료 후 백그라운드에서 검출

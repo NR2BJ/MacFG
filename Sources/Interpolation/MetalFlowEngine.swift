@@ -158,6 +158,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         return 0.034
     }()
 
+    /// **마스크 인지 매칭/평활** (기본 OFF — 조각·PSNR 모두 중립으로 실측, halo 전용 시험 전까지 보류; `MACFG_MFMASKMATCH=1`로 켬). 정지 UI(자막) 위·옆의 6×6 SAD 패치는
+    /// 텍스트 탭이 지배해 flow를 0으로 끌어당긴다 → 텍스트 주변 배경이 찢기거나 멈추는 halo, 그리고 그
+    /// 잘못된 flow가 글리프 안을 샘플해 초록 조각이 튀는 현상(2026-09-25 덤프 205048). UI 마스크 픽셀을
+    /// SAD 가중치에서 빼고(정규화), 3×3 평활도 UI 탭을 빼며 UI 픽셀 자체는 이웃 평균으로 채운다(1단계 인페인트).
+    public nonisolated(unsafe) static var maskAwareMatch = Knob.string("MACFG_MFMASKMATCH") == "1"
+
     public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
         if let s = Knob.string("MACFG_MFRADIUS"), let v = Int32(s), (1...8).contains(v) { return v }
         return 3
@@ -254,7 +260,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         smoothPSO = try await pso("mfSmooth")
         finalizePSO = try await pso("mfFinalize")
         warpPSO = try await pso("mfWarp")
-        DiagnosticLog.shared.log("[MetalFlow] prepared (pyramid flow + full-res warp)")
+        DiagnosticLog.shared.log("[MetalFlow] prepared (pyramid flow + full-res warp) zeroBias=\(Self.zeroBias) srcGuard=\(Self.sourceMaskGuard) maskMatch=\(Self.maskAwareMatch) uiMask=\(Self.useUIMask) occDir=\(Self.occlusionDirectional) smooth=\(Self.motionSmoothness)")
     }
 
     // MARK: - Encode
@@ -294,6 +300,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 모션 부드러움 매핑 — flow 부드러움만 조절 (고스팅 주는 폴백 폭은 슬라이더에서 분리).
         // 하단: flow raw(예리, 디테일↑). 상단: flow 박스+워프블러(에러 완만, AppleFI 느낌).
         let sm = min(max(Self.motionSmoothness, 0), 1)
+        var maskAwareSmooth: Float = (uiMaskTex != nil && Self.maskAwareMatch) ? 1 : 0
         var smoothAmt: Float = min(sm * 2, 1)                       // flow 박스스무딩: 0→raw, 0.5→full, 1→full
         // **상반부(0.5~1.0)는 측정상 무효다 (2026-08-31 실측). 죽은 코드는 아니다.**
         // flowBlur는 셰이더까지 제대로 연결돼 flow 필드를 실제로 블러한다(아래 mfWarp 참조).
@@ -374,7 +381,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 refine: l < Self.refineLevels ? 1 : 0,   // 서브픽셀 정련 레벨 수 (기본 1=최종만)
                 priorScale: isCoarsest ? 1.0 : 2.0,
                 penalty: Self.matchPenalty,
-                zeroBias: isCoarsest ? Self.zeroBias : 0
+                zeroBias: isCoarsest ? Self.zeroBias : 0,
+                maskWeight: (uiMaskTex != nil && Self.maskAwareMatch) ? 1 : 0
             )
             // forward: A→B (zero-mean 루마로 매칭)
             enc.setComputePipelineState(matchPSO)
@@ -382,11 +390,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             enc.setTexture(zmB[l], index: 1)
             enc.setTexture(isCoarsest ? (prevCoarseF ?? flowF[l]) : flowF[l + 1], index: 2)
             enc.setTexture(flowTmp[l], index: 3)
+            enc.setTexture(uiMaskTex ?? zmA[l], index: 4)   // 마스크 인지 SAD (미사용 시 더미)
             enc.setBytes(&params, length: MemoryLayout<MatchParams>.stride, index: 0)
             dispatch(enc, levels[l].w, levels[l].h, matchPSO)
             enc.setComputePipelineState(smoothPSO)
             enc.setTexture(flowTmp[l], index: 0); enc.setTexture(flowF[l], index: 1)
             enc.setBytes(&smoothAmt, length: MemoryLayout<Float>.stride, index: 0)
+            enc.setTexture(uiMaskTex ?? flowTmp[l], index: 2)
+            enc.setBytes(&maskAwareSmooth, length: MemoryLayout<Float>.stride, index: 1)
             dispatch(enc, levels[l].w, levels[l].h, smoothPSO)
             // backward: B→A
             enc.setComputePipelineState(matchPSO)
@@ -394,11 +405,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             enc.setTexture(zmA[l], index: 1)
             enc.setTexture(isCoarsest ? (prevCoarseB ?? flowB[l]) : flowB[l + 1], index: 2)
             enc.setTexture(flowTmp[l], index: 3)
+            enc.setTexture(uiMaskTex ?? zmA[l], index: 4)   // 마스크 인지 SAD (미사용 시 더미)
             enc.setBytes(&params, length: MemoryLayout<MatchParams>.stride, index: 0)
             dispatch(enc, levels[l].w, levels[l].h, matchPSO)
             enc.setComputePipelineState(smoothPSO)
             enc.setTexture(flowTmp[l], index: 0); enc.setTexture(flowB[l], index: 1)
             enc.setBytes(&smoothAmt, length: MemoryLayout<Float>.stride, index: 0)
+            enc.setTexture(uiMaskTex ?? flowTmp[l], index: 2)
+            enc.setBytes(&maskAwareSmooth, length: MemoryLayout<Float>.stride, index: 1)
             dispatch(enc, levels[l].w, levels[l].h, smoothPSO)
         }
         enc.endEncoding()
@@ -500,6 +514,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var priorScale: Float
         var penalty: Float
         var zeroBias: Float   // 코스 레벨 영점 편향 (0=끔)
+        var maskWeight: Float // UI 마스크 픽셀을 SAD에서 제외 (0=끔)
     }
 
     private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float; var photoLo: Float; var photoHi: Float; var statLo: Float; var statHi: Float }
@@ -518,6 +533,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var srcGuard: Float = MetalFlowEngine.sourceMaskGuard ? 1 : 0
         /// 디버그 출력 (MACFG_MFDEBUG=1): R=1−gA, G=1−gB, B=|flowF|/100(base px).
         var debug: Float = MetalFlowEngine.warpDebug
+        /// 소스 가드 경화 (MACFG_MFGUARDHARD, 기본 1).
+        var guardHard: Float = MetalFlowEngine.guardHard ? 1 : 0
     }
 
     /// **워프 소스 좌표 UI 가드 (2026-09-25).** 기본 true. `MACFG_MFSRCMASK=0`으로 끔.
@@ -536,8 +553,10 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 반 프레임 늦다. 그리고 **반투명 UI에서 글자 자체는 A와 B가 같아** 타깃을 바꿔도 안 변한다;
     /// 바뀌는 것은 뒤에 비치는 배경뿐이고 거기선 (A+B)/2가 정답에 가깝다.
     /// 플래그는 회귀 확인용으로만 남긴다.
-    /// 워프 디버그 모드 (MACFG_MFDEBUG): 1=(1−gA,1−gB,|f|/100) 2=(confF,confB,static) 3=(tBlend,conf,uim) 5=w0 6=w1 7=nearestPix 8=interp
+    /// 워프 디버그 모드 (MACFG_MFDEBUG): 1=(1−gA,1−gB,|f|/100) 2=(confF,confB,static) 3=(tBlend,conf,uim) 5=w0 6=w1 7=nearestPix 8=interp 9=정상출력+마스크초록/가드빨강 오버레이
     public nonisolated(unsafe) static var warpDebug: Float = Float(Knob.string("MACFG_MFDEBUG") ?? "") ?? 0
+    /// 소스 가드 경화 — 마스크가 조금이라도 있는 샘플은 전부 거부 (기본 ON, `MACFG_MFGUARDHARD=0`으로 끔).
+    public nonisolated(unsafe) static var guardHard = Knob.string("MACFG_MFGUARDHARD") != "0"
     public nonisolated(unsafe) static var uiMaskToB = false
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -647,9 +666,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; float zeroBias; };
+    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; float zeroBias; float maskWeight; };
     struct FinalizeParams { float confLo; float confHi; float confRel; float photoLo; float photoHi; float statLo; float statHi; };
-    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; float srcGuard; float debug; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; float srcGuard; float debug; float guardHard; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -720,6 +739,19 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             }
         return acc.x + acc.y + acc.z + acc.w;
     }
+    // 가중 6x6 SAD — 소스 패치의 UI 마스크 탭 제외 (wq = 1−mask, 쿼드별 4성분).
+    static inline half sad6x6w(texture2d<half, access::sample> ref, sampler s,
+                               thread const half4* patch, thread const half4* wq, float2 gid_c, float2 size) {
+        half4 acc = half4(0.0h);
+        int j = 0;
+        for (int dy = -2; dy <= 2; dy += 2)
+            for (int dx = -2; dx <= 2; dx += 2) {
+                float2 q = (gid_c + float2(dx + 1, dy + 1)) / size;
+                acc += wq[j] * abs(ref.gather(s, q) - patch[j]);
+                j++;
+            }
+        return acc.x + acc.y + acc.z + acc.w;
+    }
 
     // 피라미드 매칭: prior(코스 레벨) flow를 시작점으로 ±searchRadius 정수 국소 탐색 (6x6 SAD)
     // 입력은 zero-mean 루마(Z = L - mean5x5) — 조명/페이드 불변.
@@ -733,6 +765,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         texture2d<half, access::sample> ref [[texture(1)]],   // 대상 프레임 zero-mean 루마
         texture2d<float, access::sample> prior [[texture(2)]], // 코스 flow (없으면 미사용)
         texture2d<float, access::write> flowOut [[texture(3)]],
+        texture2d<float, access::sample> uiMask [[texture(4)]],  // 정지-UI 마스크 (maskWeight>0일 때만)
         constant MatchParams& p [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
@@ -756,6 +789,25 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 float2 q = (float2(gid) + float2(dx + 1, dy + 1)) / size;
                 patch[k++] = src.gather(s, q);
             }
+        // 마스크 인지 SAD: 소스 패치에서 정지-UI 탭을 뺀다 (정규화 36/Σw). 패치가 대부분 UI면(Σw<6)
+        // 그 픽셀의 flow는 어차피 UI 경로가 덮으므로 비가중 SAD로 둔다.
+        half4 wq[9];
+        half wsum = 0.0h;
+        bool useW = false;
+        if (p.maskWeight > 0.0) {
+            int k2 = 0;
+            for (int dy = -2; dy <= 2; dy += 2)
+                for (int dx = -2; dx <= 2; dx += 2) {
+                    float2 q = (float2(gid) + float2(dx + 1, dy + 1)) / size;
+                    half4 m = clamp(half4(uiMask.gather(s, q)), 0.0h, 1.0h);
+                    wq[k2] = 1.0h - m;
+                    wsum += wq[k2].x + wq[k2].y + wq[k2].z + wq[k2].w;
+                    k2++;
+                }
+            useW = wsum >= 6.0h && wsum < 35.5h;
+        }
+        half wnorm = useW ? (36.0h / wsum) : 1.0h;
+    #define SAD(pos) (useW ? (sad6x6w(ref, s, patch, wq, (pos), size) * wnorm) : sad6x6(ref, s, patch, (pos), size))
 
         half bestSAD = 65504.0h;
         float2 bestOff = float2(0.0);
@@ -767,7 +819,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         for (int oy = -p.searchRadius; oy <= p.searchRadius; oy++) {
             for (int ox = -p.searchRadius; ox <= p.searchRadius; ox++) {
                 float2 cand = base + float2(ox, oy);
-                half rawSad = sad6x6(ref, s, patch, float2(gid) + cand, size);
+                half rawSad = SAD(float2(gid) + cand);
                 if (cache9) sad9[oy + 1][ox + 1] = rawSad;
                 // 평활 페널티 — 애매(평탄) 영역에서 벡터가 prior에서 멋대로 점프하는
                 // 노이즈 억제 (shimmer의 주범). 36탭 SAD 스케일 기준 (25탭 0.012 × 36/25).
@@ -785,7 +837,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             for (int oy = -p.searchRadius; oy <= p.searchRadius; oy++) {
                 for (int ox = -p.searchRadius; ox <= p.searchRadius; ox++) {
                     float2 cand = float2(ox, oy);
-                    half rawSad = sad6x6(ref, s, patch, float2(gid) + cand, size);
+                    half rawSad = SAD(float2(gid) + cand);
                     half sad = rawSad + half(p.penalty) * half(length(cand - base))
                              + half(p.zeroBias) * half(fabs(cand.x) + fabs(cand.y));
                     if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
@@ -802,13 +854,13 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             int bi = cache9 ? int(bestOff.x - base.x) : 2;   // ∈[-1,1], 2=캐시 미사용
             int bj = cache9 ? int(bestOff.y - base.y) : 2;
             half sL = (bi > -1 && bi < 2 && bj < 2) ? sad9[bj + 1][bi]
-                                                    : sad6x6(ref, s, patch, c + float2(-1, 0), size);
+                                                    : SAD(c + float2(-1, 0));
             half sR = (bi < 1)                      ? sad9[bj + 1][bi + 2]
-                                                    : sad6x6(ref, s, patch, c + float2( 1, 0), size);
+                                                    : SAD(c + float2( 1, 0));
             half sU = (bj > -1 && bj < 2 && bi < 2) ? sad9[bj][bi + 1]
-                                                    : sad6x6(ref, s, patch, c + float2( 0, -1), size);
+                                                    : SAD(c + float2( 0, -1));
             half sD = (bj < 1)                      ? sad9[bj + 2][bi + 1]
-                                                    : sad6x6(ref, s, patch, c + float2( 0, 1), size);
+                                                    : SAD(c + float2( 0, 1));
             float sadL = float(sL);
             float sadR = float(sR);
             float sadU = float(sU);
@@ -820,6 +872,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         }
 
         flowOut.write(float4(refined, 0, 0), gid);
+    #undef SAD
     }
 
     // 3x3 flow 스무딩 (노이즈로 인한 정적 영역 부들거림 억제).
@@ -828,7 +881,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     kernel void mfSmooth(
         texture2d<float, access::read> src [[texture(0)]],
         texture2d<float, access::write> dst [[texture(1)]],
+        texture2d<float, access::sample> uiMask [[texture(2)]],   // maskAware>0.5일 때만
         constant float& smoothAmt [[buffer(0)]],
+        constant float& maskAware [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = dst.get_width(), h = dst.get_height();
@@ -837,6 +892,26 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 접근이 전부 텍셀 정렬 정수 좌표라 bilinear sample()은 낭비 — read()+수동 clamp로
         // 샘플러 유닛 우회 (mfZeroMean과 동일 패턴). 중심 탭은 1회만 읽어 박스합·mix에 재사용.
         float2 center = src.read(gid).rg;
+        if (maskAware > 0.5) {
+            // 마스크 인지: UI 탭을 뺀 가중 평균. UI 픽셀 자체는 이웃(비-UI) 평균으로 대체(1단계 인페인트)
+            // — 정지 텍스트의 0 벡터가 평활/상위 prior를 통해 배경으로 새는 것을 막는다.
+            constexpr sampler s(filter::linear, address::clamp_to_edge);
+            float2 sz = float2(w, h);
+            float mc = clamp(uiMask.sample(s, (float2(gid) + 0.5) / sz).r, 0.0, 1.0);
+            float2 wacc = float2(0.0); float wsum = 0.0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    uint2 q = uint2(clamp(int(gid.x) + dx, 0, W), clamp(int(gid.y) + dy, 0, H));
+                    float wt = 1.0 - clamp(uiMask.sample(s, (float2(q) + 0.5) / sz).r, 0.0, 1.0);
+                    wacc += src.read(q).rg * wt; wsum += wt;
+                }
+            if (wsum > 0.25) {
+                float2 wbox = wacc / wsum;
+                dst.write(float4(mix(mix(center, wbox, smoothAmt), wbox, mc), 0, 0), gid);
+                return;
+            }
+            // 이웃이 전부 UI면 아래 일반 경로 (UI 내부 — 어차피 UI 경로가 덮는다)
+        }
         float2 acc = center;
         for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++) {
@@ -966,8 +1041,13 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float gA = 1.0, gB = 1.0;
         if (p.useUIMask > 0.5 && p.srcGuard > 0.5) {
             float notUI = 1.0 - clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
-            gA = 1.0 - clamp(uiMask.sample(s, uv - f * t).r, 0.0, 1.0) * notUI;
-            gB = 1.0 - clamp(uiMask.sample(s, uv - b * (1.0 - t)).r, 0.0, 1.0) * notUI;
+            float mA = clamp(uiMask.sample(s, uv - f * t).r, 0.0, 1.0);
+            float mB = clamp(uiMask.sample(s, uv - b * (1.0 - t)).r, 0.0, 1.0);
+            // 경화(guardHard>0): 마스크 가장자리(블러 σ=2)에 걸친 샘플도 전부 거부. 글리프의 안티앨리어스
+            // 테두리·윤곽선에서 마스크가 0.3~0.6이라 부분 가드로는 조각이 반투명으로 남았다(덤프 205048).
+            if (p.guardHard > 0.5) { mA = smoothstep(0.04, 0.25, mA); mB = smoothstep(0.04, 0.25, mB); }
+            gA = 1.0 - mA * notUI;
+            gB = 1.0 - mB * notUI;
         }
         float wa = confF * (1.0 - t);
         float wb = confB * t;
@@ -1010,6 +1090,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             else if (dm == 6) dbg.rgb = w1;
             else if (dm == 7) dbg.rgb = nearestPix;
             else if (dm == 8) dbg.rgb = interp;
+            else if (dm == 9) {
+                // 오버레이: 정상 출력 위에 UI 마스크=초록, 소스 가드 발동=빨강 (런타임 덤프로 마스크 커버리지 확인용)
+                float uimD = (p.useUIMask > 0.5) ? clamp(uiMask.sample(s, uv).r, 0.0, 1.0) : 0.0;
+                dbg.rgb = mix(outc, half3(0.0h, 1.0h, 0.0h), half(uimD * 0.45));
+                dbg.rgb = mix(dbg.rgb, half3(1.0h, 0.0h, 0.0h), half((1.0 - min(gA, gB)) * 0.6));
+            }
             dst.write(dbg, gid);
             return;
         }

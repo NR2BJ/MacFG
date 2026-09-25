@@ -747,7 +747,10 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             if let a = Knob.double("MACFG_UIALPHA") { UIStaticDetector.alpha = Float(a) }
             UIStaticDetector.enabled = true
             let d = UIStaticDetector(device: device); try? await d.prepare(); d.reset()
-            for _ in 0..<2 { for f in frames { if let cb = queue.makeCommandBuffer() { d.update(source: f, into: cb); cb.commit(); await cb.completed() } } }
+            let wstride = max(1, Int(Knob.string("MACFG_TRIPMASKSTRIDE") ?? "") ?? 1)
+            var gpuAcc = 0.0; var gpuN = 0
+            for _ in 0..<2 { for (fi, f) in frames.enumerated() where fi % wstride == 0 { if let cb = queue.makeCommandBuffer() { d.update(source: f, into: cb); cb.commit(); await cb.completed(); gpuAcc += cb.gpuEndTime - cb.gpuStartTime; gpuN += 1 } } }
+            if gpuN > 0 { print(String(format: "  [TRIPMASK] 디텍터 update GPU %.3f ms/회 (n=%d, 소스 %dx%d, 마스크 div %d)", gpuAcc / Double(gpuN) * 1000, gpuN, frames[0].width, frames[0].height, UIStaticDetector.maskDiv)) }
             tripDet = d
             print("  [TRIPMASK] alpha=\(UIStaticDetector.alpha) 예열 \(frames.count * 2)회 mask=\(d.mask != nil ? "ok" : "nil")")
         }
@@ -758,7 +761,9 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         for i in 0..<(frames.count - 2) {
             let a = frames[i], gt = frames[i + 1], b = seqMode ? frames[i + 1] : frames[i + 2]
             if let d = tripDet {
-                if let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }
+                // MACFG_TRIPMASKSTRIDE=N: 런타임처럼 N프레임마다만 갱신 (앱은 uiDetectFrame % 6)
+                let mstride = max(1, Int(Knob.string("MACFG_TRIPMASKSTRIDE") ?? "") ?? 1)
+                if i % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }
                 engine.setUIMask(d.mask)
                 if let dd = dumpDir, i == 1 || i == dumpFrom + 17, let m = d.mask {
                     dumpMaskOverlay(src: a, mask: m, device: device, queue: queue, path: "\(dd)/\(key)_mask\(i).png")

@@ -63,7 +63,9 @@ public final class UIStaticDetector {
 
     /// 튜닝(오프라인 clo0.8 chi2.0 시작점). alpha=EMA율(~1/창길이). enabled=off면 no-op.
     public nonisolated(unsafe) static var enabled = true
-    public nonisolated(unsafe) static var alpha: Float = 0.04   // ~25프레임 창 (스윕 최적)
+    /// 0.04(~25갱신 창, 스윕 최적)였으나 자막처럼 1~3초마다 바뀌는 UI엔 너무 느렸다 — 새 텍스트가 마스크되기 전에
+    /// 워프돼 조각/흔들림. 0.217(사용자 A/B값)이면 갱신 6회에 chi 도달(스트라이드 2 → 12프레임 = 0.2초).
+    public nonisolated(unsafe) static var alpha: Float = 0.217
     public nonisolated(unsafe) static var clo: Float = 0.5      // 스윕 최적 — 흐린 UI까지 잡되 무회귀
     public nonisolated(unsafe) static var chi: Float = 1.7
     public nonisolated(unsafe) static var strength: Float = 1.0  // 마스크 최대 프리즈 강도

@@ -146,6 +146,18 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     }()
 
     /// 코스 레벨 탐색 반경 (기본 3). 큰 변위(빠른 시점 회전) 추적 한계를 정한다.
+    /// **코스 레벨 영점 편향** (기본 penalty×2 = 0.034, `MACFG_MFZEROBIAS`, 0=끔).
+    /// 코스 레벨은 이전 쌍의 flow를 시간 prior로 쓰고 평활 페널티가 prior 기준이라, 데이터가 방향을
+    /// 못 정하는 영역(aperture: 가로 줄무늬 계단, 평탄한 어둠)에서는 **한 번 생긴 큰 벡터가 영구히
+    /// 고착**됐다 — 빠른 팬이 끝나도 그 영역만 옛 벡터를 유지해 워프가 수백 px 밖(채팅 패널)을
+    /// 샘플했다(2026-09-25 덤프 191839 유령 채팅). 후보 비용에 `zeroBias·(|x|+|y|)`(L1)를 더해
+    /// 애매 영역이 0으로 돌아오게 하고, |prior|>반경이면 0 주변 창도 함께 탐색한다.
+    /// 텍스처 영역의 실제 모션은 SAD 차이가 편향보다 커서 영향이 없다(H.264류 zero-MV 보너스와 동일 발상).
+    public nonisolated(unsafe) static var zeroBias: Float = {
+        if let s = Knob.string("MACFG_MFZEROBIAS"), let v = Float(s), v >= 0, v <= 1 { return v }
+        return 0.034
+    }()
+
     public nonisolated(unsafe) static var coarseSearchRadius: Int32 = {
         if let s = Knob.string("MACFG_MFRADIUS"), let v = Int32(s), (1...8).contains(v) { return v }
         return 3
@@ -361,7 +373,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 hasPrior: (useTemporal || !isCoarsest) ? 1 : 0,
                 refine: l < Self.refineLevels ? 1 : 0,   // 서브픽셀 정련 레벨 수 (기본 1=최종만)
                 priorScale: isCoarsest ? 1.0 : 2.0,
-                penalty: Self.matchPenalty
+                penalty: Self.matchPenalty,
+                zeroBias: isCoarsest ? Self.zeroBias : 0
             )
             // forward: A→B (zero-mean 루마로 매칭)
             enc.setComputePipelineState(matchPSO)
@@ -486,6 +499,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var refine: Int32
         var priorScale: Float
         var penalty: Float
+        var zeroBias: Float   // 코스 레벨 영점 편향 (0=끔)
     }
 
     private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float; var photoLo: Float; var photoHi: Float; var statLo: Float; var statHi: Float }
@@ -500,7 +514,21 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var confGamma: Float = MetalFlowEngine.confGamma
         /// UI 마스크 타깃: 1 = bOrig(B 원본, 자체 staticness와 같은 곳), 0 = nearestPix((A+B)/2, 옛 동작).
         var uiToB: Float = MetalFlowEngine.uiMaskToB ? 1 : 0
+        /// 워프 소스 좌표 UI 가드 (sourceMaskGuard).
+        var srcGuard: Float = MetalFlowEngine.sourceMaskGuard ? 1 : 0
+        /// 디버그 출력 (MACFG_MFDEBUG=1): R=1−gA, G=1−gB, B=|flowF|/100(base px).
+        var debug: Float = MetalFlowEngine.warpDebug
     }
+
+    /// **워프 소스 좌표 UI 가드 (2026-09-25).** 기본 true. `MACFG_MFSRCMASK=0`으로 끔.
+    ///
+    /// 사용자 덤프(out_20260925-191839, 계단 장면)에서 I 프레임에만 우측 채팅창 글자가 계단 위에
+    /// **왼쪽 ~480px 유령 복사본**으로 찍혔다. 워프는 목적지 uv에서 `imgA(uv−f·t)`, `imgB(uv−b·(1−t))`를
+    /// 읽는데, 그 **소스 좌표가 채팅창 안**이어도 검사가 없었다. UI 마스크는 목적지 uv에서만 샘플되므로
+    /// 채팅창 *바깥* 목적지가 채팅창을 읽는 경우는 마스크가 정확해도 못 막는다 — Codex 리뷰가 짚은
+    /// "워프가 읽는 A/B 좌표의 UI 마스크" 그것이다. flow가 왜 그리 큰지(4K 120Hz 예산 초과·스테일 쌍·
+    /// prior 누적)와 무관하게, UI 픽셀이 제자리 밖으로 복제되는 것을 원천 차단한다.
+    public nonisolated(unsafe) static var sourceMaskGuard = Knob.string("MACFG_MFSRCMASK") != "0"
 
     /// UI 마스크를 `bOrig`로 보낼지 — **기본 false(=(A+B)/2). 시험했고 명확히 나빴다.**
     /// 실측(ow_fhd, 2026-09-02): ROI이득 +0.477 → **−0.523**, full −0.017 → −0.090.
@@ -508,6 +536,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     /// 반 프레임 늦다. 그리고 **반투명 UI에서 글자 자체는 A와 B가 같아** 타깃을 바꿔도 안 변한다;
     /// 바뀌는 것은 뒤에 비치는 배경뿐이고 거기선 (A+B)/2가 정답에 가깝다.
     /// 플래그는 회귀 확인용으로만 남긴다.
+    /// 워프 디버그 모드 (MACFG_MFDEBUG): 1=(1−gA,1−gB,|f|/100) 2=(confF,confB,static) 3=(tBlend,conf,uim) 5=w0 6=w1 7=nearestPix 8=interp
+    public nonisolated(unsafe) static var warpDebug: Float = Float(Knob.string("MACFG_MFDEBUG") ?? "") ?? 0
     public nonisolated(unsafe) static var uiMaskToB = false
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -617,9 +647,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; };
+    struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; float zeroBias; };
     struct FinalizeParams { float confLo; float confHi; float confRel; float photoLo; float photoHi; float statLo; float statHi; };
-    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; float srcGuard; float debug; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -742,7 +772,24 @@ public final class MetalFlowEngine: PairInterpolationEngine {
                 // 평활 페널티 — 애매(평탄) 영역에서 벡터가 prior에서 멋대로 점프하는
                 // 노이즈 억제 (shimmer의 주범). 36탭 SAD 스케일 기준 (25탭 0.012 × 36/25).
                 half sad = rawSad + half(p.penalty) * half(length(float2(ox, oy)));
+                // 영점 편향(코스 레벨만) — 애매 영역에서 시간 prior에 고착된 벡터를 0으로 되돌린다.
+                if (p.zeroBias > 0.0) sad += half(p.zeroBias) * half(fabs(cand.x) + fabs(cand.y));
                 if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
+            }
+        }
+        // 영점 창: prior가 탐색 반경 밖이면 0 주변도 탐색 — 평활 페널티는 prior 기준 그대로,
+        // 영점 편향은 |cand| 기준. SAD가 평탄하면 0이 이기고(penalty·|p| < zeroBias·|p|),
+        // 텍스처가 있으면 SAD 차이가 결정한다. 코스 레벨(40×22)이라 비용은 무시할 수준.
+        if (p.zeroBias > 0.0 && p.hasPrior != 0 &&
+            (fabs(base.x) > float(p.searchRadius) || fabs(base.y) > float(p.searchRadius))) {
+            for (int oy = -p.searchRadius; oy <= p.searchRadius; oy++) {
+                for (int ox = -p.searchRadius; ox <= p.searchRadius; ox++) {
+                    float2 cand = float2(ox, oy);
+                    half rawSad = sad6x6(ref, s, patch, float2(gid) + cand, size);
+                    half sad = rawSad + half(p.penalty) * half(length(cand - base))
+                             + half(p.zeroBias) * half(fabs(cand.x) + fabs(cand.y));
+                    if (sad < bestSAD) { bestSAD = sad; bestOff = cand; }
+                }
             }
         }
 
@@ -909,13 +956,26 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         //   (기존엔 이 영역이 통째로 원본 폴백 → 가림 경계 60fps 스텝/고스트).
         // 주의: 반복 패턴에선 "일관되게 틀린"(aliased) flow에 확신을 줄 리스크 —
         //   합성 줄무늬 벤치 실측 -3dB (병리적 최악 케이스). 실영상 육안 A/B 전까지 기본 0.
+        // **소스 좌표 UI 가드.** 목적지가 UI가 아닌데(1−uimD) 워프 샘플 좌표가 UI 안(uimA/uimB)이면
+        // 그 flow는 오염된 것이다(정지 UI 자리의 소스 픽셀은 언제나 UI라, 비-UI 목적지의 정답일 수 없다).
+        // 한쪽만 걸려도 **양쪽 다 불신**하고 conf를 죽여 nearestPix 폴백으로 보낸다.
+        // 처음 구현(2026-09-25)은 걸린 쪽을 빼고 "깨끗한" 쪽으로 100% 강제했는데, 실측(덤프 191839
+        // 재현, 픽셀 1380,597)에서 반대쪽 샘플도 같은 오염 flow로 **마스크가 안 덮는 UI 픽셀**
+        // (평탄한 배지 아이콘 내부 — 고주파 구조 게이트가 0)을 물고 있어 유령이 50%→100%로 더 진해졌다.
+        // 마스크는 소스 정렬 UV라 소스 좌표로 바로 샘플할 수 있다.
+        float gA = 1.0, gB = 1.0;
+        if (p.useUIMask > 0.5 && p.srcGuard > 0.5) {
+            float notUI = 1.0 - clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
+            gA = 1.0 - clamp(uiMask.sample(s, uv - f * t).r, 0.0, 1.0) * notUI;
+            gB = 1.0 - clamp(uiMask.sample(s, uv - b * (1.0 - t)).r, 0.0, 1.0) * notUI;
+        }
         float wa = confF * (1.0 - t);
         float wb = confB * t;
         float denom = wa + wb;
         float dirFactor = (denom > 1e-4) ? (wb / denom) : t;
         float tBlend = mix(t, dirFactor, fabs(confF - confB) * p.dirBlend);
         half3 interp = mix(w0, w1, half(tBlend));
-        float cRaw = mix(confF, max(confF, confB), max(p.dirBlend, p.confMax));
+        float cRaw = mix(confF, max(confF, confB), max(p.dirBlend, p.confMax)) * min(gA, gB);
         half conf = half(p.confGamma == 1.0 ? cRaw : pow(cRaw, p.confGamma));
 
         // 저신뢰 폴백: A/B 원본 크로스페이드. 폭(fadeLo~fadeHi)이 smoothness 슬라이더:
@@ -939,6 +999,19 @@ public final class MetalFlowEngine: PairInterpolationEngine {
             float uim = clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
             half3 uiTarget = p.uiToB > 0.5 ? bOrig : nearestPix;
             outc = mix(outc, uiTarget, half(uim));
+        }
+        if (p.debug > 0.5) {
+            int dm = int(p.debug + 0.5);
+            half4 dbg = half4(0.0h, 0.0h, 0.0h, 1.0h);
+            if (dm == 1) dbg.rgb = half3(half(1.0 - gA), half(1.0 - gB), half(min(length(fRaw) / 100.0, 1.0)));
+            else if (dm == 2) dbg.rgb = half3(half(confF), half(confB), half(staticness));
+            else if (dm == 3) dbg.rgb = half3(half(tBlend), conf, half(clamp(uiMask.sample(s, uv).r, 0.0, 1.0)));
+            else if (dm == 5) dbg.rgb = w0;
+            else if (dm == 6) dbg.rgb = w1;
+            else if (dm == 7) dbg.rgb = nearestPix;
+            else if (dm == 8) dbg.rgb = interp;
+            dst.write(dbg, gid);
+            return;
         }
         dst.write(half4(outc, 1.0h), gid);
     }

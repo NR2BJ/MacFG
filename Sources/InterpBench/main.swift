@@ -739,17 +739,40 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         var psnrs: [Double] = []
         var sharps: [Double] = []
         var dt = 1.0 / 30.0
+        // **MACFG_TRIPMASK=1**: 삼중항 경로에도 정지-UI 디텍터를 붙인다 (기본은 마스크 없음).
+        // 워프의 소스 좌표 가드(MetalFlow sourceMaskGuard)는 마스크가 있어야 동작하므로, 유령 재현
+        // 검증엔 필수. 프레임이 적어 EMA가 덜 수렴하므로 전체를 2회 예열한다.
+        var tripDet: UIStaticDetector? = nil
+        if Knob.isSet("MACFG_TRIPMASK") {
+            if let a = Knob.double("MACFG_UIALPHA") { UIStaticDetector.alpha = Float(a) }
+            UIStaticDetector.enabled = true
+            let d = UIStaticDetector(device: device); try? await d.prepare(); d.reset()
+            for _ in 0..<2 { for f in frames { if let cb = queue.makeCommandBuffer() { d.update(source: f, into: cb); cb.commit(); await cb.completed() } } }
+            tripDet = d
+            print("  [TRIPMASK] alpha=\(UIStaticDetector.alpha) 예열 \(frames.count * 2)회 mask=\(d.mask != nil ? "ok" : "nil")")
+        }
+        // **MACFG_TRIPSEQ=1**: 연속 쌍 (i,i+1) — 런타임 케이던스(시간 prior 누적) 재현용. GT가 없어 PSNR은 무의미.
+        let seqMode = Knob.isSet("MACFG_TRIPSEQ")
+        let dumpFrom = Int(Knob.string("MACFG_DUMPFROM") ?? "") ?? 0
+        if seqMode { print("  [TRIPSEQ] 연속 쌍 모드 — PSNR 무시, 덤프 i>=\(dumpFrom)") }
         for i in 0..<(frames.count - 2) {
-            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
+            let a = frames[i], gt = frames[i + 1], b = seqMode ? frames[i + 1] : frames[i + 2]
+            if let d = tripDet {
+                if let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }
+                engine.setUIMask(d.mask)
+                if let dd = dumpDir, i == 1 || i == dumpFrom + 17, let m = d.mask {
+                    dumpMaskOverlay(src: a, mask: m, device: device, queue: queue, path: "\(dd)/\(key)_mask\(i).png")
+                }
+            }
             // 워밍업 겸 실행 — 시간적 prior 있는 엔진 위해 순서대로
             guard let cb = queue.makeCommandBuffer() else { continue }
-            let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt, tsB: Double(i + 2) * dt, tValues: [0.5], into: cb)
+            let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt, tsB: Double(i + (seqMode ? 1 : 2)) * dt, tValues: [0.5], into: cb)
             cb.commit(); await cb.completed()
             guard let interp = r?.frames.first?.texture else { continue }
             let p = computePSNRFull(device: device, queue: queue, texA: interp, texB: gt)
             psnrs.append(p)
             sharps.append(computeSharpnessRatio(device: device, queue: queue, out: interp, gt: gt))
-            if let dd = dumpDir, i == frames.count / 2 {
+            if let dd = dumpDir, i == frames.count / 2 || (Knob.isSet("MACFG_DUMPALL") && i >= dumpFrom) {
                 dumpPNG(interp, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_interp.png")
                 dumpPNG(gt, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_gt.png")
                 dumpPNG(a, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_A.png")

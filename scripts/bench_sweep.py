@@ -22,11 +22,13 @@ zsh가 아니라 파이썬인 이유: 이 저장소는 셸 스크립트에서 �
     scripts/bench_sweep.py --flow-base 1440
     scripts/bench_sweep.py --engine metalflow  # 주의: 소문자. metalFlow는 조용히 빈 집합이 된다.
 """
-import subprocess, sys, re, statistics as st
+import os, subprocess, sys, re, statistics as st
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / ".build/debug/InterpBench"
+# 기본은 debug 빌드 — **release만 다시 빌드하고 스윕을 돌리면 옛 debug 바이너리를 돌린다**
+# (2026-09-25: 영점 편향 A/B가 두 arm 비트 동일로 나와서 발견). MACFG_BENCH_BIN으로 바꿀 수 있다.
+BIN = Path(os.environ.get("MACFG_BENCH_BIN", str(ROOT / ".build/debug/InterpBench")))
 
 args = sys.argv[1:]
 engine = "metalflow"

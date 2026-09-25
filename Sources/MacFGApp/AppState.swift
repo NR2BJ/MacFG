@@ -2983,6 +2983,11 @@ public final class AppState {
         guard let presentQueue, let cb = presentQueue.makeCommandBuffer() else { return }
         guard let surface = renderSurface else { cb.commit(); return }
         // 표시 프레임 덤프 — 무장 시 이 표시분을 PNG로 (S/I·콘텐츠 ts를 파일명에)
+        // **사전(entry.texture)과 사후(RenderSurface가 그린 드로어블) 두 장을 같은 idx로 남긴다.**
+        // 2026-09-25 실측: 사전 덤프에서 자막 글자는 S/I 모두 고정(p95 ≤7)인데 사용자는 화면에서
+        // 심한 흔들림을 본다 → 원인은 이 텍스처 **이후**(CAS 샤픈·합성·표시)에 있거나 MacFG 밖이다.
+        // 사후 덤프가 그 둘을 가른다. 파일명 `_P` 접미.
+        var postDumpPath: String? = nil
         if outDumpRemaining > 0, let dir = outDumpDir {
             outDumpRemaining -= 1
             let idx = outDumpIndex
@@ -2990,6 +2995,7 @@ public final class AppState {
             let kind = entry.isInterpolated ? "I" : "S"
             let tsMs = Int((entry.timestamp.truncatingRemainder(dividingBy: 100)) * 1000)
             let path = dir.appendingPathComponent(String(format: "out_%03d_%@_%06d.png", idx, kind, tsMs)).path
+            postDumpPath = dir.appendingPathComponent(String(format: "out_%03d_%@_%06d_P.png", idx, kind, tsMs)).path
             let tex = entry.texture
             let w = tex.width, h = tex.height
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
@@ -3013,6 +3019,31 @@ public final class AppState {
         }
         // CAMetalDisplayLink가 배달한 드로어블에 직접 인코딩 — nextDrawable 없음
         surface.encode(texture: entry.texture, into: cb, drawable: drawable)
+        // 사후 덤프 — RenderSurface(업스케일·CAS·aspect-fit) 통과 후 실제 화면에 가는 픽셀.
+        if let postPath = postDumpPath {
+            let dt = drawable.texture
+            let fmt = dt.pixelFormat
+            if fmt == .bgra8Unorm || fmt == .bgra8Unorm_srgb {
+                let w = dt.width, h = dt.height
+                let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+                desc.storageMode = .shared
+                desc.usage = [.shaderRead]
+                if let shared = device.makeTexture(descriptor: desc), let blit = cb.makeBlitCommandEncoder() {
+                    blit.copy(from: dt, sourceSlice: 0, sourceLevel: 0,
+                              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                              sourceSize: MTLSize(width: w, height: h, depth: 1),
+                              to: shared, destinationSlice: 0, destinationLevel: 0,
+                              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                    blit.endEncoding()
+                    let queue = frameDumpFileQueue
+                    cb.addCompletedHandler { _ in
+                        queue.async { AppState.writeTexturePNG(shared, width: w, height: h, path: postPath) }
+                    }
+                }
+            } else {
+                DiagnosticLog.shared.log("[OUTDUMP] 사후 덤프 생략 — 드로어블 pixelFormat=\(fmt.rawValue) (8bit BGRA 아님)")
+            }
+        }
 
         // 콘텐츠 간격/모션 레이트는 여기서 재지 않는다 — 아래 addPresentedHandler(표시 확정)로
         // 옮겼다. 이유는 shownContentTs 선언부 주석 참조. lastPresentedTimestamp는 **페이싱

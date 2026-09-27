@@ -3003,13 +3003,19 @@ public final class AppState {
             let path = dir.appendingPathComponent(String(format: "out_%03d_%@_%06d.png", idx, kind, tsMs)).path
             postDumpPath = dir.appendingPathComponent(String(format: "out_%03d_%@_%06d_P.png", idx, kind, tsMs)).path
             let tex = entry.texture
-            let w = tex.width, h = tex.height
+            // 잘라내기 덤프: 영역을 텍스처 안으로 클램프. 크롭이면 사후(_P) 덤프는 생략.
+            var ox = 0, oy = 0, w = tex.width, h = tex.height
+            if let c = Self.outDumpCrop {
+                ox = min(max(0, c.x), tex.width - 1); oy = min(max(0, c.y), tex.height - 1)
+                w = min(c.w, tex.width - ox); h = min(c.h, tex.height - oy)
+                postDumpPath = nil
+            }
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
             desc.storageMode = .shared
             desc.usage = [.shaderRead]
             if let shared = device.makeTexture(descriptor: desc), let blit = cb.makeBlitCommandEncoder() {
                 blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0,
-                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceOrigin: MTLOrigin(x: ox, y: oy, z: 0),
                           sourceSize: MTLSize(width: w, height: h, depth: 1),
                           to: shared, destinationSlice: 0, destinationLevel: 0,
                           destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
@@ -4151,7 +4157,17 @@ public final class AppState {
     }
 
     /// 표시 프레임 덤프 무장 (⌃⌥⌘O) — 다음 N개 '표시된' 프레임(S/I 순서 그대로)을 PNG로.
+    /// 출력 덤프 잘라내기 영역 (`MACFG_DUMPCROP=x,y,w,h`, 소스 픽셀). 설정되면 그 영역만 저장하고 `_P` 사후 덤프는
+    /// 생략한다 — 4K 전체(33MB/장)는 36장만으로도 파이프라인을 0.5초 정지시켜(SPIKE 58ms, STALE 160ms) 케이던스가
+    /// 무너지므로, 자막처럼 작은 영역을 길게(`MACFG_DUMPCOUNT`, 기본 36) 찍을 때 쓴다.
+    nonisolated static let outDumpCrop: (x: Int, y: Int, w: Int, h: Int)? = {
+        guard let s = Knob.string("MACFG_DUMPCROP") else { return nil }
+        let v = s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard v.count == 4, v[2] > 0, v[3] > 0 else { return nil }
+        return (v[0], v[1], v[2], v[3])
+    }()
     func startOutputDump(count: Int = 36) {
+        let count = Int(Knob.string("MACFG_DUMPCOUNT") ?? "") ?? count
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd-HHmmss"
         let stamp = fmt.string(from: Date())
@@ -4161,7 +4177,7 @@ public final class AppState {
         outDumpDir = dir
         outDumpIndex = 0
         outDumpRemaining = count
-        DiagnosticLog.shared.log("[OUTDUMP] 무장 \(count)장 → \(dir.path)")
+        DiagnosticLog.shared.log("[OUTDUMP] 무장 \(count)장 → \(dir.path)\(Self.outDumpCrop.map { " crop=\($0.x),\($0.y),\($0.w),\($0.h)" } ?? "")")
         NSSound.beep()
     }
 

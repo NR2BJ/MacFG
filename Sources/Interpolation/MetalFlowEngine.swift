@@ -446,7 +446,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         enc2.setTexture(maskTex, index: 4)
         enc2.setBuffer(statsBuffer, offset: 0, index: 0)
         var fp = FinalizeParams(confLo: Self.confLo, confHi: Self.confHi, confRel: Self.confRel,
-                                photoLo: Self.photoLo, photoHi: Self.photoHi, statLo: Self.staticLo, statHi: Self.staticHi)
+                                photoLo: Self.photoLo, photoHi: Self.photoHi, statLo: Self.staticLo, statHi: Self.staticHi,
+                                uiAware: (uiMaskTex != nil && Self.uiAwareConf) ? 1 : 0)
+        enc2.setTexture(uiMaskTex ?? maskTex, index: 5)   // 오버레이 인지 conf (미사용 시 더미)
         enc2.setBytes(&fp, length: MemoryLayout<FinalizeParams>.stride, index: 1)
         dispatch(enc2, levels[0].w, levels[0].h, finalizePSO)
 
@@ -517,7 +519,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var maskWeight: Float // UI 마스크 픽셀을 SAD에서 제외 (0=끔)
     }
 
-    private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float; var photoLo: Float; var photoHi: Float; var statLo: Float; var statHi: Float }
+    private struct FinalizeParams { var confLo: Float; var confHi: Float; var confRel: Float; var photoLo: Float; var photoHi: Float; var statLo: Float; var statHi: Float; var uiAware: Float }
     private struct WarpParams {
         var t: Float
         var dirBlend: Float
@@ -535,6 +537,11 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         var debug: Float = MetalFlowEngine.warpDebug
         /// 소스 가드 경화 (MACFG_MFGUARDHARD, 기본 1).
         var guardHard: Float = MetalFlowEngine.guardHard ? 1 : 0
+        /// UI 프리즈/가드 정지 게이트 (uiSameGate) + 문턱.
+        var uiSame: Float = MetalFlowEngine.uiSameGate ? 1 : 0
+        var sameLo: Float = MetalFlowEngine.sameLo
+        var sameHi: Float = MetalFlowEngine.sameHi
+        var guardDir: Float = MetalFlowEngine.guardDirectional ? 1 : 0
     }
 
     /// **워프 소스 좌표 UI 가드 (2026-09-25).** 기본 true. `MACFG_MFSRCMASK=0`으로 끔.
@@ -557,6 +564,26 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     public nonisolated(unsafe) static var warpDebug: Float = Float(Knob.string("MACFG_MFDEBUG") ?? "") ?? 0
     /// 소스 가드 경화 — 마스크가 조금이라도 있는 샘플은 전부 거부 (기본 ON, `MACFG_MFGUARDHARD=0`으로 끔).
     public nonisolated(unsafe) static var guardHard = Knob.string("MACFG_MFGUARDHARD") != "0"
+    /// **UI 프리즈 정지 게이트** (기본 ON, `MACFG_MFUISAME=0`으로 끔; 문턱 `MACFG_MFSAMELO/HI`, 기본 0.02/0.06 루마).
+    /// 마스크는 블러 띠(σ=2)와 Vision 박스 여백 때문에 글리프 주변의 **움직이는 배경**까지 덮는다. 그 픽셀에
+    /// nearestPix((A+B)/2)를 주면 I 프레임에서 배경이 이중상으로 얼어붙고 S 프레임에선 선명 — 120Hz 교대가
+    /// 텍스트를 감싸는 shimmer가 된다(덤프 000554: 계단이 "소리 주의" 뒤를 지날 때 |I−blend|≈0인 블록).
+    /// 실제로 A≈B인 픽셀(진짜 정지 UI)만 프리즈하고, 움직이는 배경은 워프로 보낸다. 소스 가드도 같은 게이트.
+    public nonisolated(unsafe) static var uiSameGate = Knob.string("MACFG_MFUISAME") != "0"
+    public nonisolated(unsafe) static var sameLo: Float = Float(Knob.string("MACFG_MFSAMELO") ?? "") ?? 0.02
+    public nonisolated(unsafe) static var sameHi: Float = Float(Knob.string("MACFG_MFSAMEHI") ?? "") ?? 0.06
+    /// **방향 가드** (기본 ON, `MACFG_MFGUARDDIR=0`으로 끔). 목적지가 움직이는 픽셀(A≠B)인데 워프 샘플 좌표가
+    /// 정지 픽셀(A≈B)이면 그 방향은 정지 오버레이(자막·아이콘, 마스크 유무 무관)를 물은 것이다 → 반대 방향만 쓴다.
+    /// 정지 텍스트 뒤로 배경이 지날 때 한쪽 샘플은 글자 밑(가려짐), 반대쪽은 글자 반대편 배경이라 정답이 있다.
+    /// 양쪽 다 걸리면 blend 폴백. 첫 구현(마스크만 보고 반대쪽 강제)이 실패한 건 '반대쪽'이 마스크 밖 정지 UI였기
+    /// 때문인데, 정지 판정을 A≈B로 직접 하면 그 구멍이 없다.
+    public nonisolated(unsafe) static var guardDirectional = Knob.string("MACFG_MFGUARDDIR") != "0"
+    /// **오버레이 인지 신뢰도** (기본 ON, `MACFG_MFUICONF=0`으로 끔). 순환·광도 검사는 flow가 가리키는 곳이 정지
+    /// 오버레이(강한 마스크)면 그 오버레이 때문에 반드시 실패한다 — 배경은 옳게 흘러도 글자가 같이 안 움직이니까.
+    /// 그 실패로 conf가 0이 되면 워프 대신 blend가 나가고, 텍스트 주변에 배경 이중상 띠가 생긴다(덤프 000554,
+    /// 움직이는 배경 픽셀의 63~70%가 blend). 목표점이 강한 UI면 두 검사를 건너뛴다 — 오염 샘플은 워프의 방향
+    /// 가드가 따로 잡는다. 마스크 인지 매칭(MFMASKMATCH)과 짝: flow가 옳아야 검사를 건너뛴 보람이 있다.
+    public nonisolated(unsafe) static var uiAwareConf = Knob.string("MACFG_MFUICONF") != "0"
     public nonisolated(unsafe) static var uiMaskToB = false
 
     private func dispatch(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int, _ pso: any MTLComputePipelineState) {
@@ -667,8 +694,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
     using namespace metal;
 
     struct MatchParams { int searchRadius; int hasPrior; int refine; float priorScale; float penalty; float zeroBias; float maskWeight; };
-    struct FinalizeParams { float confLo; float confHi; float confRel; float photoLo; float photoHi; float statLo; float statHi; };
-    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; float srcGuard; float debug; float guardHard; };
+    struct FinalizeParams { float confLo; float confHi; float confRel; float photoLo; float photoHi; float statLo; float statHi; float uiAware; };
+    struct WarpParams { float t; float dirBlend; float fadeLo; float fadeHi; float flowBlur; float useUIMask; float confMax; float confGamma; float uiToB; float srcGuard; float debug; float guardHard; float uiSame; float sameLo; float sameHi; float guardDir; };
 
     constant half3 kLuma = half3(0.2126h, 0.7152h, 0.0722h);
 
@@ -930,6 +957,7 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         texture2d<float, access::sample> flowF [[texture(2)]],
         texture2d<float, access::sample> flowB [[texture(3)]],
         texture2d<float, access::write> mask [[texture(4)]],
+        texture2d<float, access::sample> uiMask [[texture(5)]],   // uiAware>0일 때만 유효
         device atomic_uint* hist [[buffer(0)]],
         constant FinalizeParams& fp [[buffer(1)]],
         uint2 gid [[thread_position_in_grid]]
@@ -953,8 +981,14 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 원본 폴백(60fps 스텝)으로 빠져 '프레임레이트 낮아 보임' (실측 보고)
         // 문턱을 모션 크기에 비례해 늘림 — 큰 변위에서 순환 오차가 커지는 건 정상이다.
         float relF = fp.confRel * length(f), relB = fp.confRel * length(b);
-        float confF = 1.0 - smoothstep(fp.confLo + relF, fp.confHi + relF, cycF);
-        float confB = 1.0 - smoothstep(fp.confLo + relB, fp.confHi + relB, cycB);
+        // 오버레이 인지: flow 목표점이 강한 정지-UI면 순환·광도 검사를 건너뛴다(그 오버레이 때문에 반드시 실패).
+        float skipF = 0.0, skipB = 0.0;
+        if (fp.uiAware > 0.5) {
+            skipF = smoothstep(0.5, 0.9, clamp(uiMask.sample(s, uvF).r, 0.0, 1.0));
+            skipB = smoothstep(0.5, 0.9, clamp(uiMask.sample(s, uvB).r, 0.0, 1.0));
+        }
+        float confF = 1.0 - smoothstep(fp.confLo + relF, fp.confHi + relF, cycF) * (1.0 - skipF);
+        float confB = 1.0 - smoothstep(fp.confLo + relB, fp.confHi + relB, cycB) * (1.0 - skipB);
 
         // 광도 검증(brightness constancy): flow를 따라간 곳의 밝기가 다르면 그 방향 기각.
         // 순환 일관성만으론 "일관되게 틀린" flow(반복 패턴 aliasing)를 못 걸러냄 —
@@ -963,8 +997,8 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         float lb = float(lumB.sample(s, uv).r);
         float errF = fabs(float(lumB.sample(s, uvF).r) - la);
         float errB = fabs(float(lumA.sample(s, uvB).r) - lb);
-        confF *= 1.0 - smoothstep(fp.photoLo, fp.photoHi, errF);
-        confB *= 1.0 - smoothstep(fp.photoLo, fp.photoHi, errB);
+        confF *= 1.0 - smoothstep(fp.photoLo, fp.photoHi, errF) * (1.0 - skipF);
+        confB *= 1.0 - smoothstep(fp.photoLo, fp.photoHi, errB) * (1.0 - skipB);
         float d = fabs(la - lb);
         float staticness = 1.0 - smoothstep(fp.statLo, fp.statHi, d);
 
@@ -1038,31 +1072,68 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 재현, 픽셀 1380,597)에서 반대쪽 샘플도 같은 오염 flow로 **마스크가 안 덮는 UI 픽셀**
         // (평탄한 배지 아이콘 내부 — 고주파 구조 게이트가 0)을 물고 있어 유령이 50%→100%로 더 진해졌다.
         // 마스크는 소스 정렬 UV라 소스 좌표로 바로 샘플할 수 있다.
+        // 원본 UV 샘플 (폴백/정적 합성/정지 판정 공용)
+        half3 bOrig = imgB.sample(s, uv).rgb;
+        half3 aOrig = imgA.sample(s, uv).rgb;
+        const half3 kLum = half3(0.299h, 0.587h, 0.114h);
+        float dDest = fabs(float(dot(aOrig, kLum) - dot(bOrig, kLum)));
+        float sameD = 1.0 - smoothstep(p.sameLo, p.sameHi, dDest);   // 목적지 정지(A≈B)
         float gA = 1.0, gB = 1.0;
+        float sameA = 0.0, sameB = 0.0;                                 // 샘플 좌표 정지(A≈B)
+        if (p.uiSame > 0.5 || p.guardDir > 0.5) {
+            float dA = fabs(float(dot(w0, kLum) - dot(imgB.sample(s, uv - f * t).rgb, kLum)));
+            float dB = fabs(float(dot(imgA.sample(s, uv - b * (1.0 - t)).rgb, kLum) - dot(w1, kLum)));
+            sameA = 1.0 - smoothstep(p.sameLo, p.sameHi, dA);
+            sameB = 1.0 - smoothstep(p.sameLo, p.sameHi, dB);
+        }
         if (p.useUIMask > 0.5 && p.srcGuard > 0.5) {
             float notUI = 1.0 - clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
             float mA = clamp(uiMask.sample(s, uv - f * t).r, 0.0, 1.0);
             float mB = clamp(uiMask.sample(s, uv - b * (1.0 - t)).r, 0.0, 1.0);
+            // 샘플 좌표가 마스크 안이어도 거기서 A≠B(움직이는 배경)면 UI가 아니다 — 가드 해제.
+            // 단, 마스크가 강한 픽셀(≥0.5~0.9: 글리프 획, 패널 텍스트)은 정지 여부와 무관하게 가드 — 채팅이 스크롤한
+            // 쌍에선 텍스트가 A≠B인데 마스크(EMA)는 아직 높다. 그때 게이트를 풀면 1프레임 유령이 번쩍인다(t257 실측).
+            if (p.uiSame > 0.5) {
+                mA *= mix(sameA, 1.0, smoothstep(0.5, 0.9, mA));
+                mB *= mix(sameB, 1.0, smoothstep(0.5, 0.9, mB));
+            }
             // 경화(guardHard>0): 마스크 가장자리(블러 σ=2)에 걸친 샘플도 전부 거부. 글리프의 안티앨리어스
             // 테두리·윤곽선에서 마스크가 0.3~0.6이라 부분 가드로는 조각이 반투명으로 남았다(덤프 205048).
             if (p.guardHard > 0.5) { mA = smoothstep(0.04, 0.25, mA); mB = smoothstep(0.04, 0.25, mB); }
             gA = 1.0 - mA * notUI;
             gB = 1.0 - mB * notUI;
         }
-        float wa = confF * (1.0 - t);
-        float wb = confB * t;
+        if (p.guardDir > 0.5) {
+            // 방향 가드: 목적지는 움직이는데(A≠B) 샘플 좌표는 정지(A≈B) → 정지 오버레이를 물었다 (마스크 무관).
+            float movingD = 1.0 - sameD;
+            gA = min(gA, 1.0 - movingD * sameA);
+            gB = min(gB, 1.0 - movingD * sameB);
+        }
+        float wa = confF * (1.0 - t) * gA;
+        float wb = confB * t * gB;
         float denom = wa + wb;
         float dirFactor = (denom > 1e-4) ? (wb / denom) : t;
         float tBlend = mix(t, dirFactor, fabs(confF - confB) * p.dirBlend);
+        float cRaw0 = mix(confF, max(confF, confB), max(p.dirBlend, p.confMax));
+        float cRaw;
+        if (p.guardDir > 0.5) {
+            // 한쪽만 걸리면 깨끗한 쪽으로 (dirBlend·conf와 무관). 양쪽 다 걸리면 cRaw=0 → nearestPix 폴백.
+            float gStr = max(1.0 - gA, 1.0 - gB);
+            float gDir = (gA + gB > 1e-4) ? (gB / (gA + gB)) : t;
+            tBlend = mix(tBlend, gDir, gStr);
+            float confSurv = (gA >= gB) ? confF : confB;
+            cRaw = mix(cRaw0, confSurv, gStr) * max(gA, gB);
+        } else {
+            cRaw = cRaw0 * min(gA, gB);
+        }
         half3 interp = mix(w0, w1, half(tBlend));
-        float cRaw = mix(confF, max(confF, confB), max(p.dirBlend, p.confMax)) * min(gA, gB);
         half conf = half(p.confGamma == 1.0 ? cRaw : pow(cRaw, p.confGamma));
 
         // 저신뢰 폴백: A/B 원본 크로스페이드. 폭(fadeLo~fadeHi)이 smoothness 슬라이더:
         // 좁으면(예리) 단일 프레임에 가까워 저더, 넓으면(부드러움) 부드러운 블렌드(약간 고스트).
-        half3 bOrig = imgB.sample(s, uv).rgb;   // 원본 UV B — 폴백/정적 합성 공용 (중복 샘플 제거)
-        half3 nearestPix = mix(imgA.sample(s, uv).rgb, bOrig,
-                               half(smoothstep(p.fadeLo, p.fadeHi, t)));
+        half3 nearestPix = mix(aOrig, bOrig, half(smoothstep(p.fadeLo, p.fadeHi, t)));
+        // UI 프리즈는 실제로 정지한 픽셀(A≈B)에만 — 마스크 띠·Vision 박스 여백 속 움직이는 배경은 워프로.
+        float uiSameD = (p.uiSame > 0.5) ? sameD : 1.0;
         half3 moving = mix(nearestPix, interp, conf);
         half3 outc = mix(moving, bOrig, half(staticness)); // 정적 → B 원본 (선명)
         // 시간축 정지-UI 프리즈 (staticness가 못 잡는 반투명/저대비 UI) — 소스로 고정.
@@ -1076,7 +1147,9 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         // 바로 그 경우에만 난다 — 사용자가 "채팅 흔들림은 MetalFlow가 더 심하다"고 한 상황이다.
         // **시험 결과 bOrig는 명확히 나빴다(위 uiMaskToB 주석의 수치). 기본은 nearestPix다.**
         if (p.useUIMask > 0.5) {
-            float uim = clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
+            float uimRaw = clamp(uiMask.sample(s, uv).r, 0.0, 1.0);
+            // 강한 마스크는 정지 여부와 무관하게 프리즈(스크롤 중 텍스트·반투명 패널 텍스트), 약한 띠만 정지 게이트.
+            float uim = uimRaw * mix(uiSameD, 1.0, smoothstep(0.5, 0.9, uimRaw));
             half3 uiTarget = p.uiToB > 0.5 ? bOrig : nearestPix;
             outc = mix(outc, uiTarget, half(uim));
         }

@@ -754,26 +754,74 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             tripDet = d
             print("  [TRIPMASK] alpha=\(UIStaticDetector.alpha) 예열 \(frames.count * 2)회 mask=\(d.mask != nil ? "ok" : "nil")")
         }
+        // **MACFG_UILAYER=1**: 정적 UI 층 분리 프로토타입 — 추출(α, clean) → 엔진은 clean만 → 합성. 엔진 내부 UI 경로는 끈다.
+        var uiLayer: UILayer? = nil
+        var layerPrev: (alpha: any MTLTexture, clean: any MTLTexture)? = nil   // 프레임 i의 (α, clean)
+        var layerOutRing: [any MTLTexture] = []
+        var layerGpuMs = 0.0; var layerGpuN = 0
+        if Knob.isSet("MACFG_UILAYER"), tripDet != nil {
+            let ul = UILayer(device: device); try? await ul.prepare(); uiLayer = ul
+            for _ in 0..<2 {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: frames[0].pixelFormat, width: frames[0].width, height: frames[0].height, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]
+                if let t = device.makeTexture(descriptor: d) { layerOutRing.append(t) }
+            }
+            print("  [UILAYER] 프로토타입 ON — 엔진 내부 UI 마스크 OFF, 합성은 층에서")
+        }
         // **MACFG_TRIPSEQ=1**: 연속 쌍 (i,i+1) — 런타임 케이던스(시간 prior 누적) 재현용. GT가 없어 PSNR은 무의미.
         let seqMode = Knob.isSet("MACFG_TRIPSEQ")
         let dumpFrom = Int(Knob.string("MACFG_DUMPFROM") ?? "") ?? 0
         if seqMode { print("  [TRIPSEQ] 연속 쌍 모드 — PSNR 무시, 덤프 i>=\(dumpFrom)") }
         for i in 0..<(frames.count - 2) {
             let a = frames[i], gt = frames[i + 1], b = seqMode ? frames[i + 1] : frames[i + 2]
+            var layerA: (alpha: any MTLTexture, clean: any MTLTexture)? = nil
+            var layerB: (alpha: any MTLTexture, clean: any MTLTexture)? = nil
             if let d = tripDet {
                 // MACFG_TRIPMASKSTRIDE=N: 런타임처럼 N프레임마다만 갱신 (앱은 uiDetectFrame % 6)
                 let mstride = max(1, Int(Knob.string("MACFG_TRIPMASKSTRIDE") ?? "") ?? 1)
-                if i % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }
-                engine.setUIMask(d.mask)
+                // 층 모드에선 A(=직전 B)가 이미 갱신됐으므로 첫 반복만 갱신
+                if (uiLayer == nil || i == 0), i % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }
+                if let ul = uiLayer, let m = d.mask {
+                    // 프레임 i는 직전 반복에서 추출됨(layerPrev). 첫 반복이면 지금 추출.
+                    if layerPrev == nil, let cb = queue.makeCommandBuffer() {
+                        layerPrev = ul.extract(source: a, prev: nil, mask: m, into: cb); cb.commit(); await cb.completed()
+                    }
+                    layerA = layerPrev
+                    // 프레임 i+1(B) 추출 — 런타임처럼 B 도착 시 마스크 갱신 후 (스트라이드 준수)
+                    if (i + 1) % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: b, into: cb); cb.commit(); await cb.completed() }
+                    if let m2 = d.mask, let cb = queue.makeCommandBuffer() {
+                        layerB = ul.extract(source: b, prev: a, mask: m2, into: cb); cb.commit(); await cb.completed()
+                        layerGpuMs += (cb.gpuEndTime - cb.gpuStartTime) * 1000; layerGpuN += 1
+                    }
+                    layerPrev = layerB
+                    engine.setUIMask(nil)
+                } else {
+                    engine.setUIMask(d.mask)
+                }
                 if let dd = dumpDir, i == 1 || i == dumpFrom + 17, let m = d.mask {
                     dumpMaskOverlay(src: a, mask: m, device: device, queue: queue, path: "\(dd)/\(key)_mask\(i).png")
                 }
             }
             // 워밍업 겸 실행 — 시간적 prior 있는 엔진 위해 순서대로
             guard let cb = queue.makeCommandBuffer() else { continue }
-            let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) * dt, tsB: Double(i + (seqMode ? 1 : 2)) * dt, tValues: [0.5], into: cb)
+            let engA: any MTLTexture = layerA?.clean ?? a
+            let engB: any MTLTexture = layerB?.clean ?? b
+            let r = engine.encodePair(stableA: engA, stableB: engB, tsA: Double(i) * dt, tsB: Double(i + (seqMode ? 1 : 2)) * dt, tValues: [0.5], into: cb)
             cb.commit(); await cb.completed()
-            guard let interp = r?.frames.first?.texture else { continue }
+            guard let interpRaw = r?.frames.first?.texture else { continue }
+            var interp: any MTLTexture = interpRaw
+            if let ul = uiLayer, let lb = layerB, !layerOutRing.isEmpty, let cb2 = queue.makeCommandBuffer() {
+                // 합성: 보간된 배경 위에 B의 UI 층
+                let outTex = layerOutRing[i % layerOutRing.count]
+                ul.composite(interp: interpRaw, sourceA: a, sourceB: b, t: 0.5, alpha: lb.alpha, into: cb2, dst: outTex)
+                cb2.commit(); await cb2.completed()
+                layerGpuMs += (cb2.gpuEndTime - cb2.gpuStartTime) * 1000
+                interp = outTex
+                if let dd = dumpDir, i == dumpFrom + 17 {
+                    dumpPNG(lb.clean, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_clean.png")
+                    dumpPNG(lb.alpha, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_alpha.png")
+                }
+            }
             let p = computePSNRFull(device: device, queue: queue, texA: interp, texB: gt)
             psnrs.append(p)
             sharps.append(computeSharpnessRatio(device: device, queue: queue, out: interp, gt: gt))
@@ -796,6 +844,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         // (이 벤치에서 blend가 hold보다 2.45dB 높은 것이 그 증거다 — 평균만 내도 점수가 오른다).
         // sharp 1.0 = 정답만큼 선명, <1 = 더 흐림, >1 = 과선명. PSNR↑ + sharp↓ 면 흐려서 이긴 것이다.
         let shAvg = sharps.isEmpty ? 0 : sharps.reduce(0, +) / Double(sharps.count)
+        if uiLayer != nil, layerGpuN > 0 { print(String(format: "  [UILAYER] 추출+합성 GPU %.3f ms/쌍 (n=%d)", layerGpuMs / Double(layerGpuN), layerGpuN)) }
         print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  sharp=\(String(format: "%.3f", shAvg))  (n=\(psnrs.count))")
     }
     print("\n⏱  실프레임 = 합성보다 압축노이즈·반투명·대모션 모두 포함. 높을수록 정확.")

@@ -53,7 +53,7 @@ cp "$ROOT/.build/release/MacFGApp" "$APP/Contents/MacOS/MacFG"
 cp "$ICON_TMP/MacFG.icns" "$APP/Contents/Resources/"
 
 echo "── 신경망(RIFE) 모델 컴파일·번들"
-# 180/216/240 = 거버너 부하 강등용 sub-288 flow 티어 (predict 3.1/5.0/6.2ms). bypass 대신
+# 180/216/240 = 거버너 부하 강등용 sub-288 flow 티어 (predict v3 2.3/3.6/4.3ms). bypass 대신
 # 낮은 flow로 보간을 유지하는 데 필수 — 번들에 없으면 부하 시 다시 보간이 꺼진다.
 for m in 180 216 240 288 360 432 540; do
   if [ -d "$ROOT/Models/rife$m.mlpackage" ]; then

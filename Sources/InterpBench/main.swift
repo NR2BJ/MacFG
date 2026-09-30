@@ -59,11 +59,8 @@ struct BenchConfig {
     var multiT = false              // 멀티-t 화질 벤치 (t별 PSNR — 24/30fps 경로 검증)
     var tripletsDir: String? = nil  // 실프레임 삼중항 디렉터리 (frame_NNN.png → A/GT/B 오프라인 측정)
     var qualityAB = false           // 같은 삼중항에 MetalFlow 화질 변경 4단계를 전부 돌려 비교
-    var uiSweep = false             // B2: 정지-UI 마스크 파라미터 스윕 (--triplets와 함께)
-    var uiShimmer = false           // B2: 흔들림(교대) 지표 — 엔진·대조군 비교 (--triplets와 함께)
     /// 디텍터 갱신 주기(프레임). 앱은 6(AppState `uiDetectFrame % 6`)이고 벤치 기본은 1이다 —
     /// 6으로 맞추면 EMA 시간 상수가 앱과 같아져 결과를 그대로 옮길 수 있다(대신 워밍업 450장).
-    var uiStride = 1
     var tinStride: Int? = nil       // A5: 틴 밀도 — stride N에서 t=1/N..(N-1)/N을 실프레임 GT로 (--triplets와 함께)
 
     static func parse() -> BenchConfig {
@@ -87,9 +84,6 @@ struct BenchConfig {
             case "--triplets": if let v = args.popFirst() { config.tripletsDir = v }
             case "--quality-ab": config.qualityAB = true
             case "--tin-density": if let v = args.popFirst() { config.tinStride = Int(v) }
-            case "--ui-sweep": config.uiSweep = true
-            case "--ui-shimmer": config.uiShimmer = true
-            case "--ui-stride": if let v = args.popFirst() { config.uiStride = max(1, Int(v) ?? 1) }
             default: break
             }
         }
@@ -754,19 +748,44 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             tripDet = d
             print("  [TRIPMASK] alpha=\(UIStaticDetector.alpha) 예열 \(frames.count * 2)회 mask=\(d.mask != nil ? "ok" : "nil")")
         }
-        // **MACFG_UILAYER=1**: 정적 UI 층 분리 프로토타입 — 추출(α, clean) → 엔진은 clean만 → 합성. 엔진 내부 UI 경로는 끈다.
+        // **정적 UI 층** (기본 ON = UILayer.enabled, `MACFG_UILAYER=0`으로 끔) — TRIPMASK가 켜져 있을 때만.
+        // 추출(clean) → 엔진은 clean만 → 엔진 출력에 제자리 합성. 엔진에는 UI 경로가 없다(2026-09-30 제거).
+        // 프레임 인덱스별 캐시: 삼중항(A=i, B=i+2)에서도 각 쌍이 제 A·B의 clean을 받게 한다 — 예전 판은
+        // 직전 반복의 B(= i+1, 즉 GT 자신)를 A로 넘기는 버그가 있었다(2026-09-30 발견, 그 판의 삼중항 PSNR 무효).
         var uiLayer: UILayer? = nil
-        var layerPrev: (alpha: any MTLTexture, clean: any MTLTexture)? = nil   // 프레임 i의 (α, clean)
-        var layerOutRing: [any MTLTexture] = []
-        var layerGpuMs = 0.0; var layerGpuN = 0
-        if Knob.isSet("MACFG_UILAYER"), tripDet != nil {
-            let ul = UILayer(device: device); try? await ul.prepare(); uiLayer = ul
-            for _ in 0..<2 {
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: frames[0].pixelFormat, width: frames[0].width, height: frames[0].height, mipmapped: false)
-                d.usage = [.shaderRead, .shaderWrite]
-                if let t = device.makeTexture(descriptor: d) { layerOutRing.append(t) }
+        var layerCache: [Int: UILayer.Frame] = [:]
+        var layerGpuMs = 0.0; var layerGpuN = 0; var compGpuMs = 0.0; var compGpuN = 0
+        if UILayer.enabled, tripDet != nil {
+            let ul = UILayer(device: device); try? await ul.prepare()
+            if ul.available { uiLayer = ul; print("  [UILAYER] ON — 엔진 내부 UI 마스크 OFF, 합성은 층에서") }
+        }
+        // **MACFG_UILPROFILE=1**: 추출 단계별 누적 GPU 시간 (각 단계에서 멈춘 추출을 전 프레임 × 3회, 중앙값) 후 종료.
+        if let ul = uiLayer, Knob.isSet("MACFG_UILPROFILE"), let d = tripDet {
+            let names = ["복사", "+α", "+타일", "+push", "+pull", "+채움(전체)"]
+            var prevMs = 0.0
+            var lastF: UILayer.Frame? = nil
+            for stage in 1...6 {
+                UILayer.profileStop = stage == 6 ? 0 : stage
+                ul.reset()
+                var ms: [Double] = []
+                var prevF: UILayer.Frame? = nil
+                for _ in 0..<3 {
+                    for f in frames {
+                        guard let m = d.mask, let cb = queue.makeCommandBuffer() else { continue }
+                        prevF = ul.extract(source: f, prev: prevF, mask: m, owner: ObjectIdentifier(f), busy: [], into: cb)
+                        cb.commit(); await cb.completed()
+                        ms.append((cb.gpuEndTime - cb.gpuStartTime) * 1000)
+                    }
+                }
+                lastF = prevF
+                ms.sort()
+                let med = ms[ms.count / 2]
+                print(String(format: "  [UILPROFILE] %@ 누적 %.3f ms (단계 %.3f)", names[stage - 1], med, med - prevMs))
+                prevMs = med
             }
-            print("  [UILAYER] 프로토타입 ON — 엔진 내부 UI 마스크 OFF, 합성은 층에서")
+            if let pf = lastF { print("  [UILPROFILE] 구멍 타일 \(pf.tileCount) / \(Int(pf.tilesX) * ((frames[0].height + 31) / 32))") }
+            UILayer.profileStop = 0
+            return
         }
         // **MACFG_TRIPSEQ=1**: 연속 쌍 (i,i+1) — 런타임 케이던스(시간 prior 누적) 재현용. GT가 없어 PSNR은 무의미.
         let seqMode = Knob.isSet("MACFG_TRIPSEQ")
@@ -774,29 +793,32 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         if seqMode { print("  [TRIPSEQ] 연속 쌍 모드 — PSNR 무시, 덤프 i>=\(dumpFrom)") }
         for i in 0..<(frames.count - 2) {
             let a = frames[i], gt = frames[i + 1], b = seqMode ? frames[i + 1] : frames[i + 2]
-            var layerA: (alpha: any MTLTexture, clean: any MTLTexture)? = nil
-            var layerB: (alpha: any MTLTexture, clean: any MTLTexture)? = nil
+            var layerA: UILayer.Frame? = nil
+            var layerB: UILayer.Frame? = nil
+            let step = seqMode ? 1 : 2
             if let d = tripDet {
-                // MACFG_TRIPMASKSTRIDE=N: 런타임처럼 N프레임마다만 갱신 (앱은 uiDetectFrame % 6)
+                // MACFG_TRIPMASKSTRIDE=N: 런타임처럼 N프레임마다만 갱신 (앱은 uiDetectFrame % 2)
                 let mstride = max(1, Int(Knob.string("MACFG_TRIPMASKSTRIDE") ?? "") ?? 1)
-                // 층 모드에선 A(=직전 B)가 이미 갱신됐으므로 첫 반복만 갱신
+                // 층 모드는 앱과 같은 순서: 프레임이 도착하면 디텍터 갱신(스트라이드) → 그 마스크로 추출.
+                // A(=직전 반복의 B)는 이미 갱신·추출됐으므로 첫 반복만 A로 갱신한다.
                 if (uiLayer == nil || i == 0), i % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }
                 if let ul = uiLayer, let m = d.mask {
-                    // 프레임 i는 직전 반복에서 추출됨(layerPrev). 첫 반복이면 지금 추출.
-                    if layerPrev == nil, let cb = queue.makeCommandBuffer() {
-                        layerPrev = ul.extract(source: a, prev: nil, mask: m, into: cb); cb.commit(); await cb.completed()
+                    let busy = Set(layerCache.keys.map { ObjectIdentifier(frames[$0]) })
+                    if layerCache[i] == nil, let cb = queue.makeCommandBuffer() {
+                        layerCache[i] = ul.extract(source: a, prev: layerCache[i - step], mask: m, owner: ObjectIdentifier(a), busy: busy, into: cb)
+                        cb.commit(); await cb.completed()
                     }
-                    layerA = layerPrev
-                    // 프레임 i+1(B) 추출 — 런타임처럼 B 도착 시 마스크 갱신 후 (스트라이드 준수)
-                    if (i + 1) % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: b, into: cb); cb.commit(); await cb.completed() }
-                    if let m2 = d.mask, let cb = queue.makeCommandBuffer() {
-                        layerB = ul.extract(source: b, prev: a, mask: m2, into: cb); cb.commit(); await cb.completed()
+                    layerA = layerCache[i]
+                    let bIdx = i + step
+                    if bIdx % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: b, into: cb); cb.commit(); await cb.completed() }
+                    if let cb = queue.makeCommandBuffer(), let mB = d.mask {
+                        let busy2 = Set(layerCache.keys.map { ObjectIdentifier(frames[$0]) })
+                        layerB = ul.extract(source: b, prev: layerA, mask: mB, owner: ObjectIdentifier(b), busy: busy2, into: cb)
+                        cb.commit(); await cb.completed()
                         layerGpuMs += (cb.gpuEndTime - cb.gpuStartTime) * 1000; layerGpuN += 1
                     }
-                    layerPrev = layerB
-                    engine.setUIMask(nil)
-                } else {
-                    engine.setUIMask(d.mask)
+                    layerCache[bIdx] = layerB
+                    for k in layerCache.keys where k < i - 1 { layerCache.removeValue(forKey: k) }
                 }
                 if let dd = dumpDir, i == 1 || i == dumpFrom + 17, let m = d.mask {
                     dumpMaskOverlay(src: a, mask: m, device: device, queue: queue, path: "\(dd)/\(key)_mask\(i).png")
@@ -804,22 +826,18 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             }
             // 워밍업 겸 실행 — 시간적 prior 있는 엔진 위해 순서대로
             guard let cb = queue.makeCommandBuffer() else { continue }
-            let engA: any MTLTexture = layerA?.clean ?? a
-            let engB: any MTLTexture = layerB?.clean ?? b
+            let useLayer = layerA != nil && layerB != nil
+            let engA: any MTLTexture = useLayer ? layerA!.clean : a
+            let engB: any MTLTexture = useLayer ? layerB!.clean : b
             let r = engine.encodePair(stableA: engA, stableB: engB, tsA: Double(i) * dt, tsB: Double(i + (seqMode ? 1 : 2)) * dt, tValues: [0.5], into: cb)
             cb.commit(); await cb.completed()
-            guard let interpRaw = r?.frames.first?.texture else { continue }
-            var interp: any MTLTexture = interpRaw
-            if let ul = uiLayer, let lb = layerB, !layerOutRing.isEmpty, let cb2 = queue.makeCommandBuffer() {
-                // 합성: 보간된 배경 위에 B의 UI 층
-                let outTex = layerOutRing[i % layerOutRing.count]
-                ul.composite(interp: interpRaw, sourceA: a, sourceB: b, t: 0.5, alpha: lb.alpha, into: cb2, dst: outTex)
+            guard let interp = r?.frames.first?.texture else { continue }
+            if useLayer, let ul = uiLayer, let lb = layerB, let cb2 = queue.makeCommandBuffer() {
+                ul.composite(output: interp, sourceA: a, sourceB: b, t: 0.5, frameB: lb, into: cb2)   // 엔진 출력에 제자리
                 cb2.commit(); await cb2.completed()
-                layerGpuMs += (cb2.gpuEndTime - cb2.gpuStartTime) * 1000
-                interp = outTex
+                compGpuMs += (cb2.gpuEndTime - cb2.gpuStartTime) * 1000; compGpuN += 1
                 if let dd = dumpDir, i == dumpFrom + 17 {
                     dumpPNG(lb.clean, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_clean.png")
-                    dumpPNG(lb.alpha, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_alpha.png")
                 }
             }
             let p = computePSNRFull(device: device, queue: queue, texA: interp, texB: gt)
@@ -844,265 +862,13 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         // (이 벤치에서 blend가 hold보다 2.45dB 높은 것이 그 증거다 — 평균만 내도 점수가 오른다).
         // sharp 1.0 = 정답만큼 선명, <1 = 더 흐림, >1 = 과선명. PSNR↑ + sharp↓ 면 흐려서 이긴 것이다.
         let shAvg = sharps.isEmpty ? 0 : sharps.reduce(0, +) / Double(sharps.count)
-        if uiLayer != nil, layerGpuN > 0 { print(String(format: "  [UILAYER] 추출+합성 GPU %.3f ms/쌍 (n=%d)", layerGpuMs / Double(layerGpuN), layerGpuN)) }
+        if uiLayer != nil, layerGpuN > 0 { print(String(format: "  [UILAYER] 추출 GPU %.3f ms/프레임 (n=%d), 합성 %.3f ms/출력 (n=%d)", layerGpuMs / Double(layerGpuN), layerGpuN, compGpuN > 0 ? compGpuMs / Double(compGpuN) : 0, compGpuN)) }
         print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  sharp=\(String(format: "%.3f", shAvg))  (n=\(psnrs.count))")
     }
     print("\n⏱  실프레임 = 합성보다 압축노이즈·반투명·대모션 모두 포함. 높을수록 정확.")
 }
 
-/// **화질 변경 A/B (결정론적)** — 같은 삼중항에 4단계를 전부 돌려 비교한다.
-///
-/// 왜 이 모드인가: 실사용 A/B는 매번 장면이 달라 판정이 흐려진다(사용자 실측:
-/// "둘 다는 확실히 최악인데 각각은 off와 구분이 안 된다 — 매번 조건이 달라서 그런가").
-/// 같은 입력에 4단계를 돌리면 그 confound가 사라지고, 상호작용(각각은 무해한데 함께면
-/// 나빠지는지)도 드러난다.
-///
-/// 두 지표를 같이 본다 — 하나만 보면 이 세션에서 겪은 함정에 다시 빠진다:
-///  - PSNR      : t=0.5 정답과의 공간적 정확도. 높을수록 정확.
-///  - staticDev : 정지한 픽셀이 원본에서 벗어난 정도. 높을수록 **텍스트/UI가 안정**.
-/// 7/25 변경은 PSNR을 올리면서 staticDev를 떨어뜨렸을 가능성이 크다(눈에 보인 게 그쪽이다).
-/// **B2 정지-UI 마스크 스윕 — 정답(GT) 기준 짝지은 A/B.**
-///
-/// `UIStaticDetector`는 앱에만 배선돼 있고 InterpBench엔 참조가 0건이었다 — B2가 "튜닝 미완"이던
-/// 진짜 이유는 **잴 경로가 없었던 것**이다.
-///
-/// **첫 판(2026-09-01)은 지표를 틀리게 잡았다. 그 실패를 여기 남긴다.**
-/// `staticDev`(정지 픽셀이 A에서 벗어난 정도)와 그 반대 지표로 만든 `freezeErr`를 썼는데,
-/// 둘 다 **산술적으로 퇴화**한다:
-///   - staticDev는 `|A−B| ≤ tol(3)`인 픽셀만 골라 `|interp − A|`를 잰다. 그런데 t=0.5의 프리즈
-///     결과는 (A+B)/2(MetalFlow·RIFE) 또는 B(AppleFI)라 그 게이트가 오차에 **상한을 씌운다**
-///     (각각 ≤1.5, ≤3 ⇒ 항상 ≥44.6dB, ≥38.6dB). 반면 정답 GT는 그 게이트에 안 묶여 상한이 없다.
-///     **즉 "얼리기"가 "정답"을 14~21dB 이긴다.** 마스크를 키우면 좋아지는 게 당연하다.
-///   - `freezeErr`도 `|interp − A|`라 프리즈 타깃(=(A+B)/2)과 정답이 A에서 비슷한 거리에 있고,
-///     커버가 7~17%라 희석돼 판정 문턱에 닿지 못한다 → **모든 행이 후보로 통과**했다(실측).
-///
-/// **그래서 정답을 기준으로, 마스크가 실제로 덮는 영역에서, 짝지어 잰다.**
-/// 파라미터 점마다 같은 프레임·같은 마스크로 두 팔을 돌린다:
-///   on  = setUIMask(mask) 로 보간   /   off = setUIMask(nil) 로 보간
-/// 그리고 **마스크 영역(ROI)에서만** GT 대비 PSNR을 비교한다. 차이가 곧 "이 픽셀들을 얼려서
-/// 정답에 더 가까워졌는가"이고, 이건 마스크를 키운다고 공짜로 오르지 않는다.
-/// full은 화면 전체 — ROI가 좋아지면서 full이 나빠지면 다른 데를 망친 것이다.
-///
-/// **dB는 평균 내지 않고 MSE를 풀링한다.** 삼중항별 dB 평균은 준정지 구간(99dB 포화)이 열 전체를
-/// 끌어올린다 — 기존 코드의 결함이었다.
-///
-/// **EMA 워밍업**: 디텍터는 `frames >= 8`이어야 마스크를 내주고 alpha(기본 0.04)는 25갱신 창이다.
-/// 여기서는 매 프레임 갱신하므로 창의 3배(75장)를 흘린 뒤 측정한다.
-/// **주의**: 앱은 6프레임마다 갱신하므로(AppState `uiDetectFrame % 6`) 실효 창이 150 소스프레임이다
-/// — 벤치와 앱의 시간 상수가 다르다. 여기 결과를 앱 값으로 그대로 옮기지 말 것.
-func runUIMaskSweep(dir: String, engineKey: String, stride uiStride: Int,
-                    device: any MTLDevice, queue: any MTLCommandQueue) async {
-    let fm = FileManager.default
-    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
-        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
-    guard files.count >= 100 else {
-        print("❌ 프레임 \(files.count)장 — EMA 수렴에 최소 100장 필요. bench_frames는 전부 12장이라 못 쓴다.")
-        return
-    }
-    var frames: [any MTLTexture] = []
-    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
-    guard frames.count >= 100 else { print("❌ 로드 실패"); return }
-    let W = frames[0].width, H = frames[0].height
-    // **워밍업은 스트라이드에 비례한다.** EMA 창은 alpha 기준 25 **갱신**이고, 갱신은
-    // uiStride 프레임마다 일어난다 → 소스 프레임 기준 창 = 25 × stride. 3 시상수를 흘린다.
-    // stride 1(벤치 기본)이면 75장, stride 6(앱과 동일)이면 450장이 필요하다.
-    let warm = min(75 * uiStride, max(20, frames.count / 2))
-    print("▶ 정지-UI 마스크 (GT 기준 짝A/B): \(frames.count)장 \(W)x\(H) (마스크 \(W/2)x\(H/2))"
-          + " 갱신주기 \(uiStride)프레임 워밍업 \(warm)  \(dir)")
-    if warm < 75 * uiStride {
-        print("  ⚠️ 워밍업이 \(75 * uiStride)장에 못 미친다(프레임 부족) — EMA 미수렴. 결과를 앱 값으로 옮기지 말 것.")
-    }
 
-    // 마지막 항은 마스크 축소비 — 소스/div. 연산자가 마스크 픽셀 단위라 이 값이 곧
-    // "연산자가 화면의 몇 퍼센트를 덮는가"를 정한다. 4K에서 div 4 = 1080p에서 div 2와 동일 비율.
-    let points: [(String, Float, Float, Float, Float, Int)] = [
-        ("현재 .04/.5/1.7", 0.04, 0.5, 1.7, 1.0, 2),
-        ("clo 0.8",        0.04, 0.8, 2.0, 1.0, 2),
-        ("clo 1.2",        0.04, 1.2, 2.4, 1.0, 2),
-        ("clo 0.3",        0.04, 0.3, 1.5, 1.0, 2),
-        ("창 50f(.02)",    0.02, 0.5, 1.7, 1.0, 2),
-        ("창 12f(.08)",    0.08, 0.5, 1.7, 1.0, 2),
-        ("strength 0.6",   0.04, 0.5, 1.7, 0.6, 2),
-        ("div4 clo .5",    0.04, 0.5, 1.7, 1.0, 4),
-        ("div4 clo 0.3",   0.04, 0.3, 1.5, 1.0, 4),
-        ("div4 clo 0.8",   0.04, 0.8, 2.0, 1.0, 4),
-        ("div3 clo .5",    0.04, 0.5, 1.7, 1.0, 3),
-        // 어디서 뒤집히는지 — div4가 세 팔 전부에서 이겼으므로 더 밀어 본다.
-        ("div6 clo 0.3",   0.04, 0.3, 1.5, 1.0, 6),
-        ("div8 clo 0.3",   0.04, 0.3, 1.5, 1.0, 8),
-        ("div6 clo .15",   0.04, 0.15, 1.2, 1.0, 6),
-        ("div4 clo .15",   0.04, 0.15, 1.2, 1.0, 4),
-    ]
-    // cons 분모의 잡음 바닥 축 — 배포 파라미터를 고정한 채 이것만 바꾼다.
-    // 깨끗한 소스와 잡음 있는 소스에서 **최적점이 다르면** 코덱 의존성이 여기 있다는 뜻이다.
-    let epsPoints: [Float] = [0.001, 0.002, 0.004, 0.008, 0.016]
-    // **반경 축 — maskDiv와 달리 마스크 해상도는 소스/2로 유지한다.**
-    // div를 키우면 분석 스케일과 마스크 해상도가 같이 내려가 업샘플에서 뭉개졌다(선명도 −0.0040).
-    // 반경만 키우면 분석 스케일만 넓어지므로, 검출 이득을 얻으면서 블러가 없어야 한다 —
-    // 그 예측이 맞는지가 이 축의 전부다. 0 = 소스 해상도에서 자동(1080p→1, 4K→2).
-    let radiusPoints: [Int] = [1, 2, 3, 0]
-    print("  설정             cover  경도>.75  ROI이득   full이득   선명도Δ  갱신비용")
-    var allPoints = points.map { ($0.0, $0.1, $0.2, $0.3, $0.4, $0.5, Float(0.004), 1) }
-    for e in epsPoints {
-        allPoints.append((String(format: "eps %.3f", e), 0.04, 0.5, 1.7, 1.0, 2, e, 1))
-    }
-    // MetalFlow 전용 축: UI 마스크 타깃 (B 원본 vs (A+B)/2). 자체 staticness와 충돌하는지 본다.
-    if engineKey == "metalflow" || engineKey.isEmpty {
-        allPoints.append(("UI→(A+B)/2 옛", 0.04, 0.5, 1.7, 1.0, 2, 0.004, -1))
-        allPoints.append(("UI→B 신 R1",     0.04, 0.5, 1.7, 1.0, 2, 0.004, -2))
-    }
-    for r in radiusPoints {
-        allPoints.append((r == 0 ? "R auto" : "R \(r) (\(2*r+1)x\(2*r+1))",
-                          0.04, 0.5, 1.7, 1.0, 2, 0.004, r))
-    }
-    for pt in allPoints {
-        let (name, alpha, clo, chi, strength, div, eps, rad) = pt
-        UIStaticDetector.noiseEps = eps
-        // rad < 0 = MetalFlow UI 타깃 축 (반경은 1로 고정해 타깃만 가른다).
-        // **버그 정정(2026-09-02, Codex 지적)**: 전엔 `rad != -1`이라 일반 행 전부가 B 타깃으로
-        // 돌았다 — 배포 기본((A+B)/2)과 달랐고, 어려운 구간의 MetalFlow 음수(−0.47/−1.18)가
-        // 그 버그의 산물일 수 있다. 이제 전용 행(rad=-2)만 B, 나머지는 엔진 기본값이다.
-        MetalFlowEngine.uiMaskToB = rad == -2
-        UIStaticDetector.hpRadius = rad < 0 ? 1 : rad
-        UIStaticDetector.enabled = true
-        UIStaticDetector.alpha = alpha; UIStaticDetector.clo = clo
-        UIStaticDetector.chi = chi; UIStaticDetector.strength = strength
-        UIStaticDetector.maskDiv = div
-
-        let det = UIStaticDetector(device: device)
-        try? await det.prepare(); det.reset()
-        // **두 팔에 엔진 인스턴스를 따로 둔다 (Codex 지적).** MetalFlow는 호출마다 코스 flow를
-        // 다음 쌍의 prior로 저장하고 RIFE도 시간축 상태가 있어, 같은 인스턴스로 ON→OFF를 연속
-        // 호출하면 OFF가 ON의 flow를 물려받는다 — 차이가 마스크 효과만이 아니게 된다.
-        // 두 인스턴스에 **같은 쌍을 같은 순서로** 먹여 이력을 동일하게 유지한다.
-        func makeEngine() -> any PairInterpolationEngine {
-            switch engineKey {
-            case "applefi": return AppleFIEngine()
-            case "rife":    return RIFEEngine()
-            default:        return MetalFlowEngine()
-            }
-        }
-        let engOn = makeEngine(), engOff = makeEngine()
-        do { try await engOn.prepare(device: device); try await engOff.prepare(device: device) }
-        catch { print("  \(name): prepare 실패"); continue }
-
-        // **디텍터 갱신 비용을 같이 잰다.** 박스 반경을 R로 키우면 텍스처 샘플이 (2R+1)²로
-        // 늘어난다(3x3=9 → 7x7=49, 5.4배). 이 패스는 4K에서 cb1 +3ms이고 workQueue 백로그가
-        // 그걸 +11ms work로 증폭한다고 기록돼 있다 — 화질 이득을 성능으로 사는 것이면 알아야 한다.
-        var updMs: [Double] = []
-        for i in stride(from: 0, to: warm, by: uiStride) {
-            guard let cb = queue.makeCommandBuffer() else { break }
-            let t0 = CFAbsoluteTimeGetCurrent()
-            det.update(source: frames[i], into: cb); cb.commit(); await cb.completed()
-            updMs.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        }
-        let updAvg = updMs.count > 8
-            ? updMs.suffix(updMs.count - 8).reduce(0, +) / Double(updMs.count - 8) : 0
-        // MSE 풀링 누적 — (roiOn, roiOff, fullOn, fullOff) 각각 (제곱합, 표본수)
-        var acc = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
-        var covs: [Double] = [], hards: [Double] = [], shOn: [Double] = [], shOff: [Double] = []
-        // 측정 삼중항 상한 — 4K에서 CPU 오차 누적이 병목이라 전수는 비싸다. 40개면 MSE 풀링에
-        // 충분하고(픽셀 단위 표본이 4K 40삼중항 = 8천만 개), 파라미터 점 7개 × 두 팔이 감당된다.
-        let measureStep = max(2, 2 * ((frames.count - warm) / 2 / 40))
-        var i = warm
-        // **디텍터에는 예정된 소스를 전부 공급한다 (Codex 지적).** 측정 삼중항은 measureStep으로
-        // 건너뛰더라도, 그 사이 프레임을 디텍터가 안 보면 예열과 측정의 EMA 시간축이 달라진다.
-        var fed = warm
-        while i + 2 < frames.count {
-            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
-            while fed <= i {
-                if (fed - warm) % uiStride == 0 {
-                    guard let cbu = queue.makeCommandBuffer() else { break }
-                    det.update(source: frames[fed], into: cbu); cbu.commit(); await cbu.completed()
-                }
-                fed += 1
-            }
-            guard let mask = det.mask else { i += measureStep; continue }
-            let ms = readMaskStats(mask, device: device, queue: queue)
-            covs.append(ms.mean); hards.append(ms.hard)
-            // **마스크 시각화 (B2, 여태 미구현).** 숫자로는 "무엇을 놓쳤나"를 못 본다.
-            // 소스 위에 마스크를 초록으로 얹어 한 장 남긴다 — 어디가 얼려지고 어디가 안
-            // 얼려지는지가 한눈에 보인다. 반투명 채팅처럼 배경이 비쳐 시간축 일관성이 깨지는
-            // 영역을 디텍터가 잡는지 여부가 이 그림에서 바로 갈린다.
-            if let dd = Knob.string("MACFG_MASKDUMP"), covs.count == 5 {
-                dumpMaskOverlay(src: a, mask: mask, device: device, queue: queue,
-                                path: "\(dd)/mask_\(name.replacingOccurrences(of: " ", with: "_")).png")
-            }
-            var outs: [any MTLTexture] = []
-            for useMask in [true, false] {
-                let engine = useMask ? engOn : engOff
-                engine.setUIMask(useMask ? mask : nil)
-                guard let cb = queue.makeCommandBuffer() else { break }
-                let r = engine.encodePair(stableA: a, stableB: b, tsA: Double(i) / 60.0,
-                                          tsB: Double(i + 2) / 60.0, tValues: [0.5], into: cb)
-                cb.commit(); await cb.completed()
-                guard let t = r?.frames.first?.texture else { break }
-                // 링 슬롯 재사용으로 덮이기 전에 즉시 읽어야 한다 — 두 팔을 모아 뒀다 재면 안 된다.
-                outs.append(t)
-                // **선명도를 두 팔 각각 잰다.** full이득이 양수인데 선명도가 떨어졌다면
-                // 마스크가 UI를 얼린 게 아니라 전체를 흐리게 해서 PSNR을 번 것이다.
-                let sh = computeSharpnessRatio(device: device, queue: queue, out: t, gt: gt)
-                if useMask { shOn.append(sh) } else { shOff.append(sh) }
-                let (rs, rn, fs, fn) = maskedSquaredError(device: device, queue: queue,
-                                                          out: t, gt: gt, mask: mask)
-                let k = useMask ? 0 : 1
-                acc[k].0 += rs; acc[k].1 += rn
-                acc[k + 2].0 += fs; acc[k + 2].1 += fn
-            }
-            _ = outs
-            i += measureStep
-        }
-        engOn.shutdown(); engOff.shutdown()
-        let db: ((Double, Double)) -> Double = { p in
-            guard p.1 > 0 else { return 0 }
-            let mse = p.0 / p.1
-            return mse <= 0 ? 99 : 10 * log10(255 * 255 / mse)
-        }
-        let rOn = db(acc[0]), rOff = db(acc[1]), fOn = db(acc[2]), fOff = db(acc[3])
-        let mean: ([Double]) -> Double = { $0.isEmpty ? 0 : $0.reduce(0, +) / Double($0.count) }
-        let C = mean(covs), Hd = mean(hards), dSharp = mean(shOn) - mean(shOff)
-        let lbl = name.count >= 16 ? name : name + String(repeating: " ", count: 16 - name.count)
-        // 선명도가 떨어지면(−0.002 초과) 이득의 출처를 의심해야 한다 — 블러로 번 것일 수 있다.
-        let blurry = dSharp < -0.002
-        let mark = blurry ? "  ⚠️흐려짐" : ((fOn - fOff) > -0.02 ? "  ✅" : "  ✗")
-        print(lbl + String(format: " %5.1f%% %5.1f%%  %+7.3f  %+7.3f  %+7.4f %6.2fms",
-                           C * 100, Hd * 100, rOn - rOff, fOn - fOff, dSharp, updAvg) + mark)
-    }
-    print("\n  ROI = 마스크가 덮는 픽셀만, GT 기준. ROI이득 = 마스크 켬 − 끔 (짝지은 같은 프레임·같은 마스크).")
-    print("  ✅ = ROI이득 > +0.02dB 이면서 full이득 > −0.02dB. 마스크를 키운다고 공짜로 오르지 않는다.")
-}
-
-/// 마스크 가중 제곱오차와 전체 제곱오차를 **한 번에** 낸다 — (ROI합, ROI표본, 전체합, 전체표본).
-/// dB로 바꾸지 않고 합을 돌려주는 이유: 호출측이 시퀀스 전체를 **MSE로 풀링**해야 하기 때문이다.
-/// 삼중항별 dB를 평균하면 준정지 구간(99dB 포화)이 결과를 끌어올린다.
-func maskedSquaredError(device: any MTLDevice, queue: any MTLCommandQueue,
-                        out: any MTLTexture, gt: any MTLTexture,
-                        mask: any MTLTexture, thresh: Double = 0.25)
-                        -> (Double, Double, Double, Double) {
-    let o = readTextureBytes(out, device: device, queue: queue)
-    let g = readTextureBytes(gt, device: device, queue: queue)
-    guard !o.isEmpty, o.count == g.count else { return (0, 0, 0, 0) }
-    let m = readMaskFloats(mask, device: device, queue: queue)
-    guard !m.isEmpty else { return (0, 0, 0, 0) }
-    let w = min(out.width, gt.width), h = min(out.height, gt.height)
-    let rowO = out.width * 4, rowG = gt.width * 4
-    let mw = mask.width, mh = mask.height
-    var rs = 0.0, rn = 0.0, fs = 0.0, fn = 0.0
-    for y in stride(from: 0, to: h, by: 2) {
-        let my = min(mh - 1, y * mh / h)
-        for x in stride(from: 0, to: w, by: 2) {
-            let mx = min(mw - 1, x * mw / w)
-            let inROI = Double(m[my * mw + mx]) >= thresh
-            for c in 0..<3 {
-                let d = Double(o[y * rowO + x * 4 + c]) - Double(g[y * rowG + x * 4 + c])
-                let sq = d * d
-                fs += sq; fn += 1
-                if inROI { rs += sq; rn += 1 }
-            }
-        }
-    }
-    return (rs, rn, fs, fn)
-}
 
 /// 소스 위에 마스크를 얹은 진단 이미지. 초록 = 마스크가 얼리는 곳(밝을수록 강하게).
 /// 숫자(커버·경도)는 **얼마나**를 말하지만 **어디를**은 말하지 않는다. 정지 UI 검출의
@@ -1159,117 +925,7 @@ func readMaskFloats(_ mask: any MTLTexture, device: any MTLDevice, queue: any MT
     return raw.map { Float(Float16(bitPattern: $0)) }
 }
 
-/// 마스크 평균(프리즈 비율)과 **경도** — 0.75를 넘는 픽셀 비율.
-///
-/// 평균만 보면 속는다. 격자를 거칠게 하면(maskDiv↑) 업샘플이 마스크를 뭉개서 **화면 전체에
-/// 옅은 블렌드**가 되는데, 평균은 그것도 "커버가 늘었다"로 읽는다. 그건 UI를 얼린 게 아니라
-/// 전부를 살짝 흐리게 한 것이고, PSNR은 블러를 보상하므로 점수만 오른다(이 저장소에 기록된
-/// 함정). 경도가 낮은데 평균만 높으면 그 경우다.
-func readMaskStats(_ mask: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue)
-                   -> (mean: Double, hard: Double) {
-    let f = readMaskFloats(mask, device: device, queue: queue)
-    guard !f.isEmpty else { return (0, 0) }
-    var sum = 0.0, hard = 0.0
-    for v in f { sum += Double(v); if v > 0.75 { hard += 1 } }
-    return (sum / Double(f.count), hard / Double(f.count))
-}
 
-/// **흔들림(교대) 지표 — B2의 지각과 맞는 숫자를 찾기 위한 모드 (`--ui-shimmer`).**
-///
-/// 눈이 보는 "글자 흔들림"은 단일 프레임 오차가 아니라 소스/보간 프레임 간 **교대**다:
-/// 소스 프레임에서 글자는 정확하고 보간 프레임에서 δ만큼 어긋나면, 120Hz에서 정확/어긋남이
-/// 60Hz로 번갈아 보인다. PSNR은 |δ|를 재지만 그것이 일정한지 깜박이는지는 구분 못 한다.
-///
-/// 정의 (Codex 제안을 따름): 출력 스트림 O=[A, interp, B, …]와 정답 G=[i, i+1, i+2, …]에서
-///   e_k = H(O_k) − H(G_k)   (H = 3x3 박스 대비 고주파, **글자 ROI**만)
-///   T   = mean_k |e_{k+1} − e_k|
-/// 소스 프레임은 e=0이므로 보간 프레임 오차가 그대로 교대 크기가 된다.
-/// 글자 ROI = mask>0.5 ∧ |A−B|<tol — **모든 팔에 같은 ROI**(마스크는 고정, 첫 팔에서 뽑음).
-///
-/// 이 지표도 얼리면 T≈0이라 단독으로는 퇴화한다. 그래서 같이 찍는다:
-///   ghost  — 글자 ROI 바깥 링(팽창−마스크)의 고주파 초과 = 워프가 글자를 밖으로 끌어낸 유령 획
-///   moving — |A−B|≥tol 픽셀의 GT 대비 PSNR = 모션을 망쳤는지 (얼리기를 벌한다)
-///   sharp  — 선명도 비율
-/// 그리고 **대조군** hold(=A 복사)·blend((A+B)/2)를 같은 표에 넣어, 각 지표가 각 결함을
-/// 실제로 잡는지 먼저 본다. hold는 T·ghost가 0에 가깝고 moving이 최악이어야 정상이다.
-func runUIShimmerMode(dir: String, engineKeys: [String], device: any MTLDevice,
-                      queue: any MTLCommandQueue) async {
-    let fm = FileManager.default
-    let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
-        .filter { $0.hasPrefix("frame_") && $0.hasSuffix(".png") }.sorted()
-    guard files.count >= 100 else { print("❌ 프레임 \(files.count)장 — 100장 이상 필요"); return }
-    var frames: [any MTLTexture] = []
-    for f in files { if let t = loadTexture(path: dir + "/" + f, device: device) { frames.append(t) } }
-    guard frames.count >= 100 else { print("❌ 로드 실패"); return }
-    let W = frames[0].width, H = frames[0].height
-    let warm = 75, step = max(2, 2 * ((frames.count - warm) / 2 / 30))
-    print("▶ 흔들림(교대) 지표: \(frames.count)장 \(W)x\(H)  \(dir)")
-
-    // 마스크는 배포 기본 디텍터로 한 번만 뽑아 모든 팔이 공유한다 (ROI 고정).
-    UIStaticDetector.enabled = true; UIStaticDetector.hpRadius = 0
-    let det = UIStaticDetector(device: device); try? await det.prepare(); det.reset()
-    for i in 0..<warm {
-        guard let cb = queue.makeCommandBuffer() else { break }
-        det.update(source: frames[i], into: cb); cb.commit(); await cb.completed()
-    }
-    // 측정 인덱스와 그 시점 마스크(Float 배열)를 미리 확보 — 팔마다 디텍터를 다시 돌리지 않는다.
-    var idx: [Int] = [], masks: [[Float]] = []
-    var fed = warm, i = warm
-    while i + 2 < frames.count {
-        while fed <= i {
-            guard let cb = queue.makeCommandBuffer() else { break }
-            det.update(source: frames[fed], into: cb); cb.commit(); await cb.completed(); fed += 1
-        }
-        if let m = det.mask { idx.append(i); masks.append(readMaskFloats(m, device: device, queue: queue)) }
-        i += step
-    }
-    guard !idx.isEmpty, let maskTexRef = det.mask else { print("❌ 마스크 없음"); return }
-    let mw = maskTexRef.width, mh = maskTexRef.height
-
-    var arms: [(String, (any PairInterpolationEngine)?)] = [("hold(A)", nil), ("blend", nil)]
-    let all: [(String, any PairInterpolationEngine)] = [("metalflow", MetalFlowEngine()),
-        ("applefi", AppleFIEngine()), ("rife", RIFEEngine())]
-    for (k, e) in all where engineKeys.contains("all") || engineKeys.contains(k) { arms.append((k, e)) }
-
-    print("  팔            T(교대)   ghost    moving    sharp   |  T·ghost 낮고 moving 높아야 좋다")
-    for (name, engine) in arms {
-        if let e = engine { do { try await e.prepare(device: device) } catch { print("  \(name) prepare 실패"); continue } }
-        // 두 인스턴스가 아니라 한 팔이므로 이력 공유 문제 없음. 마스크는 항상 켠다(배포 조건).
-        var Tsum = 0.0, Tn = 0.0, ghostSum = 0.0, ghostN = 0.0
-        var movSq = 0.0, movN = 0.0, sharps: [Double] = []
-        for (k, i) in idx.enumerated() {
-            let a = frames[i], gt = frames[i + 1], b = frames[i + 2]
-            let mask = masks[k]
-            let out: any MTLTexture
-            if let e = engine {
-                // 이 팔의 엔진에 이 시점 마스크를 텍스처로 다시 올려야 하지만, 디텍터 마스크
-                // 텍스처는 하나뿐이다 — 대신 디텍터 '현재' 마스크를 그대로 쓴다. 측정 인덱스
-                // 진행과 디텍터 상태가 위에서 같은 순서로 갱신됐으므로 마지막 마스크와 거의 같다.
-                e.setUIMask(det.mask)
-                guard let cb = queue.makeCommandBuffer() else { break }
-                let r = e.encodePair(stableA: a, stableB: b, tsA: Double(i) / 60.0,
-                                     tsB: Double(i + 2) / 60.0, tValues: [0.5], into: cb)
-                cb.commit(); await cb.completed()
-                guard let t = r?.frames.first?.texture else { continue }
-                out = t
-            } else if name == "hold(A)" { out = a }
-            else { guard let bl = makeBlend(a, b, device: device, queue: queue) else { continue }; out = bl }
-
-            let (T, gh, mq, mn) = shimmerStats(device: device, queue: queue, a: a, b: b, gt: gt,
-                                               out: out, mask: mask, mw: mw, mh: mh)
-            Tsum += T.0; Tn += T.1; ghostSum += gh.0; ghostN += gh.1; movSq += mq; movN += mn
-            sharps.append(computeSharpnessRatio(device: device, queue: queue, out: out, gt: gt))
-        }
-        engine?.shutdown()
-        let Tv = Tn > 0 ? Tsum / Tn : 0, gv = ghostN > 0 ? ghostSum / ghostN : 0
-        let mov = movN > 0 ? 10 * log10(255 * 255 / max(movSq / movN, 1e-9)) : 0
-        let sh = sharps.isEmpty ? 0 : sharps.reduce(0, +) / Double(sharps.count)
-        let lbl = name.count >= 12 ? name : name + String(repeating: " ", count: 12 - name.count)
-        print("  " + lbl + String(format: " %8.3f %8.3f %8.2f %8.3f", Tv, gv, mov, sh))
-    }
-    print("\n  T = 글자 ROI 고주파 오차의 프레임 간 변화량(교대). ghost = ROI 바깥 링의 고주파 초과.")
-    print("  moving = 움직인 픽셀의 GT 대비 PSNR(얼리기를 벌함). hold 행이 T≈0·moving 최악이면 지표가 작동하는 것.")
-}
 
 /// 글자 ROI 교대량·유령 링·움직임 오차를 한 번에. ROI = mask>0.5 ∧ |A−B|<tol.
 /// 반환: (T합, T표본), (ghost합, ghost표본), moving제곱합, moving표본.
@@ -1335,6 +991,17 @@ func makeBlend(_ a: any MTLTexture, _ b: any MTLTexture, device: any MTLDevice, 
     return t
 }
 
+/// **화질 변경 A/B (결정론적)** — 같은 삼중항에 4단계를 전부 돌려 비교한다.
+///
+/// 왜 이 모드인가: 실사용 A/B는 매번 장면이 달라 판정이 흐려진다(사용자 실측:
+/// "둘 다는 확실히 최악인데 각각은 off와 구분이 안 된다 — 매번 조건이 달라서 그런가").
+/// 같은 입력에 4단계를 돌리면 그 confound가 사라지고, 상호작용(각각은 무해한데 함께면
+/// 나빠지는지)도 드러난다.
+///
+/// 두 지표를 같이 본다 — 하나만 보면 이 세션에서 겪은 함정에 다시 빠진다:
+///  - PSNR      : t=0.5 정답과의 공간적 정확도. 높을수록 정확.
+///  - staticDev : 정지한 픽셀이 원본에서 벗어난 정도. 높을수록 **텍스트/UI가 안정**.
+/// 7/25 변경은 PSNR을 올리면서 staticDev를 떨어뜨렸을 가능성이 크다(눈에 보인 게 그쪽이다).
 func runQualityABMode(dir: String, device: any MTLDevice, queue: any MTLCommandQueue) async {
     let fm = FileManager.default
     let files = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
@@ -1536,12 +1203,7 @@ func main() async {
     }
 
     if let td = config.tripletsDir {
-        if config.uiShimmer {
-            await runUIShimmerMode(dir: td, engineKeys: config.engines, device: device, queue: commandQueue)
-        } else if config.uiSweep {
-            await runUIMaskSweep(dir: td, engineKey: config.engines.first ?? "metalflow",
-                                 stride: config.uiStride, device: device, queue: commandQueue)
-        } else if let stride = config.tinStride {
+        if let stride = config.tinStride {
             await runTinDensityMode(dir: td, strideN: stride, engineKeys: config.engines,
                                     device: device, queue: commandQueue)
         } else if config.qualityAB {

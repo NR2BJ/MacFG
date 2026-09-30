@@ -52,15 +52,12 @@ public protocol PairInterpolationEngine: AnyObject {
     /// 링을 재사용하지 않는 엔진(Legacy 등)은 기본 구현(항상 true)을 그대로 쓴다.
     func isFrameLive(_ stamp: UInt64) -> Bool
 
-    /// 화면정지 UI 마스크(UIStaticDetector 산출, 소스 좌표 UV) — 워프가 이 영역을 소스로
-    /// 프리즈해 채팅/HUD가 배경 flow에 끌리는 것을 막는다. 다음 encodePair에서 사용. nil=미사용.
-    /// 지원 안 하는 엔진은 기본 no-op.
-    func setUIMask(_ texture: (any MTLTexture)?)
+    // 정적 UI(채팅·HUD·자막)는 엔진이 다루지 않는다. 앱이 엔진 입력에서 지우고(UILayer.extract → clean)
+    // 엔진 출력에 다시 얹는다(UILayer.composite). 엔진은 "UI 없는 두 프레임 → 중간 프레임"만 책임진다.
 }
 
 public extension PairInterpolationEngine {
     func isFrameLive(_ stamp: UInt64) -> Bool { true }
-    func setUIMask(_ texture: (any MTLTexture)?) {}
 }
 
 /// 기존 FrameInterpolator(Blend 등)를 PairInterpolationEngine으로 감싸는 어댑터

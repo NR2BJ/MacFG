@@ -74,8 +74,6 @@ public final class AppleFIEngine: PairInterpolationEngine {
     private var slotStamps: [UInt64] = []
     private var nextStamp: UInt64 = 0
     /// 화면정지 UI 마스크 (UIStaticDetector) — compositeMasked가 이 영역을 소스B로 프리즈
-    private var uiMaskTex: (any MTLTexture)?
-    public func setUIMask(_ texture: (any MTLTexture)?) { uiMaskTex = texture }
     private var outputWidth = 0
     private var outputHeight = 0
 
@@ -274,9 +272,6 @@ public final class AppleFIEngine: PairInterpolationEngine {
         enc3.setTexture(upscaledTmp, index: 1)
         enc3.setTexture(maskTex, index: 2)
         enc3.setTexture(output, index: 3)
-        enc3.setTexture(uiMaskTex ?? stableB, index: 4)   // 정지-UI 마스크 (미사용 시 더미)
-        var useUIMask: Float = uiMaskTex != nil ? 1 : 0
-        enc3.setBytes(&useUIMask, length: MemoryLayout<Float>.size, index: 0)
         dispatch(enc3, width: output.width, height: output.height, pso: compositePSO)
         enc3.endEncoding()
 
@@ -592,8 +587,6 @@ public final class AppleFIEngine: PairInterpolationEngine {
         texture2d<float, access::read> interpUp [[texture(1)]],
         texture2d<float, access::sample> mask [[texture(2)]],
         texture2d<float, access::write> dst [[texture(3)]],
-        texture2d<float, access::sample> uiMask [[texture(4)]],
-        constant float& useUIMask [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
         uint w = dst.get_width();
@@ -607,8 +600,7 @@ public final class AppleFIEngine: PairInterpolationEngine {
         m = max(m, mask.sample(s, uv + float2(-o.x, 0)).r);
         m = max(m, mask.sample(s, uv + float2(0,  o.y)).r);
         m = max(m, mask.sample(s, uv + float2(0, -o.y)).r);
-        // 시간축 정지-UI: 모션 마스크를 낮춰 UI를 소스B(정지)로 고정
-        if (useUIMask > 0.5) m *= (1.0 - clamp(uiMask.sample(s, uv).r, 0.0, 1.0));
+        // 정적 UI는 엔진에 들어오기 전에 지워진다(UILayer). 여기엔 UI 경로가 없다.
         float3 base = srcB.read(gid).rgb;
         float3 interp = interpUp.read(gid).rgb;
         dst.write(float4(mix(base, interp, m), 1.0), gid);

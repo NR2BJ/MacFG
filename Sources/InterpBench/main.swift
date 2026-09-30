@@ -599,7 +599,18 @@ func computeSharpnessRatio(device: any MTLDevice, queue: any MTLCommandQueue,
     return gradEnergy(out) / g
 }
 
-func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: any MTLTexture, texB: any MTLTexture) -> Double {
+/// `MACFG_ROI=x,y,w,h` — 삼중항 모드에서 이 사각형(소스 픽셀) 안의 PSNR을 따로 낸다(`roi=`).
+/// 용도: 반투명 채팅처럼 **특정 UI 영역**의 번짐을 전체 PSNR에 묻히지 않게 본다(B1 재평가, 2026-10-01).
+/// 출력 키를 `avg=`로 쓰지 않는 이유: bench_sweep.py가 `avg=` 등장 순서(hold/blend/엔진)로 값을 읽는다.
+nonisolated(unsafe) let benchROI: (x: Int, y: Int, w: Int, h: Int)? = {
+    guard let s = Knob.string("MACFG_ROI") else { return nil }
+    let v = s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    guard v.count == 4, v[2] > 0, v[3] > 0 else { return nil }
+    return (v[0], v[1], v[2], v[3])
+}()
+
+func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: any MTLTexture, texB: any MTLTexture,
+                     region: (x: Int, y: Int, w: Int, h: Int)? = nil) -> Double {
     func readAll(_ tex: any MTLTexture) -> [UInt8] {
         let w = tex.width, h = tex.height
         if tex.storageMode == .shared {
@@ -624,8 +635,11 @@ func computePSNRFull(device: any MTLDevice, queue: any MTLCommandQueue, texA: an
     guard !a.isEmpty, !b.isEmpty else { return 0 }
     let rowA = texA.width * 4, rowB = texB.width * 4
     var mse = 0.0, count = 0.0
-    for y in stride(from: 0, to: h, by: 2) {
-        for x in stride(from: 0, to: w, by: 2) {
+    let x0 = region.map { max(0, $0.x) } ?? 0, y0 = region.map { max(0, $0.y) } ?? 0
+    let x1 = region.map { min(w, $0.x + $0.w) } ?? w, y1 = region.map { min(h, $0.y + $0.h) } ?? h
+    let st = region == nil ? 2 : 1
+    for y in stride(from: y0, to: y1, by: st) {
+        for x in stride(from: x0, to: x1, by: st) {
             for c in 0..<3 {
                 let d = Double(a[y * rowA + x * 4 + c]) - Double(b[y * rowB + x * 4 + c])
                 mse += d * d; count += 1
@@ -743,6 +757,13 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
     let holdAvg = holdPSNRs.isEmpty ? 0 : holdPSNRs.reduce(0, +) / Double(holdPSNRs.count)
     let holdMin = holdPSNRs.min() ?? 0
     print("  \("hold(보간없음)".padding(toLength: 16, withPad: " ", startingAt: 0)) avg=\(String(format: "%.2f", holdAvg))dB  min=\(String(format: "%.2f", holdMin))dB   ← 기준선①")
+    if let roi = benchROI {
+        var r: [Double] = []
+        for i in stride(from: 0, to: frames.count - 2, by: 1) {
+            r.append(computePSNRFull(device: device, queue: queue, texA: frames[i], texB: frames[i + 1], region: roi))
+        }
+        print("  [ROI \(roi.x),\(roi.y),\(roi.w)x\(roi.h)] hold roi=\(String(format: "%.2f", r.reduce(0, +) / Double(max(1, r.count))))dB")
+    }
     var blendPSNRs: [Double] = []
     for i in 0..<(frames.count - 2) {
         blendPSNRs.append(computeBlendPSNR(device: device, queue: queue,
@@ -762,6 +783,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         do { try await engine.prepare(device: device) } catch { print("  \(key): prepare 실패"); continue }
         var psnrs: [Double] = []
         var sharps: [Double] = []
+        var roiPSNRs: [Double] = []
         var dt = 1.0 / 30.0
         // **MACFG_TRIPMASK=1**: 삼중항 경로에도 정지-UI 디텍터를 붙인다 (기본은 마스크 없음).
         // 워프의 소스 좌표 가드(MetalFlow sourceMaskGuard)는 마스크가 있어야 동작하므로, 유령 재현
@@ -885,6 +907,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             let p = computePSNRFull(device: device, queue: queue, texA: interp, texB: gt)
             psnrs.append(p)
             sharps.append(computeSharpnessRatio(device: device, queue: queue, out: interp, gt: gt))
+            if let roi = benchROI { roiPSNRs.append(computePSNRFull(device: device, queue: queue, texA: interp, texB: gt, region: roi)) }
             if let dd = dumpDir, i == frames.count / 2 || (Knob.isSet("MACFG_DUMPALL") && i >= dumpFrom) {
                 dumpPNG(interp, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_interp.png")
                 dumpPNG(gt, device: device, queue: queue, path: "\(dd)/\(key)_t\(i)_gt.png")
@@ -905,7 +928,8 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
         // sharp 1.0 = 정답만큼 선명, <1 = 더 흐림, >1 = 과선명. PSNR↑ + sharp↓ 면 흐려서 이긴 것이다.
         let shAvg = sharps.isEmpty ? 0 : sharps.reduce(0, +) / Double(sharps.count)
         if uiLayer != nil, layerGpuN > 0 { print(String(format: "  [UILAYER] 추출 GPU %.3f ms/프레임 (n=%d), 합성 %.3f ms/출력 (n=%d)", layerGpuMs / Double(layerGpuN), layerGpuN, compGpuN > 0 ? compGpuMs / Double(compGpuN) : 0, compGpuN)) }
-        print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  sharp=\(String(format: "%.3f", shAvg))  (n=\(psnrs.count))")
+        let roiStr = roiPSNRs.isEmpty ? "" : String(format: "  roi=%.2fdB", roiPSNRs.reduce(0, +) / Double(roiPSNRs.count))
+        print("  \(key.padding(toLength: 10, withPad: " ", startingAt: 0)) 삼중항 PSNR avg=\(String(format: "%.2f", avg))dB  med=\(String(format: "%.2f", med))dB  min=\(String(format: "%.2f", mn))dB  sharp=\(String(format: "%.3f", shAvg))  (n=\(psnrs.count))\(roiStr)")
     }
     print("\n⏱  실프레임 = 합성보다 압축노이즈·반투명·대모션 모두 포함. 높을수록 정확.")
 }

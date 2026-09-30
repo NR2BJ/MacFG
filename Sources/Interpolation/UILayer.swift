@@ -39,6 +39,14 @@ public final class UILayer {
     /// "정지만"의 중간.
     public nonisolated(unsafe) static var strongLo: Float = Float(Knob.string("MACFG_UILSTRONGLO") ?? "") ?? 0.08
     public nonisolated(unsafe) static var strongHi: Float = Float(Knob.string("MACFG_UILSTRONGHI") ?? "") ?? 0.20
+    /// **서브픽셀 정지 기준** (2×2 중 가장 덜 변한 서브픽셀의 루마 변화, 기본 0.06~0.12). 재인코딩 영상은 빠른 팬에서
+    /// 정지 UI도 프레임마다 0.03~0.13씩 흔들리고(압축, 오프라인 168쌍 실측), 가는 UI(게이지 눈금·얇은 글자)는 2×2 평균이
+    /// 배경과 섞여 평균 판정을 못 받는다. 서브픽셀 하나라도 거의 정지면 붙잡는다.
+    public nonisolated(unsafe) static var subLo: Float = Float(Knob.string("MACFG_UILSUBLO") ?? "") ?? 0.06
+    public nonisolated(unsafe) static var subHi: Float = Float(Knob.string("MACFG_UILSUBHI") ?? "") ?? 0.12
+    /// 약한 마스크 항에도 서브픽셀 정지를 쓴다 (기본 ON, MACFG_UILSUBWEAK=0으로 끔). 가는 UI는 마스크가 강함 문턱(0.5)에
+    /// 못 미친다. 실측: 삼중항 PSNR 세 엔진 +0.03~0.33dB, 무기 영역 조각 18246→15605, 띠 42.5→41.8%.
+    public nonisolated(unsafe) static var subWeak: Bool = Knob.string("MACFG_UILSUBWEAK") != "0"
     /// 프로파일용: 추출을 k단계에서 멈춘다 (1=복사 2=+α 3=+타일 4=+push 5=+pull 6=+채움). 0=전부.
     public nonisolated(unsafe) static var profileStop: Int = 0
     /// push-pull 단수 상한 (0단 = 소스/2). 1×1까지 내려가야 화면 폭만 한 구멍도 반드시 닫힌다 —
@@ -52,7 +60,7 @@ public final class UILayer {
     public final class Frame {
         public let clean: any MTLTexture
         let hole: any MTLTexture       // 소스/2, r8 — 구멍 강도(합성 가중치)
-        let luma: any MTLTexture       // 소스/2, r16f — 다음 프레임의 정지 판정용
+        let luma: any MTLTexture       // 소스 전해상도 r8 — 다음 프레임의 정지 판정용 (서브픽셀 단위)
         let tiles: any MTLBuffer       // uint 타일 인덱스
         let flags: any MTLBuffer       // uint 타일별 구멍 플래그 (α 패스가 세우고 압축 패스가 목록화)
         let args: any MTLBuffer        // 간접 디스패치 인자 (x = 타일 수, 1, 1)
@@ -156,7 +164,7 @@ public final class UILayer {
     private func makeSlot() -> Frame? {
         let hw = (slotW + 1) / 2, hh = (slotH + 1) / 2
         let tx = (slotW + Self.tile - 1) / Self.tile, ty = (slotH + Self.tile - 1) / Self.tile
-        guard let clean = tex(slotW, slotH, slotFmt), let hole = tex(hw, hh, .r8Unorm), let luma = tex(hw, hh, .r16Float),
+        guard let clean = tex(slotW, slotH, slotFmt), let hole = tex(hw, hh, .r8Unorm), let luma = tex(slotW, slotH, .r8Unorm),
               let tiles = device.makeBuffer(length: max(4, tx * ty * 4), options: .storageModePrivate),
               let flags = device.makeBuffer(length: max(4, tx * ty * 4), options: .storageModePrivate),
               let args = device.makeBuffer(length: 12, options: .storageModeShared) else { return nil }
@@ -202,6 +210,8 @@ public final class UILayer {
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
         var p2 = SIMD4<Float>(Self.holeLo, Self.holeHi, Self.strongLo, Self.strongHi)
         enc.setBytes(&p2, length: MemoryLayout<SIMD4<Float>>.size, index: 1)
+        var p3 = SIMD4<Float>(Self.subLo, Self.subHi, Self.subWeak ? 1 : 0, 0)
+        enc.setBytes(&p3, length: MemoryLayout<SIMD4<Float>>.size, index: 5)
         var tx = f.tilesX
         var tyN = UInt32((hh + 15) / 16)
         enc.setBytes(&tx, length: 4, index: 2); enc.setBytes(&tyN, length: 4, index: 3)
@@ -325,8 +335,8 @@ public final class UILayer {
     // 무조건 구멍"은 움직인 무기·HUD의 옛 테두리와 글자 밖 4~8px 배경을 A·B 블렌드로 덮어 유령 윤곽을 만들었다
     // (덤프 201423). 닫힘은 넓고 평평한 글자 획 속(마스크 0)을 메운다(덤프 201510 "ㅋㅋㅋ"의 획 속 윤곽선).
     // 산출: luma(r16f)·hole(r8), 피라미드 0단(¼, 2×2 가중 평균), ssQ(¼, 강한×정지 2×2 최대), 타일 플래그(가장자리면 이웃도).
-    kernel void uilAlphaPush(texture2d<half, access::sample> cur [[texture(0)]],
-                             texture2d<half, access::sample> prevLuma [[texture(1)]],
+    kernel void uilAlphaPush(texture2d<half, access::read> cur [[texture(0)]],
+                             texture2d<half, access::read> prevLuma [[texture(1)]],
                              texture2d<float, access::sample> mask [[texture(2)]],
                              texture2d<half, access::sample> nearQ [[texture(3)]],
                              texture2d<half, access::write> lumaOut [[texture(4)]],
@@ -338,6 +348,7 @@ public final class UILayer {
                              constant uint& tilesX [[buffer(2)]],
                              constant uint& tilesY [[buffer(3)]],
                              device uint* flags [[buffer(4)]],
+                             constant float4& sp [[buffer(5)]],       // subLo, subHi, subWeak (서브픽셀 정지)
                              uint2 gid [[thread_position_in_grid]],
                              uint2 tg [[threadgroup_position_in_grid]],
                              uint2 lid [[thread_position_in_threadgroup]]) {
@@ -349,20 +360,38 @@ public final class UILayer {
         if (gid.x < w && gid.y < h) {
             constexpr sampler s(filter::linear, address::clamp_to_edge);
             float2 uv = (float2(gid) + 0.5) / float2(w, h);
-            half3 c = cur.sample(s, uv).rgb;
-            half l = dot(c, kLum);
-            lumaOut.write(half4(l), gid);
+            // 서브픽셀 2×2를 직접 읽는다 — 루마는 전해상도로 저장해 다음 프레임이 서브픽셀 단위로 정지를 판정한다.
+            uint W = cur.get_width(), H = cur.get_height();
+            half3 c = half3(0.0h);
+            float lsum = 0.0, psum = 0.0, dmin = 1.0;
+            for (uint j = 0; j < 4; j++) {
+                uint2 q = uint2(min(gid.x * 2 + (j & 1), W - 1), min(gid.y * 2 + (j >> 1), H - 1));
+                half3 cq = cur.read(q).rgb;
+                c += cq;
+                half lq = dot(cq, kLum);
+                lumaOut.write(half4(lq), q);
+                lsum += float(lq);
+                if (p.z > 0.5) {
+                    float pq = float(prevLuma.read(q).r);
+                    psum += pq;
+                    dmin = min(dmin, fabs(float(lq) - pq));
+                }
+            }
+            c *= 0.25h;
             float m = clamp(mask.sample(s, uv).r, 0.0, 1.0);
-            float still = 1.0, still2 = 1.0;
+            float still = 1.0, still2 = 1.0, stillW = 1.0;
             if (p.z > 0.5) {
-                float d = fabs(float(l - prevLuma.sample(s, uv).r));
+                float d = fabs(lsum - psum) * 0.25;   // 2×2 평균의 변화 (예전 ½해상도 판정과 같은 값)
                 still = 1.0 - smoothstep(p.x, p.y, d);
-                still2 = 1.0 - smoothstep(hp.z, hp.w, d);
+                // 강한 마스크: 평균이 조금만 변했거나(느슨) **서브픽셀 하나라도 진짜 정지**면 붙잡는다 —
+                // 게이지 눈금처럼 가는 UI는 2×2 평균이 배경과 섞여 빠른 팬에서 정지 판정을 못 받았다(오프라인 168쌍).
+                still2 = max(1.0 - smoothstep(hp.z, hp.w, d), 1.0 - smoothstep(sp.x, sp.y, dmin));
+                stillW = (sp.z > 0.5) ? max(still, 1.0 - smoothstep(sp.x, sp.y, dmin)) : still;
             }
             float weak = smoothstep(hp.x, hp.y, m);
             float strong = smoothstep(0.5, 0.9, m);
             float nr = (p.w > 0.5) ? float(nearQ.sample(s, uv).r) : 0.0;
-            half hv = half(max(still * max(weak, nr), strong * still2));
+            half hv = half(max(max(stillW * weak, still * nr), strong * still2));
             hole.write(half4(hv), gid);
             ssv = half(strong * still);
             half wgt = 1.0h - hv;

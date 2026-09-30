@@ -158,7 +158,14 @@ def main():
     ap.add_argument("--bs", type=int, default=4)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--base-lr-mul", type=float, default=0.1)
-    ap.add_argument("--train", choices=["new", "all"], default="new")
+    ap.add_argument("--train", choices=["new", "all", "maskhead"], default="new",
+                    help="maskhead = (--arch v3) 마지막 블록 lastconv의 마스크 출력 채널만 학습. 최종 마스크는 block4의 그 채널에서만 "
+                         "나오고 뒤에서 아무도 안 쓰므로 flow는 비트 단위로 그대로다 — 파인튜닝 flow + v3식 마스크를 모델 하나로")
+    ap.add_argument("--no-image-loss", action="store_true", help="이미지 손실 끔(마스크 증류만) — maskhead와 함께")
+    ap.add_argument("--teacher-flow", default=None,
+                    help="교사 둘 증류: flow는 이 체크포인트(--arch v3 파인튜닝)를, 마스크는 원본 v3를 따른다(--mask-distill λ). "
+                         "마스크 헤드만으론 v3 마스크를 못 따라간다(증류 손실 0.21→0.18) — 학생 전체를 학습")
+    ap.add_argument("--flow-distill", type=float, default=0.1, help="교사 flow L1(모델 px) 가중치")
     ap.add_argument("--p-blocks", type=int, default=3)
     ap.add_argument("--p-feat", action="store_true")
     ap.add_argument("--mp-bias", type=float, default=-6.0)
@@ -187,10 +194,20 @@ def main():
     sd = torch.load('../v425/train_log/flownet.pkl', map_location='cpu', weights_only=True)
     v3.load_state_dict({k.replace('module.', ''): v for k, v in sd.items()}, strict=False)
     v3 = v3.eval().permute_input_channels()
+    import copy
+    v3_orig = copy.deepcopy(v3)      # 마스크 증류 기준 — V3AsMF(v3)가 v3를 공유하므로 --init 적재 **전에** 떠 둔다
     if a.arch == "v3":
         net, masks = V3AsMF(v3), {}
-        a.train = "all"                                   # v3 단독은 전체(기존) 파라미터만 있다
-        a.base_lr_mul = 1.0
+        if a.train == "maskhead":
+            # v3 lastconv: ConvTranspose2d(c, 4*13) + PixelShuffle(2) — 레벨 채널 4(mask) ← convT 채널 16..19
+            w = net.net.block4.lastconv[0].weight; b = net.net.block4.lastconv[0].bias
+            mw = torch.zeros_like(w); mw[:, 16:20] = 1
+            mb = torch.zeros_like(b); mb[16:20] = 1
+            masks = {"net.block4.lastconv.0.weight": mw, "net.block4.lastconv.0.bias": mb}
+            a.train = "new"                               # 이하 경로: 마스크된 텐서만 학습, 나머지 동결
+        else:
+            a.train = "all"                               # v3 단독은 전체(기존) 파라미터만 있다
+            a.base_lr_mul = 1.0
     else:
         net, masks = from_v3(v3, warp_manual, mp_bias=a.mp_bias, p_blocks=a.p_blocks, p_feat=a.p_feat)
     if a.init:
@@ -217,10 +234,16 @@ def main():
 
     ref_net = None
     if a.mask_distill > 0:
-        import copy
-        ref_net = V3AsMF(copy.deepcopy(v3)).to(DEV).eval()   # 출발 v3 — 마스크 기준 (고정)
+        ref_net = V3AsMF(v3_orig).to(DEV).eval()            # 원본 v3 — 마스크 기준 (고정)
         for p_ in ref_net.parameters(): p_.requires_grad_(False)
         print(f"마스크 증류 λ={a.mask_distill}", flush=True)
+    teacher = None
+    if a.teacher_flow:
+        teacher = V3AsMF(copy.deepcopy(v3_orig))
+        teacher.load_state_dict(torch.load(a.teacher_flow, map_location='cpu'))
+        teacher = teacher.to(DEV).eval()
+        for p_ in teacher.parameters(): p_.requires_grad_(False)
+        print(f"flow 교사: {a.teacher_flow} (가중치 {a.flow_distill})", flush=True)
     ds = Windows(a.data, tr_ids)
     ev_items = load_eval(a.data, ev_ids, a.eval_n)
     ref = run_eval(net, ev_items)
@@ -237,11 +260,15 @@ def main():
         if a.p_source == "A": P = A
         flow, mask = net(torch.cat((P, A, B), 1), T, SCALES)
         out, _ = synth(A, B, P, flow, mask)
-        loss = (out - G).abs().mean() + lap_loss(out, G)
+        loss = torch.zeros((), device=DEV) if a.no_image_loss else (out - G).abs().mean() + lap_loss(out, G)
         if ref_net is not None:
             with torch.no_grad():
                 _, mref = ref_net(torch.cat((P, A, B), 1), T, SCALES)
             loss = loss + a.mask_distill * (torch.sigmoid(mask[:, 0:1]) - torch.sigmoid(mref[:, 0:1])).abs().mean()
+        if teacher is not None:
+            with torch.no_grad():
+                ft_flow, _ = teacher(torch.cat((P, A, B), 1), T, SCALES)
+            loss = loss + a.flow_distill * (flow[:, 0:4] - ft_flow[:, 0:4]).abs().mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

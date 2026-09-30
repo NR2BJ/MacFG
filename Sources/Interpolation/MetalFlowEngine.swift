@@ -82,9 +82,12 @@ public final class MetalFlowEngine: PairInterpolationEngine {
         if let s = Knob.string("MACFG_MFCYCLO"), let v = Float(s), v >= 0 { return v }
         return 2.5
     }()
+    /// **상한 8 → 32 (2026-09-30).** 8이면 빠른 팬에서 순환 오차가 쉽게 넘쳐 화면이 블렌드 폴백으로 빠졌다(자막 주변 번짐의
+    /// 엔진 몫). 코퍼스 63시퀀스(flowBase 800·사용자 설정): 중앙값 이득 +2.630→+2.710dB, 빠른 모션 +3.700→+3.840dB,
+    /// 최악값 중앙·선명도 불변. 64부터는 최악 프레임이 무너진다(빠른 모션 최악값 중앙 21.64→21.22, 128이면 20.44).
     public nonisolated(unsafe) static var confHi: Float = {
         if let s = Knob.string("MACFG_MFCYCHI"), let v = Float(s), v > 0 { return v }
-        return 8.0
+        return 32.0
     }()
 
     /// 순환 오차 문턱의 **모션 비례분** (0 = 절대 px 문턱만). 문턱 = lo + rel·|flow|.

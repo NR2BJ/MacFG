@@ -1686,6 +1686,15 @@ public final class AppState {
     /// 이 틱까지는 miss 무시 — 캡처 시작/리셋 직후 케이던스 락 과도기의 miss로
     /// 깨끗한 소스까지 +4 램프되는 것 방지 (무지터 소스 e2e 57→91ms 낭비 실측)
     @ObservationIgnored nonisolated(unsafe) private var paceWarmupUntilTick = 0
+    /// **적응 지연 시드** (2026-09-30). 제어기는 매 캡처를 extra=0에서 시작해 miss를 맞으며 2초에 1칸씩 오른다 —
+    /// 4K에선 매번 3~4칸에 자리 잡으므로 시작 후 8~12초가 거칠었다(실측 miss 220→125→19/2s). 해상도·엔진별로
+    /// 마지막으로 자리 잡은 칸 수를 기억해 새 캡처를 거기서 시작한다. 과하면 기존 규칙(6초 무결 −1)이 내린다.
+    /// UserDefaults "pace.seed.<키>"로 앱 재시작 후에도 유지. `MACFG_PACESEED=0`이면 끔.
+    @ObservationIgnored nonisolated(unsafe) private var paceSeedKey: String? = nil
+    nonisolated private static let paceSeedEnabled = Knob.string("MACFG_PACESEED") != "0"
+    nonisolated private func paceSeedKeyFor(width: Int, height: Int) -> String {
+        "pace.seed.\(width)x\(height).\(pairEngine?.name ?? "none")"
+    }
     @ObservationIgnored nonisolated(unsafe) private var diagStaleSampleCount = 0
 
     /// ~2초마다: miss ≥4면 지연 +1슬롯 (최대 4), 3윈도(~6s) 연속 0이면 -1슬롯 회수.
@@ -1736,6 +1745,11 @@ public final class AppState {
             }
         } else {
             paceCleanWindows = 0
+        }
+        // 자리 잡은 값을 시드로 기록 — 값이 바뀔 때만 쓴다 (UserDefaults는 스레드 안전)
+        if Self.paceSeedEnabled, let key = paceSeedKey,
+           UserDefaults.standard.double(forKey: key) != extraLatencySlots {
+            UserDefaults.standard.set(extraLatencySlots, forKey: key)
         }
     }
 
@@ -3477,6 +3491,16 @@ public final class AppState {
             for _ in 0..<8 {
                 if let tex = device.makeTexture(descriptor: desc) {
                     stablePool.append(tex)
+                }
+            }
+            // 적응 지연 시드 — 이 해상도·엔진에서 지난번에 자리 잡은 칸 수로 시작 (과하면 제어기가 내린다)
+            if Self.paceSeedEnabled {
+                let key = paceSeedKeyFor(width: width, height: height)
+                paceSeedKey = key
+                let seed = UserDefaults.standard.double(forKey: key)
+                if seed > 0, mirrorInterpolationEnabled, !adaptDisabled {
+                    extraLatencySlots = min(seed, Knob.string("MACFG_MAXLAT").flatMap { Double($0) } ?? 4.0)
+                    DiagnosticLog.shared.log("[PACE] 시드 extra=\(Int(extraLatencySlots)) (\(key))")
                 }
             }
             // 크기가 바뀌면 이전 참조는 모두 무효

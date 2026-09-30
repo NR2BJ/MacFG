@@ -29,8 +29,16 @@ public final class UILayer {
     /// 낮추는 이유는 막 뜬 자막(마스크 형성 중, 0.1~0.3)의 글자 조각이 clean에 남아 엔진에 워프되는 것을 막기 위해서다.
     public nonisolated(unsafe) static var holeLo: Float = Float(Knob.string("MACFG_UILHOLELO") ?? "") ?? 0.12
     public nonisolated(unsafe) static var holeHi: Float = Float(Knob.string("MACFG_UILHOLEHI") ?? "") ?? 0.22
-    /// 강한 마스크 근처(±nearR 마스크 텍셀)의 **정지** 픽셀도 구멍 — 글자 외곽선·획 사이 틈. 움직이는 배경은 제외.
-    public nonisolated(unsafe) static var nearR: Float = Float(Knob.string("MACFG_UILNEAR") ?? "") ?? 0
+    /// **닫힘 반경** (¼해상도 텍셀, 기본 8 = 소스 32px). 강한 마스크 근처의 **정지** 픽셀을 구멍에 넣는다 —
+    /// 넓고 평평한 글자 획 안쪽은 고주파가 없어 마스크가 0이라, 테두리만 구멍이 되고 속이 남아 I 프레임에 윤곽선이
+    /// 생겼다(2026-09-30 덤프 201510 "ㅋㅋㅋ"). 정지 픽셀만 넣으므로 움직이는 배경은 안 얼린다.
+    public nonisolated(unsafe) static var closeR: Int = Int(Knob.string("MACFG_UILCLOSE") ?? "") ?? 8
+    /// **강한 마스크의 느슨한 정지 기준** (루마 변화, 기본 0.08~0.20). 강한 마스크 픽셀은 조금 변해도(HUD 숫자,
+    /// 글자 안티앨리어스 가장자리) 블렌드로 붙잡는 편이 정답에 가깝고(삼중항 +0.35dB), 크게 변한 픽셀(무기가 떠난
+    /// 자리·글자 밖 움직이는 배경·스크롤)은 풀어줘야 유령 윤곽이 안 생긴다(덤프 201423). 예전의 "무조건 붙잡기"와
+    /// "정지만"의 중간.
+    public nonisolated(unsafe) static var strongLo: Float = Float(Knob.string("MACFG_UILSTRONGLO") ?? "") ?? 0.08
+    public nonisolated(unsafe) static var strongHi: Float = Float(Knob.string("MACFG_UILSTRONGHI") ?? "") ?? 0.20
     /// 프로파일용: 추출을 k단계에서 멈춘다 (1=복사 2=+α 3=+타일 4=+push 5=+pull 6=+채움). 0=전부.
     public nonisolated(unsafe) static var profileStop: Int = 0
     /// push-pull 단수 상한 (0단 = 소스/2). 1×1까지 내려가야 화면 폭만 한 구멍도 반드시 닫힌다 —
@@ -61,6 +69,7 @@ public final class UILayer {
 
     public private(set) var available = false
     private let device: any MTLDevice
+    private var dilatePSO: (any MTLComputePipelineState)?
     private var alphaPushPSO: (any MTLComputePipelineState)?
     private var tilesPSO: (any MTLComputePipelineState)?
     private var pushPSO: (any MTLComputePipelineState)?
@@ -69,6 +78,11 @@ public final class UILayer {
     private var compositePSO: (any MTLComputePipelineState)?
     private var initArgs: (any MTLBuffer)?
     private var pyr: [any MTLTexture] = []      // 공유 스크래치 (추출 한 번 안에서만 유효)
+    private var ssQ: (any MTLTexture)?          // ¼해상도: 강한마스크×정지 (2×2 최대)
+    private var nearQ: (any MTLTexture)?        // ¼해상도: ssQ의 최대 팽창 (닫힘)
+    private var tmpQ: (any MTLTexture)?
+    /// nearQ가 직전 프레임의 팽창 결과를 담고 있는가 (리셋·크기 변경 뒤 첫 프레임은 없음).
+    private var nearValid = false
     private var slots: [Frame] = []
     private var slotW = 0, slotH = 0, slotFmt: MTLPixelFormat = .invalid
     private var extractCount = 0, skipCount = 0, compositeCount = 0
@@ -82,6 +96,7 @@ public final class UILayer {
             guard let f = lib.makeFunction(name: n) else { throw NSError(domain: "UILayer", code: 1, userInfo: [NSLocalizedDescriptionKey: n]) }
             return try device.makeComputePipelineState(function: f)
         }
+        dilatePSO = try pso("uilDilate")
         alphaPushPSO = try pso("uilAlphaPush"); tilesPSO = try pso("uilTiles"); pushPSO = try pso("uilPush")
         pullPSO = try pso("uilPull"); fillPSO = try pso("uilFill"); compositePSO = try pso("uilComposite")
         var ia: [UInt32] = [0, 1, 1]
@@ -130,7 +145,11 @@ public final class UILayer {
             if lw == 1 && lh == 1 { break }
             lw = max(1, (lw + 1) / 2); lh = max(1, (lh + 1) / 2)
         }
-        DiagnosticLog.shared.log("[UILAYER] 자원 \(w)x\(h) 피라미드 \(pyr.count)단 (최하 \(pyr.last?.width ?? 0)x\(pyr.last?.height ?? 0))")
+        let qw = max(1, (w + 3) / 4), qh = max(1, (h + 3) / 4)
+        ssQ = tex(qw, qh, .r8Unorm); nearQ = tex(qw, qh, .r8Unorm); tmpQ = tex(qw, qh, .r8Unorm)
+        nearValid = false
+        guard ssQ != nil, nearQ != nil, tmpQ != nil else { pyr = []; return false }
+        DiagnosticLog.shared.log("[UILAYER] 자원 \(w)x\(h) 피라미드 \(pyr.count)단 (최하 \(pyr.last?.width ?? 0)x\(pyr.last?.height ?? 0)) 닫힘 R=\(Self.closeR)")
         return true
     }
 
@@ -149,8 +168,9 @@ public final class UILayer {
     /// 슬롯이 없으면(백로그가 깊음) nil — 호출측은 이 프레임을 층 없이 처리한다.
     public func extract(source: any MTLTexture, prev: Frame?, mask: any MTLTexture, owner: ObjectIdentifier,
                         busy: Set<ObjectIdentifier>, into cb: any MTLCommandBuffer) -> Frame? {
-        guard available, let alphaPushPSO, let tilesPSO, let pushPSO, let pullPSO, let fillPSO, let initArgs,
-              ensure(w: source.width, h: source.height, fmt: source.pixelFormat) else { return nil }
+        guard available, let dilatePSO, let alphaPushPSO, let tilesPSO, let pushPSO, let pullPSO, let fillPSO, let initArgs,
+              ensure(w: source.width, h: source.height, fmt: source.pixelFormat),
+              let ssQ, let nearQ, let tmpQ else { return nil }
         var slot = slots.first { s in s !== prev && (s.owner == nil || !busy.contains(s.owner!)) }
         if slot == nil, slots.count < Self.maxSlots, let s = makeSlot() { slots.append(s); slot = s }
         guard let f = slot else { skipCount += 1; return nil }
@@ -169,20 +189,37 @@ public final class UILayer {
 
         guard let enc = cb.makeComputeCommandEncoder() else { return nil }
         let hw = f.hole.width, hh = f.hole.height
-        // 1) α·hole·루마·피라미드 0단
+        // 1) 구멍 (½해상도 단일 패스): hole = max(still × max(weak, near_직전), strong × still2)
+        //    + 루마(다음 프레임 정지 판정) + 피라미드 0단(¼) + ssQ(¼, 다음 프레임 닫힘의 씨앗) + 타일 플래그.
+        //    닫힘(near)은 **직전 프레임의 팽창 결과**를 쓴다 — 정적 글자 속을 채우는 용도라 한 프레임 늦어도 같고,
+        //    그 덕에 패스가 하나로 끝난다(분리하면 4K +0.5ms, 2026-09-30 실측).
         enc.setComputePipelineState(alphaPushPSO)
         // prev 없으면 더미로 mask를 묶는다 (같은 디스패치에서 쓰는 텍스처를 읽기로 겹쳐 묶지 않는다)
         enc.setTexture(source, index: 0); enc.setTexture(usePrev ? prev!.luma : mask, index: 1)
-        enc.setTexture(mask, index: 2); enc.setTexture(f.hole, index: 3); enc.setTexture(f.luma, index: 4); enc.setTexture(pyr[0], index: 5)
-        var p = SIMD4<Float>(Self.stillLo, Self.stillHi, usePrev ? 1 : 0, Self.nearR)
+        enc.setTexture(mask, index: 2); enc.setTexture(nearQ, index: 3)
+        enc.setTexture(f.luma, index: 4); enc.setTexture(f.hole, index: 5); enc.setTexture(pyr[0], index: 6); enc.setTexture(ssQ, index: 7)
+        var p = SIMD4<Float>(Self.stillLo, Self.stillHi, usePrev ? 1 : 0, nearValid && Self.closeR > 0 ? 1 : 0)
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
-        var p2 = SIMD2<Float>(Self.holeLo, Self.holeHi)
-        enc.setBytes(&p2, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
+        var p2 = SIMD4<Float>(Self.holeLo, Self.holeHi, Self.strongLo, Self.strongHi)
+        enc.setBytes(&p2, length: MemoryLayout<SIMD4<Float>>.size, index: 1)
         var tx = f.tilesX
         var tyN = UInt32((hh + 15) / 16)
         enc.setBytes(&tx, length: 4, index: 2); enc.setBytes(&tyN, length: 4, index: 3)
         enc.setBuffer(f.flags, offset: 0, index: 4)
         grid(enc, hw, hh)   // 스레드그룹 16×16 반해상도 = 소스 32×32 타일 하나 (타일 플래그의 전제)
+        // 2) 다음 프레임용 닫힘: ssQ를 ¼해상도에서 분리형 최대 팽창 (가로→tmp, 세로→near)
+        if Self.closeR > 0 {
+            enc.setComputePipelineState(dilatePSO)
+            var r = Int32(Self.closeR)
+            for (src, dst, ax) in [(ssQ, tmpQ, SIMD2<Int32>(1, 0)), (tmpQ, nearQ, SIMD2<Int32>(0, 1))] {
+                enc.setTexture(src, index: 0); enc.setTexture(dst, index: 1)
+                var a2 = ax
+                enc.setBytes(&a2, length: MemoryLayout<SIMD2<Int32>>.size, index: 0)
+                enc.setBytes(&r, length: 4, index: 1)
+                grid(enc, ssQ.width, ssQ.height)
+            }
+            nearValid = true
+        }
         if stop == 2 { enc.endEncoding(); return f }
         // 2) 타일 목록 압축 — 타일당 스레드 하나
         enc.setComputePipelineState(tilesPSO)
@@ -246,7 +283,7 @@ public final class UILayer {
 
     /// 불연속(캡처 재시작·크기 변경) — 슬롯을 통째로 버린다. 소유 표시만 지우면 아직 GPU에서 읽히는
     /// 슬롯을 다음 추출이 덮을 수 있다(특히 RIFE의 분리 큐). 버린 텍스처는 커맨드 버퍼가 붙잡고 있다가 놓는다.
-    public func reset() { slots = [] }
+    public func reset() { slots = []; nearValid = false }
 
     private func grid(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int) {
         enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1),
@@ -264,17 +301,40 @@ public final class UILayer {
         t.write(half4(v.r * 0.5h, v.g, v.b, 1.0h), gid);
     }
 
-    // 반해상도 격자, 스레드그룹 16×16 = 소스 32×32 타일. 소스는 반해상도 픽셀 중심에서 bilinear = 소스 2×2 평균.
-    // 산출: hole(r8)·luma(r16f) 반해상도, 피라미드 0단(소스/4)은 그룹 안 2×2 축약, 타일 플래그(가장자리면 이웃 타일도 —
-    // 채움·합성이 hole을 bilinear로 읽어 이웃 타일 구멍이 가장자리 픽셀에 번지기 때문).
+    // 분리형 최대 팽창 (¼해상도). ax = (1,0) 가로 / (0,1) 세로, r = 반경.
+    kernel void uilDilate(texture2d<half, access::read> src [[texture(0)]],
+                          texture2d<half, access::write> dst [[texture(1)]],
+                          constant int2& ax [[buffer(0)]],
+                          constant int& r [[buffer(1)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+        int W = int(dst.get_width()), H = int(dst.get_height());
+        if (int(gid.x) >= W || int(gid.y) >= H) return;
+        half mx = 0.0h;
+        for (int k = -r; k <= r; k++) {
+            int2 q = clamp(int2(gid) + ax * k, int2(0), int2(W - 1, H - 1));
+            mx = max(mx, src.read(uint2(q)).r);
+        }
+        dst.write(half4(mx), gid);
+    }
+
+    // 구멍 (½해상도 단일 패스, 그룹 16×16 = 소스 32×32 타일). 소스는 ½ 픽셀 중심 bilinear = 소스 2×2 평균.
+    //   still  = 1 − smoothstep(stillLo, stillHi, |루마 − 직전 루마|)       (0.02~0.06)
+    //   still2 = 1 − smoothstep(strongLo, strongHi, 같은 값)                 (0.08~0.20, 강한 마스크용 느슨한 기준)
+    //   hole   = max(still × max(weak, near_직전), strong × still2)
+    // 약한 마스크·닫힘은 **실제 정지 픽셀만**, 강한 마스크는 **조금 변한 것까지만** 구멍이다. 예전의 "강한 마스크는
+    // 무조건 구멍"은 움직인 무기·HUD의 옛 테두리와 글자 밖 4~8px 배경을 A·B 블렌드로 덮어 유령 윤곽을 만들었다
+    // (덤프 201423). 닫힘은 넓고 평평한 글자 획 속(마스크 0)을 메운다(덤프 201510 "ㅋㅋㅋ"의 획 속 윤곽선).
+    // 산출: luma(r16f)·hole(r8), 피라미드 0단(¼, 2×2 가중 평균), ssQ(¼, 강한×정지 2×2 최대), 타일 플래그(가장자리면 이웃도).
     kernel void uilAlphaPush(texture2d<half, access::sample> cur [[texture(0)]],
                              texture2d<half, access::sample> prevLuma [[texture(1)]],
                              texture2d<float, access::sample> mask [[texture(2)]],
-                             texture2d<half, access::write> hole [[texture(3)]],
+                             texture2d<half, access::sample> nearQ [[texture(3)]],
                              texture2d<half, access::write> lumaOut [[texture(4)]],
-                             texture2d<half, access::write> pyr0 [[texture(5)]],
-                             constant float4& p [[buffer(0)]],        // stillLo, stillHi, hasPrev, nearR(마스크 텍셀)
-                             constant float2& hp [[buffer(1)]],       // holeLo, holeHi
+                             texture2d<half, access::write> hole [[texture(5)]],
+                             texture2d<half, access::write> pyr0 [[texture(6)]],
+                             texture2d<half, access::write> ssQ [[texture(7)]],
+                             constant float4& p [[buffer(0)]],        // stillLo, stillHi, hasPrev, hasNear
+                             constant float4& hp [[buffer(1)]],       // holeLo, holeHi, strongLo, strongHi
                              constant uint& tilesX [[buffer(2)]],
                              constant uint& tilesY [[buffer(3)]],
                              device uint* flags [[buffer(4)]],
@@ -282,29 +342,29 @@ public final class UILayer {
                              uint2 tg [[threadgroup_position_in_grid]],
                              uint2 lid [[thread_position_in_threadgroup]]) {
         threadgroup half4 red[16][16];
+        threadgroup half redS[16][16];
         uint w = hole.get_width(), h = hole.get_height();
-        bool inside = gid.x < w && gid.y < h;
         half4 contrib = half4(0.0h);
-        if (inside) {
+        half ssv = 0.0h;
+        if (gid.x < w && gid.y < h) {
             constexpr sampler s(filter::linear, address::clamp_to_edge);
             float2 uv = (float2(gid) + 0.5) / float2(w, h);
             half3 c = cur.sample(s, uv).rgb;
             half l = dot(c, kLum);
             lumaOut.write(half4(l), gid);
             float m = clamp(mask.sample(s, uv).r, 0.0, 1.0);
-            float still = 1.0;
-            if (p.z > 0.5) still = 1.0 - smoothstep(p.x, p.y, fabs(float(l - prevLuma.sample(s, uv).r)));
-            // 강한 마스크(글자 획·패널 텍스트)는 정지 여부 무관 — 스크롤 중 채팅은 A≠B인데 마스크가 높다.
-            float a = m * mix(still, 1.0, smoothstep(0.5, 0.9, m));
-            float ms = m;
-            if (p.w > 0.0) {
-                float2 em = p.w / float2(mask.get_width(), mask.get_height());
-                for (int dy = -1; dy <= 1; dy++)
-                    for (int dx = -1; dx <= 1; dx++)
-                        ms = max(ms, mask.sample(s, uv + float2(dx, dy) * em).r);
+            float still = 1.0, still2 = 1.0;
+            if (p.z > 0.5) {
+                float d = fabs(float(l - prevLuma.sample(s, uv).r));
+                still = 1.0 - smoothstep(p.x, p.y, d);
+                still2 = 1.0 - smoothstep(hp.z, hp.w, d);
             }
-            half hv = half(max(smoothstep(hp.x, hp.y, a), p.w > 0.0 ? smoothstep(0.5, 0.9, ms) * still : 0.0));
+            float weak = smoothstep(hp.x, hp.y, m);
+            float strong = smoothstep(0.5, 0.9, m);
+            float nr = (p.w > 0.5) ? float(nearQ.sample(s, uv).r) : 0.0;
+            half hv = half(max(still * max(weak, nr), strong * still2));
             hole.write(half4(hv), gid);
+            ssv = half(strong * still);
             half wgt = 1.0h - hv;
             contrib = half4(c * wgt, wgt);
             if (hv > 0.004h) {
@@ -319,15 +379,18 @@ public final class UILayer {
             }
         }
         red[lid.y][lid.x] = contrib;
+        redS[lid.y][lid.x] = ssv;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
-            half4 acc = red[lid.y][lid.x] + red[lid.y][lid.x + 1] + red[lid.y + 1][lid.x] + red[lid.y + 1][lid.x + 1];
             uint2 q = gid / 2;
+            half4 acc = red[lid.y][lid.x] + red[lid.y][lid.x + 1] + red[lid.y + 1][lid.x] + red[lid.y + 1][lid.x + 1];
             if (q.x < pyr0.get_width() && q.y < pyr0.get_height()) {
                 half wn = (acc.a < 0.05h) ? 0.0h : min(acc.a / 4.0h, 1.0h);
                 half3 cc = (acc.a > 0.0h) ? (acc.rgb / acc.a) : half3(0.0h);
                 pyr0.write(half4(cc, wn), q);
             }
+            half mx = max(max(redS[lid.y][lid.x], redS[lid.y][lid.x + 1]), max(redS[lid.y + 1][lid.x], redS[lid.y + 1][lid.x + 1]));
+            if (q.x < ssQ.get_width() && q.y < ssQ.get_height()) ssQ.write(half4(mx), q);
         }
     }
 

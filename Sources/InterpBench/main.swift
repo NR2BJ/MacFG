@@ -16,6 +16,7 @@ import Monitoring
 import ImageIO
 import CoreGraphics
 import UniformTypeIdentifiers
+import Vision
 
 /// MTLTexture(bgra8) → PNG (육안 검증용)
 func dumpPNG(_ tex: any MTLTexture, device: any MTLDevice, queue: any MTLCommandQueue, path: String) {
@@ -421,6 +422,35 @@ func loadTexture(path: String, device: any MTLDevice) -> (any MTLTexture)? {
     return tex
 }
 
+/// 앱의 Vision 텍스트 박스 검출과 같은 조건(AppState.scheduleVisionTextDetection): 긴 변 1280 축소, .fast,
+/// 언어 보정 끔, 좌상 원점 정규화 사각형. 벤치 텍스처는 .shared bgra8이라 바로 읽는다.
+func benchVisionBoxes(_ tex: any MTLTexture) -> [CGRect] {
+    let w = tex.width, h = tex.height
+    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+    tex.getBytes(&bytes, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+    guard let full = CGContext(data: &bytes, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
+          let img = full.makeImage() else { return [] }
+    let longSide = max(w, h)
+    let sc = longSide > 1280 ? 1280.0 / Double(longSide) : 1.0
+    let dw = max(16, Int(Double(w) * sc) & ~1), dh = max(16, Int(Double(h) * sc) & ~1)
+    guard let small = CGContext(data: nil, width: dw, height: dh, bitsPerComponent: 8, bytesPerRow: dw * 4,
+                                space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return [] }
+    small.interpolationQuality = .medium
+    small.draw(img, in: CGRect(x: 0, y: 0, width: dw, height: dh))
+    guard let cg = small.makeImage() else { return [] }
+    let req = VNRecognizeTextRequest()
+    req.recognitionLevel = .fast
+    req.usesLanguageCorrection = false
+    try? VNImageRequestHandler(cgImage: cg).perform([req])
+    return (req.results ?? []).map { o in
+        let b = o.boundingBox
+        return CGRect(x: b.origin.x, y: 1 - b.origin.y - b.height, width: b.width, height: b.height)
+    }
+}
+
 /// 전체 프레임 PSNR (그리드 서브샘플) — 실프레임 비교용
 /// 블렌드 기준선 PSNR — (A+B)/2 vs GT. 모션보상 없이 두 프레임을 섞기만 한 것.
 /// 엔진이 이걸 못 넘으면 "flow가 실제로 버는 게 없다"는 뜻이고, 크게 넘으면 모션보상이 작동 중이며
@@ -748,6 +778,17 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             tripDet = d
             print("  [TRIPMASK] alpha=\(UIStaticDetector.alpha) 예열 \(frames.count * 2)회 mask=\(d.mask != nil ? "ok" : "nil")")
         }
+        // **Vision 텍스트 박스** — 앱은 2초마다 제출한다(부스트 = 박스 안 마스크 1). 이게 없으면 벤치가 런타임보다
+        // 마스크를 적게 본다(2026-09-30: 층의 런타임 띠가 오프라인보다 나쁜 원인 조사). 120프레임마다, TTL은 무한
+        // (벤치는 벽시계가 영상 시간과 달라 TTL 6초가 엉뚱하게 만료된다 — 앱에선 2초마다 교체되니 동일).
+        let tripVision = tripDet != nil && Knob.string("MACFG_TRIPVISION") != "0"
+        let visionEvery = max(1, Int(Knob.string("MACFG_TRIPVISIONEVERY") ?? "") ?? 120)
+        if tripVision, let d = tripDet {
+            UIStaticDetector.boxTTL = 1e9
+            let bx = benchVisionBoxes(frames[0])
+            d.submitTextBoxes(bx, generation: d.generation)
+            print("  [TRIPVISION] 120프레임마다 Vision 박스 제출 (첫 프레임 \(bx.count)개)")
+        }
         // **정적 UI 층** (기본 ON = UILayer.enabled, `MACFG_UILAYER=0`으로 끔) — TRIPMASK가 켜져 있을 때만.
         // 추출(clean) → 엔진은 clean만 → 엔진 출력에 제자리 합성. 엔진에는 UI 경로가 없다(2026-09-30 제거).
         // 프레임 인덱스별 캐시: 삼중항(A=i, B=i+2)에서도 각 쌍이 제 A·B의 clean을 받게 한다 — 예전 판은
@@ -799,6 +840,7 @@ func runTripletMode(dir: String, engineKeys: [String], device: any MTLDevice, qu
             if let d = tripDet {
                 // MACFG_TRIPMASKSTRIDE=N: 런타임처럼 N프레임마다만 갱신 (앱은 uiDetectFrame % 2)
                 let mstride = max(1, Int(Knob.string("MACFG_TRIPMASKSTRIDE") ?? "") ?? 1)
+                if tripVision, i > 0, i % visionEvery == 0 { let bx = benchVisionBoxes(a); d.submitTextBoxes(bx, generation: d.generation); if Knob.isSet("MACFG_TRIPVISIONLOG") { print("  [TRIPVISION] i=\(i) 박스 \(bx.count)개") } }
                 // 층 모드는 앱과 같은 순서: 프레임이 도착하면 디텍터 갱신(스트라이드) → 그 마스크로 추출.
                 // A(=직전 반복의 B)는 이미 갱신·추출됐으므로 첫 반복만 A로 갱신한다.
                 if (uiLayer == nil || i == 0), i % mstride == 0, let cb = queue.makeCommandBuffer() { d.update(source: a, into: cb); cb.commit(); await cb.completed() }

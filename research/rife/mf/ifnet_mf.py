@@ -114,29 +114,39 @@ class IFNetMF(nn.Module):
         return flowOut, mf[:, 0:2]
 
 
-def from_v3(v3, warp, mp_bias=-20.0):
+def from_v3(v3, warp, mp_bias=-20.0, p_blocks=5, p_feat=True):
     """permute_input_channels()를 마친 v3 IFNet의 가중치를 MF로 이식한다 (zero-init extension).
     새 입력 채널(P 묶음·mP·P 잔차 flow)의 가중치 = 0, 새 출력(P 잔차 flow) = 0, mP 바이어스 = mp_bias.
-    이러면 MF의 flow[:, :4]·mask[:, :1]이 v3와 같아야 한다 — ane_gate.py가 확인한다."""
-    mf = IFNetMF(warp)   # 기본 구성(p_blocks=5, p_feat=True)만 이식 대상
+    이러면 MF의 flow[:, :4]·mask[:, :1]이 v3와 같아야 한다 — ane_gate.py가 확인한다.
+    반환: (mf, new_masks) — new_masks[파라미터 이름] = 새 채널 위치가 1인 마스크(부분 학습용)."""
+    mf = IFNetMF(warp, p_blocks=p_blocks, p_feat=p_feat)
     mf.encode.load_state_dict(v3.encode.state_dict())
-    # 입력 채널 대응 (v3 → MF). block0: [A 0:7, B 7:14, t 14] → [A 0:7, B 7:14, P 14:21, t 21]
-    in0 = {i: i for i in range(14)}; in0[14] = 21
-    # block1~4: v3 [wA 0:7, wB 7:14, t 14, mask 15, feat 16:24, flow 24:28]
-    #        → MF [wA 0:7, wB 7:14, wP 14:21, t 21, m 22, mP 23, feat 24:32, flow 32:36, Pres 36:38]
-    inN = {i: i for i in range(14)}; inN[14] = 21; inN[15] = 22
-    inN.update({16 + k: 24 + k for k in range(8)}); inN.update({24 + k: 32 + k for k in range(4)})
+    pc = 7 if p_feat else 3
     # 출력(레벨) 채널: v3 [flow 0:4, mask 4, feat 5:13] → MF [flow 0:4, Pres 4:6, m 6, mP 7, feat 8:16]
     outmap = {k: k for k in range(4)}; outmap[4] = 6; outmap.update({5 + k: 8 + k for k in range(8)})
+    masks = {}
     with torch.no_grad():
-        for name in ["block0", "block1", "block2", "block3", "block4"]:
+        for bi, name in enumerate(["block0", "block1", "block2", "block3", "block4"]):
             b3, bm = getattr(v3, name), getattr(mf, name)
-            imap = in0 if name == "block0" else inN
+            off = pc if bi < p_blocks else 0
+            # 입력 채널 대응 (v3 → MF). A/B(워프) 0:14는 그대로, 그 뒤는 P 묶음(off)만큼 민다.
+            #   block0: v3 [.. t 14] → MF [.. P 14:14+off, t 14+off]
+            #   blockN: v3 [.. t 14, mask 15, feat 16:24, flow 24:28]
+            #        → MF [.. P, t 14+off, m 15+off, mP 16+off, feat 17+off.., flow 25+off.., Pres 29+off..]
+            imap = {i: i for i in range(14)}
+            imap[14] = 14 + off
+            if bi > 0:
+                imap[15] = 15 + off
+                imap.update({16 + k: 17 + off + k for k in range(8)})
+                imap.update({24 + k: 25 + off + k for k in range(4)})
             c3, cm = b3.conv0[0][0], bm.conv0[0][0]
             cm.weight.zero_()
             for i3, im in imap.items():
                 cm.weight[:, im] = c3.weight[:, i3]
             cm.bias.copy_(c3.bias)
+            mk = torch.ones_like(cm.weight)
+            for im in imap.values(): mk[:, im] = 0
+            masks[f"{name}.conv0.0.0.weight"] = mk
             bm.conv0[1].load_state_dict(b3.conv0[1].state_dict())
             bm.convblock.load_state_dict(b3.convblock.state_dict())
             l3, lm = b3.lastconv[0], bm.lastconv[0]          # ConvTranspose2d: weight (in, out, 4, 4)
@@ -145,5 +155,9 @@ def from_v3(v3, warp, mp_bias=-20.0):
                 lm.weight[:, 4 * om:4 * om + 4] = l3.weight[:, 4 * o3:4 * o3 + 4]
                 lm.bias[4 * om:4 * om + 4] = l3.bias[4 * o3:4 * o3 + 4]
             lm.bias[4 * 7:4 * 7 + 4] = mp_bias                # mP 로짓 → sigmoid ≈ 0
-    return mf
-
+            mw = torch.zeros_like(lm.weight); mb = torch.zeros_like(lm.bias)
+            for om in (4, 5, 7):                              # 새 출력: P 잔차 flow 2ch + mP
+                mw[:, 4 * om:4 * om + 4] = 1; mb[4 * om:4 * om + 4] = 1
+            masks[f"{name}.lastconv.0.weight"] = mw
+            masks[f"{name}.lastconv.0.bias"] = mb
+    return mf, masks

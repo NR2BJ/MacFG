@@ -70,7 +70,7 @@ if __name__ == '__main__':
     sd = torch.load('../v425/train_log/flownet.pkl', map_location='cpu', weights_only=True)
     v3.load_state_dict({k.replace('module.', ''): v for k, v in sd.items()}, strict=False)
     v3 = v3.eval().permute_input_channels()
-    mf = from_v3(v3, warp).eval()
+    mf = from_v3(v3, warp)[0].eval()
     nparam = lambda n: sum(p.numel() for p in n.parameters())
     print(f"파라미터 v3 {nparam(v3) / 1e6:.3f}M → MF {nparam(mf) / 1e6:.3f}M")
 

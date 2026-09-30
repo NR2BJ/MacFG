@@ -17,3 +17,6 @@ Models/rife720.mlpackage/
 bench_frames/
 Models/v1_orig/
 worklog-archive.md
+
+# 학습 코퍼스(A1 멀티프레임) — 수 GB, 재생성: research/rife/mf/extract_windows.py
+datasets/

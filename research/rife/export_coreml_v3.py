@@ -128,11 +128,22 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument("--sizes", default="360")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--weights", default=None,
+                    help="파인튜닝한 v3 state_dict(.pt, 이미 순열된 배치 — mf/train_mf.py --arch v3). "
+                         "주면 permute를 건너뛰고, ①은 원본 대비 '학습으로 달라진 양'이 된다(정보용)")
     a = ap.parse_args()
     outdir = os.path.abspath(a.out); os.makedirs(outdir, exist_ok=True)
     v1 = load(IFNetV1)
     v2 = load(IFNetV2)
-    v3 = load(IFNetV3).permute_input_channels()
+    if a.weights:
+        v3 = IFNetV3()
+        sd = torch.load(a.weights, map_location='cpu')
+        sd = {k[4:] if k.startswith("net.") else k: v for k, v in sd.items()}   # V3AsMF 래퍼 접두사
+        v3.load_state_dict(sd)
+        v3 = v3.eval()
+        print(f"파인튜닝 가중치: {a.weights}")
+    else:
+        v3 = load(IFNetV3).permute_input_channels()
     for s in [int(v) for v in a.sizes.split(",")]:
         H, W = pad64(s), pad64(s * 16 // 9)
         print(f"── rife{s} v3: 입력 {W}x{H}")

@@ -109,6 +109,13 @@ def synth(a, b, flow, mask):
         return F.grid_sample(img, torch.stack((gx, gy), -1), mode='bilinear', padding_mode='border', align_corners=False)
     return wp(a, fl[:, :2]) * m + wp(b, fl[:, 2:4]) * (1 - m), fl
 
+def grad_energy(x):
+    l = (0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]).clamp(0, 1) * 255.0
+    gx = (l[:, :, 1:-1:2, 2::2] - l[:, :, 1:-1:2, 0:-2:2]).abs()
+    gy = (l[:, :, 2::2, 1:-1:2] - l[:, :, 0:-2:2, 1:-1:2]).abs()
+    h = min(gx.shape[2], gy.shape[2]); w = min(gx.shape[3], gy.shape[3])
+    return float((gx[:, :, :h, :w] + gy[:, :, :h, :w]).mean())
+
 def psnr(x, y):
     mse = float(((x.clamp(0, 1) - y) ** 2).mean())
     return 10 * math.log10(1.0 / max(mse, 1e-10))
@@ -161,24 +168,26 @@ if __name__ == '__main__':
         for (d_ab, d, i, pa, pg, pb) in trips:
             A, G, B = to_t(load_img(pa)), to_t(load_img(pg)), to_t(load_img(pb))
             x = pack(A, B, mH, mW)
-            ps, fls = {}, {}
+            ps, fls, sh = {}, {}, {}
+            gG = grad_energy(G)
             for k in names:
                 f, m = arms_s[k](x)
                 out, _ = synth(A, B, f, m)
                 ps[k] = psnr(out, G)
+                sh[k] = grad_energy(out) / max(gG, 1e-9)   # InterpBench sharp=와 같은 정의 — PSNR↑+선명도↓ = 흐림으로 이김
                 fls[k] = f
             ref = "t.v1" if "t.v1" in fls else "c.v2"
             _, flref = synth(A, B, fls[ref], torch.zeros_like(fls[ref][:, :1]))
             mag = float(flref.abs().amax(1).flatten().quantile(0.95))   # 원 해상도 px, 95퍼센타일
             fd = {k: (fls[k] - fls[ref]).abs() for k in names if k != ref}
-            rows.append((os.path.basename(d), i, d_ab, mag, ps, {k: (float(v.mean()), float(v.flatten().quantile(0.99)), float(v.max())) for k, v in fd.items()}))
+            rows.append((os.path.basename(d), i, d_ab, mag, ps, {k: (float(v.mean()), float(v.flatten().quantile(0.99)), float(v.max())) for k, v in fd.items()}, sh))
             print(f"  {os.path.basename(d)[:22]:22s} #{i:03d} d_ab={d_ab:.3f} |flow|p95={mag:6.1f}px  " +
                   " ".join(f"{k}={ps[k]:.2f}" for k in names), flush=True)
 
         print(f"\n── rife{short} ({mW}x{mH}) — 삼중항 {len(rows)}개")
         for k in names:
             v = [r[4][k] for r in rows]
-            print(f"  {k:5s} PSNR 중앙값 {np.median(v):.3f}  평균 {np.mean(v):.3f}")
+            print(f"  {k:5s} PSNR 중앙값 {np.median(v):.3f}  평균 {np.mean(v):.3f}  선명도 {np.mean([r[6][k] for r in rows]):.3f}")
         def delta(k1, k0):
             dv = [r[4][k1] - r[4][k0] for r in rows]
             return np.median(dv), np.mean(dv), min(dv), max(dv)

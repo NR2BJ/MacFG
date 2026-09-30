@@ -166,6 +166,9 @@ def main():
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--init", default=None, help="이어 학습할 체크포인트(.pt) — 같은 arch/구성이어야 한다")
+    ap.add_argument("--mask-distill", type=float, default=0.0,
+                    help="λ·|σ(m) − σ(m_v3)| — 마스크를 v3에 묶는다. 제약 없는 파인튜닝은 마스크가 A/B를 섞는 쪽으로 가서 "
+                         "PSNR은 오르되 흐려졌다(2026-10-01: 이득 +0.646 중 마스크 몫 +0.395, 선명도 0.938→0.904). flow만 적응시키려면 >0")
     ap.add_argument("--arch", choices=["mf", "v3"], default="mf",
                     help="v3 = 과거 프레임 없이 v3 그래프 가중치만 파인튜닝(도메인 적응 단독 — 배포 시 연산 +0%%, Swift 무변경)")
     ap.add_argument("--p-source", choices=["past", "A"], default="past",
@@ -212,6 +215,12 @@ def main():
     ntrain = sum(int(masks[n].sum()) for n in masks) if a.train == "new" else sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"구성 arch={a.arch} p_blocks={a.p_blocks} p_feat={a.p_feat} mP바이어스={a.mp_bias} 학습={a.train} P={a.p_source} (학습 파라미터 {ntrain / 1e3:.1f}k)", flush=True)
 
+    ref_net = None
+    if a.mask_distill > 0:
+        import copy
+        ref_net = V3AsMF(copy.deepcopy(v3)).to(DEV).eval()   # 출발 v3 — 마스크 기준 (고정)
+        for p_ in ref_net.parameters(): p_.requires_grad_(False)
+        print(f"마스크 증류 λ={a.mask_distill}", flush=True)
     ds = Windows(a.data, tr_ids)
     ev_items = load_eval(a.data, ev_ids, a.eval_n)
     ref = run_eval(net, ev_items)
@@ -229,6 +238,10 @@ def main():
         flow, mask = net(torch.cat((P, A, B), 1), T, SCALES)
         out, _ = synth(A, B, P, flow, mask)
         loss = (out - G).abs().mean() + lap_loss(out, G)
+        if ref_net is not None:
+            with torch.no_grad():
+                _, mref = ref_net(torch.cat((P, A, B), 1), T, SCALES)
+            loss = loss + a.mask_distill * (torch.sigmoid(mask[:, 0:1]) - torch.sigmoid(mref[:, 0:1])).abs().mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

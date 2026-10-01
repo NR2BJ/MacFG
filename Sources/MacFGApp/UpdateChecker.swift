@@ -118,7 +118,12 @@ public final class UpdateChecker {
             // 채널 필터: stable은 정식만, beta는 둘 다 (베타 사용자도 정식 최신을 받아야 함)
             let pool = channel == .stable ? releases.filter { !$0.isPrerelease } : releases
             let newest = pool.max { Self.compare($0.version, $1.version) == .orderedAscending }
-            if let newest, Self.compare(newest.version, currentVersion) == .orderedDescending {
+            // 개발 빌드(`scripts/dev-install.sh` = 0.0.<커밋수>)는 HEAD에서 만든 것이라 어떤 릴리즈보다 새것인데,
+            // 번호만 보면 모든 릴리즈보다 낮다 — 그대로 비교하면 옛 릴리즈를 "새 버전"으로 띄운다(2026-10-01: 0.0.311에 v1.1.5).
+            if Self.isDevBuild(currentVersion) {
+                available = nil
+                DiagnosticLog.shared.log("[UPDATE] 개발 빌드 \(currentVersion) — 릴리즈 비교 생략 (최신 릴리즈 \(newest?.tag ?? "-"))")
+            } else if let newest, Self.compare(newest.version, currentVersion) == .orderedDescending {
                 available = newest
                 DiagnosticLog.shared.log("[UPDATE] 새 버전 \(newest.tag) (현재 \(currentVersion), 채널 \(channel.rawValue))")
             } else {
@@ -131,6 +136,9 @@ public final class UpdateChecker {
     }
 
     public var currentVersionString: String { currentVersion }
+
+    /// 개발 빌드 번호(0.0.N)인가 — 릴리즈는 1.x 이상.
+    static func isDevBuild(_ v: String) -> Bool { normalize(v).hasPrefix("0.0.") }
 
     /// "v1.1.5" / "1.1.5-beta.2" → 비교용 정규화 (앞의 v만 제거, 나머지는 보존)
     static func normalize(_ s: String) -> String {

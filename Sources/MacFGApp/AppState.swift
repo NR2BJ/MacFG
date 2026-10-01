@@ -1775,6 +1775,9 @@ public final class AppState {
     @ObservationIgnored nonisolated(unsafe) private var diagUILayerFrames = 0
     @ObservationIgnored nonisolated(unsafe) private var diagUILayerPairs = 0
     @ObservationIgnored nonisolated(unsafe) private var diagUILayerSkip = 0
+    /// 층이 켜져 있는데 층 없이 나간 **보간 프레임** 수 — 이 프레임들은 정적 UI가 엔진에 그대로 끌린다
+    /// (엔진 안 UI 보호는 층 분리 때 지웠다). 정상이면 캡처 시작·리셋 직후 한두 장뿐이어야 한다.
+    @ObservationIgnored nonisolated(unsafe) private var diagUILayerMiss = 0
     /// 컷 시 정지-UI 디텍터도 리셋할지. 기본 false. 근거는 렌더 틱의 컷 처리 주석 참조.
     nonisolated(unsafe) static let uiDetectorResetsOnCut = Knob.string("MACFG_UICUTRESET") == "1"
     /// 복원 규칙으로 통과시킨 장수 (E1a) — 거부 앞항만 참인 경우.
@@ -2874,6 +2877,8 @@ public final class AppState {
                 if let lp = layerPair, let ul = uiLayer, let r = interpResult {
                     for f in r.frames { ul.composite(output: f.texture, sourceA: prev.texture, sourceB: stable, t: f.t, frameB: lp.b, into: cb2) }
                     diagUILayerPairs &+= 1
+                } else if UILayer.enabled, uiLayer?.available == true, let r = interpResult {
+                    diagUILayerMiss &+= r.frames.count
                 }
                 pairStartTs = prev.timestamp
                 pairGap = gap
@@ -3493,6 +3498,9 @@ public final class AppState {
                     stablePool.append(tex)
                 }
             }
+            // 층 슬롯 상한은 풀보다 커야 한다 — 작으면 깊은 백로그에서 추출을 건너뛰고 그 앞뒤 쌍이 층 없이
+            // 엔진에 가 정적 UI가 끌린다(UILayer.maxSlots 주석, 2026-10-01 실측 2초당 최대 12번).
+            UILayer.maxSlots = max(UILayer.maxSlots, stablePool.count + 1)
             // 적응 지연 시드 — 이 해상도·엔진에서 지난번에 자리 잡은 칸 수로 시작 (과하면 제어기가 내린다)
             if Self.paceSeedEnabled {
                 let key = paceSeedKeyFor(width: width, height: height)
@@ -3669,7 +3677,7 @@ public final class AppState {
         // 배치는 [WIN] 로그에만, 캡처 소스는 [SCK-DISPLAY]에만 나와서 창 단위로 못 맞췄다.
         // 매 창에 라벨이 있으면 사용자가 아무 순서로 토글해도 사후에 2×2로 가를 수 있다.
         // (측정 절차를 사람이 정확히 지키게 만들 게 아니라, 지표가 엉성한 입력을 견뎌야 한다.)
-        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) srcRestore=\(diagSrcRestore) uiCutSkip=\(diagUiCutResetSkipped) uil=\(diagUILayerFrames)/\(diagUILayerPairs)/\(diagUILayerSkip) rawDist=\(diagRawIntHist.map(String.init).joined(separator: "/")) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | lead(shown)=\(diagLeadShown.map(String.init).joined(separator: "/")) lead(drop)=\(diagLeadDrop.map(String.init).joined(separator: "/")) | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
+        let msg = "[SCHED] place=\(placeTagMirror) src=\(diagSourceCount)(\(String(format: "%.0f", srcFps))fps) uniqOut=\(uniquePresented) dupSkip=\(diagDupSkipCount) chg=\(diagChangeHist.map(String.init).joined(separator: "/")) srcLock=\(diagSrcLockSkip) srcRestore=\(diagSrcRestore) uiCutSkip=\(diagUiCutResetSkipped) uil=\(diagUILayerFrames)/\(diagUILayerPairs)/\(diagUILayerSkip)/\(diagUILayerMiss) rawDist=\(diagRawIntHist.map(String.init).joined(separator: "/")) uiGate=\(diagUiGateSkip) tsRej=\(diagTsRejectCount) interpEnc=\(diagInterpEncodedCount) skip[\(skips)] present=\(diagPresentCount) (I=\(diagInterpPresentCount) 미표시=\(diagPresentDropped)) lat=+\(Int(extraLatencySlots)) \(tickStats) \(ciStats) cut=\(cuts) resync=\(diagResyncCount) snapMiss=\(diagSnapMissCount)(pull=\(diagSnapPullableCount) lagMax=\(String(format: "%.1f", diagSnapPullLagMax * 1000))ms) poolMiss=\(diagPoolExhaustCount)(deliv=\(String(format: "%.0f%%", (diagSourceCount + diagPoolExhaustCount) > 0 ? Double(diagSourceCount) * 100.0 / Double(diagSourceCount + diagPoolExhaustCount) : 100.0))) tl=\(timeline.count) t[multFell=\(diagTMultFell) gridEmpty=\(diagTGridEmpty) over=\(diagTOverSupply) ratio=\(String(format: "%.2f~%.2f", diagTRatioMin > 900 ? 0 : diagTRatioMin, diagTRatioMax))] every=\(presentEveryN) tCap=\(tCountCap.map(String.init) ?? "-") pace=\(String(format: "%.2f", paceScale))/\(String(format: "%.0f", paceLastShownRate)) slip=\(slipSnapshot.map(String.init).joined(separator: "/")) gpuLate=\(gpuLateSnapshot.map(String.init).joined(separator: "/")) dupSlot=\(diagDupTargetSlot) | glass(ms): avg=\(String(format: "%.2f", avgInterval)) σ=\(String(format: "%.2f", sqrt(variance))) max=\(String(format: "%.1f", maxInterval)) | srcInt=\(String(format: "%.1f", sourceIntervalEMA * 1000))ms dist=\(diagSrcIntHist.map(String.init).joined(separator: "/")) [\(String(format: "%.0f", srcIntLo))~\(String(format: "%.0f", srcIntHi))] | drain=\(String(format: "%.1f", drainAvg))/\(diagDrainDepthMax) | work=\(String(format: "%.0f", avgWork))/\(String(format: "%.0f", maxWork))ms wait=\(String(format: "%.1f", waitSnapshot))ms e2e=\(String(format: "%.0f", avgLatency))ms | lead(shown)=\(diagLeadShown.map(String.init).joined(separator: "/")) lead(drop)=\(diagLeadDrop.map(String.init).joined(separator: "/")) | hold=\(holdStr) p\(bestPeriod)=\(String(format: "%.0f%%", bestScore * 100)) | \(pattern)"
         DiagnosticLog.shared.log(msg)
 
         // 거버너 과부하 비율 — reset 직전, 카운터가 아직 살아있을 때 계산.
@@ -3706,7 +3714,7 @@ public final class AppState {
         diagSrcLockSkip = 0
         diagSrcRestore = 0
         diagUiCutResetSkipped = 0
-        diagUILayerFrames = 0; diagUILayerPairs = 0; diagUILayerSkip = 0
+        diagUILayerFrames = 0; diagUILayerPairs = 0; diagUILayerSkip = 0; diagUILayerMiss = 0
         stageLock.lock()
         for i in diagLeadShown.indices { diagLeadShown[i] = 0; diagLeadDrop[i] = 0 }
         stageLock.unlock()

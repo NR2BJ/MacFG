@@ -52,8 +52,13 @@ public final class UILayer {
     /// push-pull 단수 상한 (0단 = 소스/2). 1×1까지 내려가야 화면 폭만 한 구멍도 반드시 닫힌다 —
     /// 최하단이 구멍으로 남으면 채움이 검정이 된다. 4K는 12단에서 1×1.
     public nonisolated(unsafe) static var levels: Int = Int(Knob.string("MACFG_UILLEVELS") ?? "") ?? 12
-    /// 프레임 슬롯 상한. 평시 3장(직전·현재·GPU 대기 1) — 백로그가 더 깊으면 이 프레임은 층 없이 간다.
-    public nonisolated(unsafe) static var maxSlots: Int = 6
+    /// 프레임 슬롯 상한. 평시 3장(직전·현재·GPU 대기 1)이지만 **상한은 앱의 안정 텍스처 풀(8장)보다 커야 한다**
+    /// — 앱이 풀 생성 때 `풀 크기 + 1`로 맞춘다. 슬롯의 소유자는 풀 텍스처뿐이고, 지금 추출하는 프레임은 풀에서
+    /// 비어 있는 것을 받으므로 바쁜 소유자(인플라이트 ∪ 직전)는 많아야 풀−1장이다 → 풀 크기 이상이면 슬롯 부족이 없다.
+    /// 2026-10-01: 6이던 시절 4K·지연 +3~4에서 2초 창마다 1~12번 추출을 건너뛰었다. 건너뛴 한 장은 앞뒤 두 쌍을
+    /// 층 없이 엔진에 보내고(엔진 안 UI 보호는 층 분리 때 지웠다), 그 프레임에서 정적 UI가 배경 flow에 통째로 끌렸다
+    /// — 사용자 체감 "정적 UI 지지직, MetalFlow가 특히 심함". 슬롯은 필요할 때만 만들어지므로 평시 메모리는 그대로.
+    public nonisolated(unsafe) static var maxSlots: Int = 9
     static let tile = 32   // 소스 픽셀
 
     /// 소스 한 장의 층 산출물. `clean`은 엔진 입력, 나머지는 합성·다음 프레임 정지 판정용.

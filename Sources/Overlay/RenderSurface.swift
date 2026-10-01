@@ -145,7 +145,7 @@ public final class RenderSurface: @unchecked Sendable {
     /// 반환: 인코딩 성공 여부.
     @discardableResult
     public func encode(texture: any MTLTexture, into commandBuffer: any MTLCommandBuffer,
-                       drawable: any CAMetalDrawable) -> Bool {
+                       drawable: any CAMetalDrawable, interpolated: Bool = false) -> Bool {
         let p = currentParams()
         if p.isViewer {
             layoutViewerLayer(textureWidth: texture.width, textureHeight: texture.height, bounds: p.contentBounds, scale: p.contentsScale)
@@ -212,12 +212,19 @@ public final class RenderSurface: @unchecked Sendable {
             lastStatusSig = StatusSig()
             lock.lock(); _scaleStatus = nil; lock.unlock()
         }
-        encodeBlit(source: source, into: commandBuffer, target: drawable.texture, params: p)
+        encodeBlit(source: source, into: commandBuffer, target: drawable.texture, params: p, interpolated: interpolated)
         return true
     }
 
+    /// **보간 프레임 선명도 보정** (2026-10-01). 보간 프레임은 움직이는 곳에서 원본보다 흐리다 — 덤프 실측 I/S 그래디언트
+    /// MetalFlow 0.975, RIFE 0.918~0.955(움직임 영역). 원본과 번갈아 보이니 사용자는 "보간을 켜면 선예도가 떨어진다"고 느낀다.
+    /// 표시 셰이더가 보간 프레임에만 중심 보정 c' = c + α(c − 이웃 평균)을 CAS 앞에 넣는다. α는 덤프로 보정했다
+    /// (표시 기준 I/S ≈ 1): CAS가 켜져 있으면 CAS가 보정을 한 번 더 키워서 0.08(0.771 기준 1.006/1.019), 꺼져 있으면 0.22.
+    /// `MACFG_ISHARP` = 배율(기본 1, 0이면 끔).
+    nonisolated(unsafe) static let interpSharpScale: Float = Float(Knob.double("MACFG_ISHARP") ?? 1.0)
+
     private func encodeBlit(source: any MTLTexture, into commandBuffer: any MTLCommandBuffer,
-                            target: any MTLTexture, params p: Params) {
+                            target: any MTLTexture, params p: Params, interpolated: Bool = false) {
         let renderPassDesc = MTLRenderPassDescriptor()
         renderPassDesc.colorAttachments[0].texture = target
         renderPassDesc.colorAttachments[0].loadAction = .dontCare
@@ -236,7 +243,8 @@ public final class RenderSurface: @unchecked Sendable {
         var bp = BlitParams(
             size: SIMD2<Float>(Float(source.width), Float(source.height)),
             radiusPx: p.isViewer ? 0 : Float(p.cornerRadiusPt * p.contentsScale),
-            sharpness: p.sharpness
+            sharpness: p.sharpness,
+            interpSharp: interpolated ? (p.sharpness > 0.01 ? 0.08 : 0.22) * Self.interpSharpScale : 0
         )
         encoder.setFragmentBytes(&bp, length: MemoryLayout<BlitParams>.stride, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
@@ -247,6 +255,7 @@ public final class RenderSurface: @unchecked Sendable {
         var size: SIMD2<Float>
         var radiusPx: Float
         var sharpness: Float
+        var interpSharp: Float
     }
 
     /// 뷰어: 캐시된 bounds 안에서 텍스처 종횡비 유지 레터박스 배치 (NSView 접근 없음)

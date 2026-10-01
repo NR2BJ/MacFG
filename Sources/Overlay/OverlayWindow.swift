@@ -34,17 +34,22 @@ private final class ShaderCache: @unchecked Sendable {
             float2 size;      // drawable 픽셀 크기
             float radiusPx;   // 모서리 반경 (px, 0=마스킹 없음)
             float sharpness;  // CAS 강도 0~1 (0=끔, 패스스루 바이트 보존)
+            float interpSharp; // 보간 프레임 전용 중심 보정 α (원본 프레임은 0) — RenderSurface 주석 참조
         };
 
         // AMD FidelityFX CAS(Contrast Adaptive Sharpening) 단순화 — LS의 "1:1인데도
         // 선명해지는" 체감의 정체. 로컬 대비가 낮은 곳(브라우저가 늘려놓은 720p의
         // 뭉개진 디테일)을 강하게, 이미 최대 대비인 하드엣지는 약하게 → 헤일로 없음.
-        float3 casSharpen(texture2d<float> tex, sampler samp, float2 uv, float2 texel, float sharpness) {
+        float3 casSharpen(texture2d<float> tex, sampler samp, float2 uv, float2 texel, float sharpness, float pre) {
             float3 a = tex.sample(samp, uv + float2( 0, -1) * texel).rgb;
             float3 b = tex.sample(samp, uv + float2(-1,  0) * texel).rgb;
             float3 c = tex.sample(samp, uv).rgb;
             float3 d = tex.sample(samp, uv + float2( 1,  0) * texel).rgb;
             float3 e = tex.sample(samp, uv + float2( 0,  1) * texel).rgb;
+            // 보간 프레임 선명도 보정: c' = c + α(c − 이웃 평균). 보간은 워프 리샘플링·미세 어긋남 블렌드로 원본보다
+            // 움직이는 곳에서 2.5~8% 흐리다(덤프 실측) — 원본과 번갈아 보이면 전체가 무뎌 보인다.
+            if (pre > 0.0) { c = saturate(c + pre * (c - (a + b + d + e) * 0.25)); }
+            if (sharpness <= 0.01) { return c; }
             float3 mn = min(min(min(a, b), min(d, e)), c);
             float3 mx = max(max(max(a, b), max(d, e)), c);
             float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-4)));
@@ -76,8 +81,8 @@ private final class ShaderCache: @unchecked Sendable {
                                       sampler samp [[sampler(0)]],
                                       constant BlitParams& p [[buffer(0)]]) {
             float4 color = tex.sample(samp, in.texCoord);
-            if (p.sharpness > 0.01) {
-                color.rgb = casSharpen(tex, samp, in.texCoord, 1.0 / p.size, p.sharpness);
+            if (p.sharpness > 0.01 || p.interpSharp > 0.0) {
+                color.rgb = casSharpen(tex, samp, in.texCoord, 1.0 / p.size, p.sharpness, p.interpSharp);
             }
             color.a = 1.0;
             if (p.radiusPx > 0.5) {

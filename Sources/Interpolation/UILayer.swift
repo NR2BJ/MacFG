@@ -59,6 +59,13 @@ public final class UILayer {
     /// 층 없이 엔진에 보내고(엔진 안 UI 보호는 층 분리 때 지웠다), 그 프레임에서 정적 UI가 배경 flow에 통째로 끌렸다
     /// — 사용자 체감 "정적 UI 지지직, MetalFlow가 특히 심함". 슬롯은 필요할 때만 만들어지므로 평시 메모리는 그대로.
     public nonisolated(unsafe) static var maxSlots: Int = 9
+    /// **마스크 기억** (2026-10-01): 구멍 판정은 디텍터 마스크 대신 `max(마스크, 기억×감쇠)`를 쓴다(소스 프레임마다 갱신).
+    /// 왜: 자리가 고정된 UI의 **내용**이 바뀌면(캐릭터 눈 깜빡임, 탄약 숫자) 디텍터는 그 픽셀을 "변하는 곳"으로 보고 마스크를
+    /// 내리며, 회복에 수십 프레임이 걸린다. 그동안 그 픽셀은 다시 멈춰 있어도(감은 눈이 유지되는 동안) 구멍에서 빠져 엔진이
+    /// 주변 흐름으로 워프한다 — 사용자 제보 "눈 깜빡일 때 살짝 번짐", 덤프 out_20261001-150535에서 감은 눈 한가운데 I 프레임에
+    /// 뜬 눈 모양 경계가 타일로 남음. 기억이 있으면 다시 멈춘 순간 바로 보호된다. 정지 판정은 그대로 곱해지므로 실제로 움직이는
+    /// 것(무기 등)은 여전히 엔진 몫이다. 0.97 = 소스 23장(60fps 0.4초) 반감. `MACFG_UILHOLD=0`이면 끔.
+    public nonisolated(unsafe) static var holdDecay: Float = Float(Knob.double("MACFG_UILHOLD") ?? 0.97)
     static let tile = 32   // 소스 픽셀
 
     /// 소스 한 장의 층 산출물. `clean`은 엔진 입력, 나머지는 합성·다음 프레임 정지 판정용.
@@ -84,6 +91,10 @@ public final class UILayer {
     private let device: any MTLDevice
     private var dilatePSO: (any MTLComputePipelineState)?
     private var alphaPushPSO: (any MTLComputePipelineState)?
+    private var holdPSO: (any MTLComputePipelineState)?
+    private var heldTex: [any MTLTexture] = []     // 마스크 기억 핑퐁 (r16Float, 마스크와 같은 크기)
+    private var heldCur = 0
+    private var heldValid = false
     private var tilesPSO: (any MTLComputePipelineState)?
     private var pushPSO: (any MTLComputePipelineState)?
     private var pullPSO: (any MTLComputePipelineState)?
@@ -111,6 +122,7 @@ public final class UILayer {
         }
         dilatePSO = try pso("uilDilate")
         alphaPushPSO = try pso("uilAlphaPush"); tilesPSO = try pso("uilTiles"); pushPSO = try pso("uilPush")
+        holdPSO = try pso("uilHold")
         pullPSO = try pso("uilPull"); fillPSO = try pso("uilFill"); compositePSO = try pso("uilComposite")
         var ia: [UInt32] = [0, 1, 1]
         initArgs = device.makeBuffer(bytes: &ia, length: 12, options: .storageModeShared)
@@ -184,6 +196,12 @@ public final class UILayer {
         guard available, let dilatePSO, let alphaPushPSO, let tilesPSO, let pushPSO, let pullPSO, let fillPSO, let initArgs,
               ensure(w: source.width, h: source.height, fmt: source.pixelFormat),
               let ssQ, let nearQ, let tmpQ else { return nil }
+        // 앱의 안정 텍스처는 8장을 돌려 쓴다 — 이 소스 텍스처가 새 프레임으로 재사용됐다는 것은 그 텍스처의 **옛** 슬롯이
+        // 전부 낡았다는 뜻이다(앱은 인플라이트도 직전도 아닌 텍스처만 재사용하므로 옛 프레임을 읽는 GPU 작업은 끝났다).
+        // 풀어 주지 않으면: 다른 빈 슬롯이 먼저 골라진 경우 옛 슬롯이 같은 소유자를 단 채 남고, 그 텍스처가 다시 인플라이트가
+        // 되는 동안 '사용 중'으로 막힌다. 이런 유령 슬롯이 쌓이면 상한 9로도 바닥난다 — 2026-10-01 실측: 슬롯 상한을 풀+1로
+        // 올린 뒤에도 RIFE(지연 +4)에서 2초마다 추출을 최대 15번 건너뛰고 보간 28장이 층 없이 나갔다(MetalFlow는 0).
+        for s in slots where s.owner == owner && s !== prev { s.owner = nil }
         var slot = slots.first { s in s !== prev && (s.owner == nil || !busy.contains(s.owner!)) }
         if slot == nil, slots.count < Self.maxSlots, let s = makeSlot() { slots.append(s); slot = s }
         guard let f = slot else { skipCount += 1; return nil }
@@ -206,10 +224,30 @@ public final class UILayer {
         //    + 루마(다음 프레임 정지 판정) + 피라미드 0단(¼) + ssQ(¼, 다음 프레임 닫힘의 씨앗) + 타일 플래그.
         //    닫힘(near)은 **직전 프레임의 팽창 결과**를 쓴다 — 정적 글자 속을 채우는 용도라 한 프레임 늦어도 같고,
         //    그 덕에 패스가 하나로 끝난다(분리하면 4K +0.5ms, 2026-09-30 실측).
+        // 0) 마스크 기억: held = max(mask, held_직전 × 감쇠) — 같은 인코더(직렬 디스패치)라 다음 패스가 결과를 읽는다
+        var holeMask: any MTLTexture = mask
+        if Self.holdDecay > 0, let holdPSO {
+            if heldTex.count != 2 || heldTex[0].width != mask.width || heldTex[0].height != mask.height {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: mask.width, height: mask.height, mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+                heldTex = [device.makeTexture(descriptor: d), device.makeTexture(descriptor: d)].compactMap { $0 }
+                heldValid = false
+            }
+            if heldTex.count == 2 {
+                let src = heldTex[heldCur], dst = heldTex[1 - heldCur]
+                enc.setComputePipelineState(holdPSO)
+                enc.setTexture(mask, index: 0); enc.setTexture(src, index: 1); enc.setTexture(dst, index: 2)
+                var hp0 = SIMD2<Float>(Self.holdDecay, heldValid ? 1 : 0)
+                enc.setBytes(&hp0, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
+                grid(enc, dst.width, dst.height)
+                heldCur = 1 - heldCur; heldValid = true
+                holeMask = dst
+            }
+        }
         enc.setComputePipelineState(alphaPushPSO)
         // prev 없으면 더미로 mask를 묶는다 (같은 디스패치에서 쓰는 텍스처를 읽기로 겹쳐 묶지 않는다)
         enc.setTexture(source, index: 0); enc.setTexture(usePrev ? prev!.luma : mask, index: 1)
-        enc.setTexture(mask, index: 2); enc.setTexture(nearQ, index: 3)
+        enc.setTexture(holeMask, index: 2); enc.setTexture(nearQ, index: 3)
         enc.setTexture(f.luma, index: 4); enc.setTexture(f.hole, index: 5); enc.setTexture(pyr[0], index: 6); enc.setTexture(ssQ, index: 7)
         var p = SIMD4<Float>(Self.stillLo, Self.stillHi, usePrev ? 1 : 0, nearValid && Self.closeR > 0 ? 1 : 0)
         enc.setBytes(&p, length: MemoryLayout<SIMD4<Float>>.size, index: 0)
@@ -298,7 +336,7 @@ public final class UILayer {
 
     /// 불연속(캡처 재시작·크기 변경) — 슬롯을 통째로 버린다. 소유 표시만 지우면 아직 GPU에서 읽히는
     /// 슬롯을 다음 추출이 덮을 수 있다(특히 RIFE의 분리 큐). 버린 텍스처는 커맨드 버퍼가 붙잡고 있다가 놓는다.
-    public func reset() { slots = []; nearValid = false }
+    public func reset() { slots = []; nearValid = false; heldValid = false }
 
     private func grid(_ enc: any MTLComputeCommandEncoder, _ w: Int, _ h: Int) {
         enc.dispatchThreadgroups(MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1),
@@ -314,6 +352,18 @@ public final class UILayer {
         if (gid.x >= t.get_width() || gid.y >= t.get_height()) return;
         half4 v = t.read(gid);
         t.write(half4(v.r * 0.5h, v.g, v.b, 1.0h), gid);
+    }
+
+    // 마스크 기억: held = max(mask, held_prev × decay). p = (decay, hasPrev)
+    kernel void uilHold(texture2d<half, access::read> mask [[texture(0)]],
+                        texture2d<half, access::read> heldPrev [[texture(1)]],
+                        texture2d<half, access::write> heldNext [[texture(2)]],
+                        constant float2& p [[buffer(0)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= heldNext.get_width() || gid.y >= heldNext.get_height()) return;
+        half m = clamp(mask.read(gid).r, 0.0h, 1.0h);
+        half h = (p.y > 0.5) ? heldPrev.read(gid).r * half(p.x) : 0.0h;
+        heldNext.write(half4(max(m, h)), gid);
     }
 
     // 분리형 최대 팽창 (¼해상도). ax = (1,0) 가로 / (0,1) 세로, r = 반경.

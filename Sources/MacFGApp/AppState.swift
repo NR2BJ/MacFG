@@ -3081,7 +3081,7 @@ public final class AppState {
             }
         }
         // CAMetalDisplayLink가 배달한 드로어블에 직접 인코딩 — nextDrawable 없음
-        surface.encode(texture: entry.texture, into: cb, drawable: drawable)
+        surface.encode(texture: entry.texture, into: cb, drawable: drawable, interpolated: entry.isInterpolated)
         // 사후 덤프 — RenderSurface(업스케일·CAS·aspect-fit) 통과 후 실제 화면에 가는 픽셀.
         if let postPath = postDumpPath {
             let dt = drawable.texture

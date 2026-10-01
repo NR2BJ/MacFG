@@ -49,11 +49,17 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// 풀해상도 왕복 제거 + 이미지·특징 7ch 묶음 워프. 화질은 v2와 ±0.1dB — Models/README.md).
     /// v2 앱 실측 p50은 288=7.2 / 360=10.9(최근 10.2) / 432=16.7 / 540=26.1ms였다.
     /// 예산 규칙(med×면적비 < gap×0.75)이 자기제한: v2에선 60fps→360, 30/24fps→540.
-    /// v3에선 60fps의 360→432 판정이 경계선(8.7×1.44≈12.5 vs 12.5)이라 432까지 오를 수 있다(런타임 미검증).
+    /// v3에선 예산 규칙만으로는 60fps에서 432까지 오른다(0.0.311 실측) — 대기가 프레임 주기에 닿아 highFpsCapShort로 360에서 멈춘다.
     /// 앵커vs해상도는 실측 결판(anchor_vs_res.py): 같은 예산에선 등가, 최고해상도 앵커1이 최선.
     /// M1은 예산상 자동으로 낮은 티어에 머무름.
     static let ladderTiers = [288, 360, 432, 540]
     public nonisolated(unsafe) static var ladderMaxShort: Int = 540
+    /// **고fps 상한** (2026-10-01): 쌍 간격 20ms 미만(≈50fps 이상)이면 사다리를 이 티어에서 멈춘다.
+    /// v3로 predict가 빨라지자 예산 규칙(med×면적비 < 간격×0.75)이 60fps에서 432까지 올렸는데, 실사용(0.0.311) 432는
+    /// predict p50 12.4ms·GPU 대기 15~19ms로 프레임 주기(16.7ms)에 닿아 360(대기 10~12ms)보다 표시 σ·미표시가 나빴다.
+    /// 화질 이득은 360→432 +0.12dB(같은 평가 창)뿐이라 부드러움을 택한다. 30fps 이하는 예산이 넉넉해 그대로 오른다.
+    /// `MACFG_RIFE_HFCAP=0`이면 끔.
+    nonisolated(unsafe) static let highFpsCapShort: Int = Knob.int("MACFG_RIFE_HFCAP") ?? 360
 
     /// 전체 티어 — 승격용 288+에 더해 **거버너 강등용 sub-288**(180/216/240)을 포함.
     /// predict 실측(CPU_AND_NE, v3): 180=2.3 / 216=3.6 / 240=4.3 / 288=5.9ms (v2: 3.1/5.0/6.2/7.6).
@@ -382,6 +388,8 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
     /// (승격 + 강등)로 프레임이 끊긴다(실측 04:48~04:50 두 바퀴). 실패가 반복될수록
     /// 재시도를 드물게 해서, 조건이 정말 바뀐 경우에만 다시 올라가게 한다.
     private var ceilingFailStreak = 0
+    /// 고fps 상한이 걸려 있는가 (maybeAdapt 히스테리시스 상태 — 렌더 스레드 전용)
+    private var hfCapActive = false
 
     /// 과부하/여유 판정 → 필요 시 모델·유닛 핫스왑 킥. encodePair(렌더 스레드)에서 호출.
     /// 판정: predict 중앙값이 쌍 간격의 90%↑(지속 불가) 또는 슬롯 고갈 5%↑ → (288, ANE)로
@@ -416,22 +424,32 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
         // ANE-only 사다리 — 원칙: predict는 항상 ANE(GPU-free). GPU predict는 업스케일/표시와
         // 경쟁해 present 타이밍을 흔든다(30fps 소스 360/GPU에서 glass σ 2.3~7.4ms 부들부들 실측;
         // ANE 엔진(AppleFI)이 전 HW에서 매끄러운 이유). 해상도만 예산에 맞춰 티어 조절
-        //   (v3 predict: 288=5.9 / 360=8.7 / 432=12.2 / 540=20.8ms — 60fps→360~432, 30fps 이하→540).
+        //   (v3 predict: 288=5.9 / 360=8.7 / 432=12.2 / 540=20.8ms — 60fps→360(고fps 상한), 30fps 이하→540).
         let overloaded = med > gapMsEMA * 0.9 || exhaustRate > 0.05
+        // 이번 창의 티어 상한 = 설정 상한 ∧ 거버너 상한 ∧ (고fps면 highFpsCapShort)
+        // 히스테리시스: 50fps 소스(간격 ≈20ms)에서 간격이 흔들릴 때 360↔432 왕복을 막는다
+        if gapMsEMA < 20 { hfCapActive = true } else if gapMsEMA > 23 { hfCapActive = false }
+        let cadenceCap = (Self.highFpsCapShort > 0 && hfCapActive) ? Self.highFpsCapShort : Int.max
+        let tierCap = min(Self.ladderMaxShort, Self.flowCapShort, cadenceCap)
         if currentGPU, Self.modelAvailable(short: currentShort) {
             // GPU 모드는 과도기 유산 — 어떤 상황이든 ANE로 이전 (과부하면 288, 아니면 동해상도)
             let target = overloaded ? 288 : currentShort
             kickSwitch(short: target, gpu: false,
                        reason: "GPU-free 이전 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms")
+        } else if !currentGPU, currentShort > tierCap,
+                  let target = Self.ladderTiers.last(where: { $0 <= tierCap && Self.modelAvailable(short: $0) }) {
+            // 고fps로 바뀐 소스(예: 30→60fps) 등으로 상한을 넘는 티어에 있으면 상한으로 내린다 — 실패가 아니므로 천장 학습 없음
+            kickSwitch(short: target, gpu: false,
+                       reason: "고fps 상한 →\(target) gap=\(String(format: "%.1f", gapMsEMA))ms")
         } else if overloaded, currentShort > 288, Self.modelAvailable(short: 288) {
             noteTierFailed()
             kickSwitch(short: 288, gpu: false,
                        reason: "과부하 강등 med=\(String(format: "%.1f", med))ms/gap=\(String(format: "%.1f", gapMsEMA))ms exhaust=\(String(format: "%.0f", exhaustRate * 100))%")
         } else if !overloaded, Self.ladderTiers.contains(where: {
-                      $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort)
+                      $0 > currentShort && $0 <= tierCap
                           && $0 > learnedCeilingShort && Self.modelAvailable(short: $0)
                   }), !Self.ladderTiers.contains(where: {
-                      $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort)
+                      $0 > currentShort && $0 <= tierCap
                           && $0 <= learnedCeilingShort && Self.modelAvailable(short: $0)
                   }) {
             // 학습 천장에 막혀 있다 — 오래 안정적이면 한 칸 되돌려 다시 탐침할 기회를 준다.
@@ -449,7 +467,7 @@ public final class RIFEEngine: PairInterpolationEngine, @unchecked Sendable {
             }
         } else if !overloaded,
                   let next = Self.ladderTiers.first(where: {
-                      $0 > currentShort && $0 <= min(Self.ladderMaxShort, Self.flowCapShort)
+                      $0 > currentShort && $0 <= tierCap
                           && $0 <= learnedCeilingShort && Self.modelAvailable(short: $0)
                   }) {
             // 한 티어씩 승격 — 다음 해상도 예상 비용(면적비 = (next/cur)²)이 갭 여유 안일 때만.
